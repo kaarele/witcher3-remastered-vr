@@ -4,6 +4,11 @@ Versions below 1.0 are alpha releases. Downloads are on the
 [Releases page](https://github.com/kaarele/witcher3-remastered-vr/releases). Release notes of the
 original mod and of the Remastered port this project builds on are in [docs/releases](docs/releases/).
 
+## Unreleased
+
+- Experimental, off by default: interaction prompts and NPC labels at their target's distance
+  (`[openxr] world_marker_depth=1`). Not tested in the game yet.
+
 ## 0.1.2 (2026-10-20)
 
 - Linux: `w3vr-linux.py configure` now works on a fresh install from the release zip. In 0.1.1 it

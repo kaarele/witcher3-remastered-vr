@@ -813,4 +813,70 @@ bool hud_marker_ratio_to_plane_tangent(
     return std::isfinite(plane_tangent_x) && std::isfinite(plane_tangent_y);
 }
 
+void hud_plane_sub_rect_clip_positions(
+    const std::array<float, 16>& plane_clip_positions,
+    float u0,
+    float v0,
+    float u1,
+    float v1,
+    std::array<float, 16>& clip_positions) {
+    const float corner_u[4]{u0, u1, u0, u1};
+    const float corner_v[4]{v0, v0, v1, v1};
+    for (size_t corner = 0; corner < 4; ++corner) {
+        for (size_t component = 0; component < 4; ++component) {
+            const float top_left = plane_clip_positions[component];
+            clip_positions[corner * 4 + component] = top_left +
+                corner_u[corner] *
+                    (plane_clip_positions[4 + component] - top_left) +
+                corner_v[corner] *
+                    (plane_clip_positions[8 + component] - top_left);
+        }
+    }
+}
+
+bool world_marker_texel_box(
+    uint32_t width,
+    uint32_t height,
+    float ratio_x,
+    float ratio_y,
+    float half_width_px,
+    float above_px,
+    float below_px,
+    std::array<uint32_t, 4>& box) {
+    float stage_scale_x{};
+    float stage_scale_y{};
+    if (width > 0xFFFFu || height > 0xFFFFu ||
+        !std::isfinite(ratio_x) || !std::isfinite(ratio_y) ||
+        !scaleform_stage_ratio_scale(
+            width, height, stage_scale_x, stage_scale_y)) {
+        return false;
+    }
+    const float texture_width = static_cast<float>(width);
+    const float texture_height = static_cast<float>(height);
+    const float movie_scale =
+        std::min(texture_width / 1920.0f, texture_height / 1080.0f);
+    const float anchor_x =
+        (0.5f + 0.5f * ratio_x * stage_scale_x) * texture_width;
+    const float anchor_y =
+        (0.5f + 0.5f * ratio_y * stage_scale_y) * texture_height;
+    const float x0 = std::clamp(
+        std::floor(anchor_x - half_width_px * movie_scale),
+        0.0f, texture_width);
+    const float x1 = std::clamp(
+        std::ceil(anchor_x + half_width_px * movie_scale),
+        0.0f, texture_width);
+    const float y0 = std::clamp(
+        std::floor(anchor_y - above_px * movie_scale),
+        0.0f, texture_height);
+    const float y1 = std::clamp(
+        std::ceil(anchor_y + below_px * movie_scale),
+        0.0f, texture_height);
+    if (!(x1 > x0) || !(y1 > y0)) {
+        return false;
+    }
+    box = {static_cast<uint32_t>(x0), static_cast<uint32_t>(y0),
+        static_cast<uint32_t>(x1), static_cast<uint32_t>(y1)};
+    return true;
+}
+
 } // namespace w3vr::openxr_eye_geometry

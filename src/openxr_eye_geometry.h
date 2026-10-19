@@ -234,4 +234,30 @@ bool hud_marker_ratio_to_plane_tangent(
     float& plane_tangent_x,
     float& plane_tangent_y);
 
+// Clip-space corners (the order of build_cyclopean_hud_plane_clip_positions)
+// of the part [u0,u1] x [v0,v1] (HUD texture uv) of a plane quad. Clip
+// coordinates are affine across a planar quad, so this is exact.
+void hud_plane_sub_rect_clip_positions(
+    const std::array<float, 16>& plane_clip_positions,
+    float u0,
+    float v0,
+    float u1,
+    float v1,
+    std::array<float, 16>& clip_positions);
+
+// Texel box {x0, y0, x1, y1} ([x0,x1) x [y0,y1)) of a world marker in a
+// width x height HUD texture: the anchor at a script view ratio (x right,
+// y down, -1..1) through the Scaleform stage (texture NDC = ratio * stage
+// scale), widened by half_width_px, above_px and below_px of the 1920x1080
+// movie. False when the box is empty or the texture exceeds 16-bit texels.
+bool world_marker_texel_box(
+    uint32_t width,
+    uint32_t height,
+    float ratio_x,
+    float ratio_y,
+    float half_width_px,
+    float above_px,
+    float below_px,
+    std::array<uint32_t, 4>& box);
+
 } // namespace w3vr::openxr_eye_geometry
