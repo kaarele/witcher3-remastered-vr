@@ -8,6 +8,7 @@ original mod and of the Remastered port this project builds on are in [docs/rele
 
 - Linux: `w3vr-linux.py configure` now works on a fresh install from the release zip. In 0.1.1 it
   stopped with "mod not installed (run install first)" at step 4 of the install guide.
+- README: the long black screen when loading a save is the story recap video; skip it with Space / X.
 
 ## 0.1.1 (2026-10-20)
 

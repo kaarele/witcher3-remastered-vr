@@ -60,14 +60,14 @@ near view, F10 the cinema screen, F11 first person.
 - SteamVR, on Linux and Windows.
 - Windows in general (the code should work, but nobody has run it yet).
 - Interaction labels at the person's real depth.
-- Faster loading.
+- A picture for the story recap while a save loads (black in VR for now).
 
 **Not tested:** AMD and Intel GPUs (use FXAA there), headsets other than Quest 3, the GOG edition,
 SteamOS / Steam Deck.
 
-**Known issues:** loading into the game takes much longer than usual (roughly 5 times as long on
-the test setup). It is not yet known how much of that is the mod and how much is the game under
-Proton, which also loads slowly without the mod. In first person (F11) Geralt can walk at an angle
+**Known issues:** loading a save looks very slow, but most of the wait is the game's story recap
+video, which stays black in VR. The game itself has usually loaded after 20 to 25 seconds: press
+**Space** on the keyboard or **X** on the gamepad to skip the recap. In first person (F11) Geralt can walk at an angle
 to where you look (press F9 while facing forward) and the camera sits inside his head. "Press A to
 talk" labels float at the HUD's distance instead of at the person's depth. A character can still
 freeze now and then (seen once, in a cutscene). More in
@@ -564,10 +564,11 @@ you built yourself or downloaded from this repository's releases.
 
 Known issues:
 
-- **Slow loading.** With the mod, loading a save took roughly 5 times as long as usual on the test
-  setup: expect a few minutes. The game under Proton also loads more slowly than on Windows without
-  the mod, and how much of the slowdown the mod adds has not been measured yet. Be patient on the
-  loading screen; the game has not hung.
+- **Slow loading / long black screen.** After you load a save, the game plays its story recap video,
+  and in VR that video stays black. On the test setup the game itself had loaded after 20 to 25
+  seconds; the recap then runs for about another 80 seconds. Press **Space** on the keyboard or
+  **X** on the gamepad to skip it. Whether the black video is caused by the mod or by Proton is not
+  known yet.
 - Under Proton the automatic reload after Geralt dies can hang, also without the mod. Quit the game
   and load the save manually.
 - The desktop game window takes the per-eye size, so it can be taller than your monitor. This is
