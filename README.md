@@ -434,6 +434,7 @@ The original mod's keys are documented in [witcher3vr.example.ini](witcher3vr.ex
 | `world_marker_exact_projection` | `1` | Project interaction prompts and NPC or door markers exactly through the HUD plane. Needs the controller-locked level HUD (`hud_controller_locked=1`, `hud_anchor_level=1`) in Stereo. `0`: the game's markers. |
 | `hud_centre_split_aim_only` | `1` | Redraw the HUD's centre square (crosshair) about the render centre only while aiming. If the crosshair is off target while aiming, try `0`. |
 | `cinema_restore_gameplay_recenter` | `1` | After a cutscene, gameplay keeps the forward direction it had before the cutscene. |
+| `follow_runtime_recenter` | `0` | `1` = recenter the view when the runtime recenters (Meta button, WiVRn, SteamVR's *Reset seated position*). Not tested in the headset yet. |
 | `frame_wait_early` | `0` | Experimental. Strict Stereo: wait for the next OpenXR frame right after submitting, in standard OpenXR loop order. No gain measured in headless tests with a WiVRn-like pacer; not tried in the headset. |
 | `pair_rate_divisor` | `0` | Experimental, `0`-`6`. Strict Stereo: hold each stereo pair for exactly N refreshes (2 = 45 pairs/s at 90 Hz). In headless tests it was less even than running free; keep `0`. |
 
@@ -454,7 +455,10 @@ The original mod's keys are documented in [witcher3vr.example.ini](witcher3vr.ex
 | `remaster_local_shadow_slices` | `1` | `1`-`4` local-shadow atlas slices of 2048x2048. More slices let more lights cast shadows (4 costs about 24-48 MB more VRAM). |
 | `remaster_local_shadow_sort_corrected` | `0` | `1` = pack the nearest shadowed lights first, so an overflow drops far lights. |
 | `remaster_local_light_diag` | `0` | Log local-light and local-shadow choices per eye (needs diagnostics). |
-| `camera_mode` | `0` | Camera at game start: `0` = the game's shoulder camera, `1` = the near view, `2` = first person. `F8` and `F11` switch while playing. The Linux tool sets `1`. |
+| `camera_mode` | `0` | Camera at game start: `0` = the game's shoulder camera, `1` = the near view, `2` = first person. `F8` and `F11` switch while playing; leaving first person with `F11` returns to the near view when this is `1`. The Linux tool sets `1`. |
+| `first_person_recenter_on_entry` | `1` | `F11` into first person also recenters, so Geralt walks where you look. Walking follows the recenter direction, not your head. All builds. |
+| `remaster_native_head_provider` | `0` | 5.01 first person: `1` = put the eye at Geralt's animated head and hide his head, as on 4.04. Not tested on 5.01 yet. It also turns on `first_person_strafe` and `first_person_stationary_turn`. |
+| `first_person_stationary_turn` | `1` | First person with the head provider: Geralt's body turns with the camera while standing still. |
 | `close_camera_offset` | `0.750` | Near-view distance along the heading. Negative values move the camera **back**; the Linux tool writes `-1.000`. |
 | `close_camera_level` | `1` on 5.01 | Move the near view along the level heading instead of the pitched camera axis. |
 | `camera_center` | `1.0` | Near view: centre Geralt in front of you. `0`-`1` is the strength; `0` keeps the game's lateral offset. Releases while aiming, because the game aims from its own camera. |
@@ -553,7 +557,11 @@ the `modW3VRKeepHudFrameScale` script mod (the Linux tool does this).
 (`hud_controller_locked=1`).
 
 **The view points the wrong way after a runtime recenter** (SteamVR's *Reset seated position*, the
-Meta button). The mod does not follow runtime recenters yet; press `F9`.
+Meta button). Press `F9`, or set `[openxr] follow_runtime_recenter=1`.
+
+**In first person (`F11`) Geralt walks at an angle to where you look.** Walking follows the direction
+of the last recenter. Look straight ahead and press `F9`. `F11` recenters on entry
+(`first_person_recenter_on_entry=1`).
 
 **Motion looks uneven.** See [Why the frame rate moves in steps](#why-the-frame-rate-moves-in-steps).
 Turn diagnostics off, lower the foliage and grass settings, or choose a faster DLSS mode.

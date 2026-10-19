@@ -41,6 +41,8 @@ enum class Function : size_t {
     RenderFenceWait,       // CRenderFence wait, vtable +0x18 (fence): blocks until it is signalled
     ParallelFlushCommands, // ParallelRenderCommands::FlushCommands (commands): staged batches -> ready, apply
     FrustumAabbTest,       // (frustum, world box {min, max}): 1 = box fully outside the frustum
+    ActorGetHeadBoneIndex,           // native CActor.GetHeadBoneIndex
+    EntityGetBoneWorldMatrixByIndex, // native CEntity.GetBoneWorldMatrixByIndex
     Count,
 };
 
@@ -243,6 +245,18 @@ inline constexpr uint8_t kAnimatedComponentFrustumStore501Bytes[] = {
     0x49, 0x8D, 0x8F, 0x50, 0x0F, 0x00, 0x00, 0x41, 0x88, 0x87, 0x74, 0x0F,
     0x00, 0x00};
 
+// Registered script natives used by the first-person head provider. The
+// opening bytes are identical in 4.04 and 5.01 and unique in the 5.01 exe;
+// the head getter forwards to the actor's +0x200 animated component.
+inline constexpr uint8_t kActorGetHeadBoneIndexBytes[] = {
+    0x40, 0x53, 0x48, 0x83, 0xEC, 0x20, 0x48, 0xFF, 0x42, 0x30, 0x48, 0x81,
+    0xC1, 0x00, 0x02, 0x00, 0x00, 0x49, 0x8B, 0xD8, 0x48, 0x8B, 0x01, 0xFF,
+    0x50, 0x38};
+inline constexpr uint8_t kEntityGetBoneWorldMatrixByIndexBytes[] = {
+    0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58, 0x08, 0x48, 0x89, 0x70, 0x18, 0x48,
+    0x89, 0x78, 0x20, 0x55, 0x48, 0x8D, 0x68, 0xA1, 0x48, 0x81, 0xEC, 0x00,
+    0x01, 0x00, 0x00};
+
 inline constexpr Entry kEntries[] = {
     {"IsAnyMenu", 0x01F3C5C0, 0x01DF41A0, {kIsAnyMenuBytes, sizeof(kIsAnyMenuBytes)}},
     {"IsLoadingScreenVideoPlaying", 0x0154EED0, 0x0227A0F0,
@@ -295,6 +309,11 @@ inline constexpr Entry kEntries[] = {
         {kParallelFlushCommands501Bytes, sizeof(kParallelFlushCommands501Bytes)}},
     {"FrustumAabbTest", 0x0031E050, 0x0099B2B0,
         {kFrustumAabbTest501Bytes, sizeof(kFrustumAabbTest501Bytes)}},
+    {"Actor.GetHeadBoneIndex", 0x01C4B550, 0x0210A1F0,
+        {kActorGetHeadBoneIndexBytes, sizeof(kActorGetHeadBoneIndexBytes)}},
+    {"Entity.GetBoneWorldMatrixByIndex", 0x0152E600, 0x02259FC0,
+        {kEntityGetBoneWorldMatrixByIndexBytes,
+            sizeof(kEntityGetBoneWorldMatrixByIndexBytes)}},
 };
 static_assert(sizeof(kEntries) / sizeof(kEntries[0]) ==
     static_cast<size_t>(Function::Count));
