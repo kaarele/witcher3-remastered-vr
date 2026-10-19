@@ -881,6 +881,9 @@ null OpenXR runtime.
 - Status: off by default; verified with the null OpenXR runtime; headset confirmation pending. With
   lag 1 the game thread's wait per pair fell to near 0 with no timeouts; CPU-limited headless runs
   gave about 15% more frames per second.
+- With lag 1 the eye rendered second showed moving characters one game tick ahead (different
+  animation poses per eye). Fixed by `[perf] pair_enqueue_after_fence`, see "Same animation pose
+  in both eyes with run-ahead" below. With the fix, lag 1 is used in the tested headset setup.
 
 ### Black HUD rectangle during fades (`hud_fade_mode`, 5.01)
 - Symptom: a black rectangle over about 2/3 of the view for 1-2 s when a cutscene loads,
@@ -975,3 +978,54 @@ thread, just before xrWaitFrame/xrEndFrame.
   already runs free.
 - Status: experimental, off by default. Measured with the null OpenXR runtime only: with the
   WiVRn-like pacer it made no difference in the game (previous section). Not tried in the headset.
+
+### Same animation pose in both eyes with run-ahead (`[perf] pair_enqueue_after_fence`)
+- Symptom (run-ahead `pair_barrier_lag=1` with shadow reuse): moving characters (Geralt
+  running, NPCs walking) are shaded darker in one eye and lighter in the other, mostly on the back;
+  each eye alone looks fine; Geralt stutters when running.
+- Null HMD with zero IPD and a symmetric FOV, both eyes compared while Geralt walks and runs past
+  NPCs: with lag 0 the eyes are identical (with or without shadow reuse). With lag 1 Geralt and the
+  NPCs stand in different animation poses and positions per eye (with or without shadow reuse, FXAA
+  and DLAA), while the camera and the static world stay identical. Shadow reuse only turns the pose
+  difference into the dark/light patches (the second eye's bodies sample the first eye's shadow
+  map). 1-2 of 8 moving captures were clean, so the affected eye flips between the same tick and
+  the next one: the stutter.
+- Cause: 5.01 sends skinning and relink updates (pose slot, localToWorld, bbox) through the batched
+  ParallelRenderCommands queue, not through the command ring: producers append (renderer vtable
+  +0x300), constructing any `CRenderCommand_RenderScene` or `CRenderCommand_Fence` publishes what
+  was appended (renderer vtable +0x2F8), and every frame build applies what is published at that
+  moment (`ParallelRenderCommands::FlushCommands` 0x01C1CA10, called by the frame builder, so once
+  per eye). RenderSceneSetup (0x0227D1F0) calls the frame factory (0x0227D97D), waits on the fence
+  that the previous tick's Fence command signals after that tick's primary eye (0x0227D9F4), then
+  commits the primary RenderScene and the next Fence command. The factory hook queued the duplicate
+  eye (rendered first) inside the factory call, before that wait. With lag 1 tick N+1 therefore
+  published its batch while pair N's second eye (the primary, left by default) was still queued, and
+  that eye applied it: tick N+1 poses and positions with tick N's camera.
+- Fix (`pair_enqueue_after_fence=1`, default): inside RenderSceneSetup the factory hook keeps the
+  duplicate and its reference in a per-thread slot instead of queuing it. A detour on the
+  CRenderFence wait (vtable +0x18, 0x01CABDE0) queues it as soon as the wait called from
+  RenderSceneSetup (return 0x0227D9F7) has returned, before the primary is committed. The duplicate
+  still renders first and the primary second, and both publishes of tick N+1 follow pair N's Fence
+  command, as with one eye. Barrier masks, pair/eye/generation tags, shadow reuse roles, DLSS
+  slots, capture rings and markers are unchanged; with lag 0 the order changes the same way (the
+  wait returns almost at once there).
+- Checks: the wait's code (18 bytes, unique), the factory call and the fence wait call in
+  RenderSceneSetup (bytes ending at both return addresses), and per setup call that the renderer
+  already has a fence (+0x1D0) whose vtable wait is the hooked one. Otherwise the duplicate is queued
+  in the factory as before: other factory callers, the first setup call (it creates the fence and
+  does not wait), a mismatch. A duplicate still held when RenderSceneSetup returns is queued then,
+  after the primary, before any pair barrier. Each duplicate is queued and released exactly once.
+- `0` restores the old order. 5.01 only; other builds keep 0.
+- Census (VRS census log), one pair of lines per window:
+  `PERF pair enqueue after_fence= hooked= deferred= late= replaced= factory outside= other_caller=
+  no_fence= fence_class= unhooked=` (`deferred` should count one per pair, the others stay near 0)
+  and, from a probe on FlushCommands that sums the staged entries (count at +0x15C, 17 buckets of
+  12 bytes) before each flush, `PERF parallel flush first= first_entries= second= second_entries=
+  second_nonzero= second_max= second_eye= untagged= untagged_entries=`. The role comes from the frame
+  tag: the first flush of a pair id is the eye rendered first. Expected: `second_entries` about 0
+  with the fix; with `pair_enqueue_after_fence=0` and lag 1, tens to hundreds per pair at the second
+  eye (`second_eye=0`) while characters move. The probe reads the counts without the bucket locks.
+- Status: verified. With the null OpenXR runtime (zero IPD, symmetric FOV, Geralt walking and running
+  past NPCs) the largest left/right difference on moving characters fell from about 110 (fix off) to
+  about 2-3 (the static floor), with FXAA and DLAA, at unchanged throughput; `second_entries` was 0.
+  Confirmed in the headset: run-ahead with the fix shows no per-eye pose or shading difference.

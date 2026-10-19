@@ -38,6 +38,8 @@ enum class Function : size_t {
     TemporalCameraBuild,   // builds the 0xB0 temporal camera record (motion-vector camera)
     FrustumCornerHelper,   // view frustum corners for shadow cascades (view, ndc_z, out, rebuild)
     GuiFillRect,           // 2D colour quad into the GUI target (_, x, y, w, h, const uint8_t rgba[4])
+    RenderFenceWait,       // CRenderFence wait, vtable +0x18 (fence): blocks until it is signalled
+    ParallelFlushCommands, // ParallelRenderCommands::FlushCommands (commands): staged batches -> ready, apply
     Count,
 };
 
@@ -192,6 +194,30 @@ inline constexpr uint8_t kGuiFadeFillCall501Bytes[] = {
 inline constexpr uint8_t kFadeObjectFillCall501Bytes[] = {
     0xE8, 0x33, 0xDE, 0x08, 0x00};
 
+// [FIX:PAIR-ENQUEUE-AFTER-FENCE 1/11] REDengine's per-tick throttle and the
+// batched skinning/relink queue (5.01 only).
+// CRenderFence wait, slot +0x18 of the CRenderFence vtable (0x037AE648):
+// WaitForSingleObject on fence+0x10 in 100 ms steps, pumping messages on the
+// main thread between them. Its first 18 bytes are unique in the exe.
+inline constexpr uint8_t kRenderFenceWait501Bytes[] = {
+    0x40, 0x53, 0x48, 0x83, 0xEC, 0x60, 0x48, 0x8B, 0xD9, 0xBA, 0x64, 0x00,
+    0x00, 0x00, 0x48, 0x8B, 0x49, 0x10};
+// ParallelRenderCommands::FlushCommands (named by the RTTI of its
+// FunctionTask lambda); only caller the frame builder (return 0x01C1A6F4).
+// 29 bytes because the first 24 occur ten times.
+inline constexpr uint8_t kParallelFlushCommands501Bytes[] = {
+    0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x74, 0x24, 0x10, 0x48, 0x89,
+    0x7C, 0x24, 0x18, 0x55, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57,
+    0xB8, 0xA0, 0xF6, 0x01, 0x00};
+// RenderSceneSetup call sites, each ending at its return address: the frame
+// factory call (call rel32 to FrameDataFactory) and the per-tick fence wait
+// (mov rcx,[rdi+0x1D0]; vmovaps xmm6,xmm0; mov rax,[rcx]; call [rax+0x18]).
+inline constexpr uint8_t kRenderSceneFactoryCall501Bytes[] = {
+    0xE8, 0x9E, 0x2E, 0x04, 0x00};
+inline constexpr uint8_t kRenderSceneFenceWaitCall501Bytes[] = {
+    0x48, 0x8B, 0x8F, 0xD0, 0x01, 0x00, 0x00, 0xC5, 0xF8, 0x28, 0xF0, 0x48,
+    0x8B, 0x01, 0xFF, 0x50, 0x18};
+
 inline constexpr Entry kEntries[] = {
     {"IsAnyMenu", 0x01F3C5C0, 0x01DF41A0, {kIsAnyMenuBytes, sizeof(kIsAnyMenuBytes)}},
     {"IsLoadingScreenVideoPlaying", 0x0154EED0, 0x0227A0F0,
@@ -238,6 +264,10 @@ inline constexpr Entry kEntries[] = {
         {kFrustumCornerHelper501Bytes, sizeof(kFrustumCornerHelper501Bytes)}},
     {"GuiFillRect", 0, 0x01C99780,
         {kGuiFillRect501Bytes, sizeof(kGuiFillRect501Bytes)}},
+    {"RenderFenceWait", 0, 0x01CABDE0,
+        {kRenderFenceWait501Bytes, sizeof(kRenderFenceWait501Bytes)}},
+    {"ParallelRenderCommands.FlushCommands", 0, 0x01C1CA10,
+        {kParallelFlushCommands501Bytes, sizeof(kParallelFlushCommands501Bytes)}},
 };
 static_assert(sizeof(kEntries) / sizeof(kEntries[0]) ==
     static_cast<size_t>(Function::Count));
@@ -286,6 +316,12 @@ enum class Value : size_t {
     GuiFadeAmountTest,            // RVA of the GUI pass's fade-amount test (5.01 only)
     GuiFadeFillReturn,            // return address of the fill-rect call drawing the GUI-pass fade
     FadeObjectFillReturn,         // return address of the fill-rect call in the standalone fade draw
+    RenderSceneFactoryReturn,     // return address of the frame-factory call in RenderSceneSetup
+    RenderSceneFenceWaitReturn,   // return address of RenderSceneSetup's per-tick fence wait
+    RenderSceneFenceOffset,       // RenderSceneSetup's this: its CRenderFence pointer
+    ParallelStagedCountOffset,    // FlushCommands' this: entry count of staged bucket 0
+    ParallelBucketStride,         // bytes from one bucket of a list to the next
+    ParallelBucketCount,          // buckets per list (hashed by proxy address)
     Count,
 };
 
@@ -362,6 +398,23 @@ inline constexpr ValueEntry kValues[] = {
     {"GuiFadeAmountTest", 0, 0x01C26DE4},
     {"GuiFadeFillReturn", 0, 0x01C26F23},
     {"FadeObjectFillReturn", 0, 0x01C0B94D},
+    // [FIX:PAIR-ENQUEUE-AFTER-FENCE 2/11] RenderSceneSetup 0x0227D1F0 calls
+    // the frame factory (0x0227D97D), then waits on the fence at this+0x1D0
+    // that the previous tick's CRenderCommand_Fence signals (0x0227D9F4; the
+    // first call finds no fence, creates it and does not wait), then commits
+    // the primary RenderScene and the next Fence command.
+    {"RenderSceneFactoryReturn", 0, 0x0227D982},
+    {"RenderSceneFenceWaitReturn", 0, 0x0227D9F7},
+    {"RenderSceneFenceOffset", 0, 0x1D0},
+    // ParallelRenderCommands (renderer+0x118): 17 spinlocks, then the append,
+    // staged and ready lists, 17 buckets each of 12 bytes (pointer, u32
+    // count): staged at +0x154 (count +0x15C), ready at +0x220. The publish
+    // (renderer vtable +0x2F8, called by the RenderScene and Fence command
+    // constructors) appends the append lists to the staged ones;
+    // FlushCommands swaps staged into ready and applies the ready entries.
+    {"ParallelStagedCountOffset", 0, 0x15C},
+    {"ParallelBucketStride", 0, 0xC},
+    {"ParallelBucketCount", 0, 17},
 };
 static_assert(sizeof(kValues) / sizeof(kValues[0]) == static_cast<size_t>(Value::Count));
 
