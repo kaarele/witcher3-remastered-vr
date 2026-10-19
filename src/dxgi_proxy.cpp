@@ -699,6 +699,7 @@ struct Config {
     bool engine_menu_state_probe{false};
     bool engine_animation_hmd_frustum{false};
     bool engine_animated_component_visible{true};
+    bool engine_async_anim_tick_visible{false};
     bool engine_taau_reverse_eye_order{false};
     bool engine_taau_first_eye_pure_camera_motion{true};
     bool engine_taau_pure_camera_motion_all{true};
@@ -3033,6 +3034,14 @@ enum class AnimatedVisibilityCount : size_t { Tests, Culled, Forced, Count };
 std::array<std::atomic<uint64_t>, static_cast<size_t>(AnimatedVisibilityCount::Count)>
     g_animated_visibility_counts{};
 bool g_animated_visibility_call_site{};
+// [FIX:REMASTER-ASYNC-ANIM-TICK-VISIBILITY 2/5] FrustumFromMatrix(out frustum,
+// world-to-clip matrix), called through the redirected call in the async
+// animation tick's sync step. Builds = frustums built there; opened = those
+// opened for the HMD view. Always counted (once per sync step, not per box).
+using EngineFrustumFromMatrixFn = void(__fastcall*)(void*, const void*);
+EngineFrustumFromMatrixFn g_engine_async_anim_frustum_build{};
+std::atomic<uint64_t> g_async_anim_tick_frustum_builds{};
+std::atomic<uint64_t> g_async_anim_tick_frustum_opened{};
 thread_local uint64_t g_engine_producer_pair_id{};
 using EngineIsAnyMenuFn = void(__fastcall*)(void*, void*, uint8_t*);
 EngineIsAnyMenuFn g_engine_is_any_menu{};
@@ -16332,6 +16341,7 @@ void log_pair_rate_limit_census_locked(uint64_t window_presents, int64_t qpc_fre
 void log_shadow_census_locked(uint64_t window_presents, int64_t qpc_frequency);
 void log_descriptor_shadow_census_locked();
 void log_animated_visibility_census_locked(uint64_t window_presents);
+void log_async_anim_tick_census_locked(uint64_t window_presents);
 
 // One line per kVrsCensusPresentInterval Presents, written by the first bind
 // after the boundary; the counters are window deltas.
@@ -16428,6 +16438,7 @@ void log_vrs_census_locked(uint64_t present) {
     log_descriptor_shadow_census_locked();
     // [FIX:REMASTER-ANIMATED-VISIBILITY 5/8]
     log_animated_visibility_census_locked(window_presents);
+    log_async_anim_tick_census_locked(window_presents);
 }
 
 void apply_vrs_pipeline_rate(
@@ -17201,6 +17212,8 @@ void load_config() {
             "engine", "animation_hmd_frustum", false);
         g_config.engine_animated_component_visible = read_ini_bool(
             "engine", "animated_component_visible", true);
+        g_config.engine_async_anim_tick_visible = read_ini_bool(
+            "engine", "async_anim_tick_visible", false);
         g_config.engine_taau_reverse_eye_order = read_ini_bool(
             "engine", "taau_reverse_eye_order", false);
         g_config.engine_taau_first_eye_pure_camera_motion = read_ini_bool(
@@ -38863,6 +38876,22 @@ void count_animated_visibility(AnimatedVisibilityCount which) {
         1, std::memory_order_relaxed);
 }
 
+// True while the HMD view, not the game camera, decides what the player
+// sees: free look on, a valid pose, no menu or cinema, and the HMD camera
+// route applied within the last 8 Presents.
+bool hmd_view_drives_animation_visibility() {
+    const auto present = g_present_count.load(std::memory_order_relaxed);
+    const auto last_hmd_camera = g_engine_hmd_camera_last_present.load(
+        std::memory_order_relaxed);
+    const bool hmd_camera_recent = last_hmd_camera != UINT64_MAX &&
+        present >= last_hmd_camera && present - last_hmd_camera <= 8;
+    return g_config.hmd_freelook &&
+        g_hmd_pose_valid.load(std::memory_order_relaxed) &&
+        g_engine_menu_state.load(std::memory_order_relaxed) == 0 &&
+        !g_cinema_mode_active.load(std::memory_order_relaxed) &&
+        hmd_camera_recent;
+}
+
 // Keeps animated components outside the game camera's frustum fully updated
 // while the HMD view (which looks around freely) is active: the visibility
 // update then skins them like visible ones. Only the call from that update
@@ -38881,22 +38910,13 @@ int __fastcall hook_engine_frustum_aabb_test(void* frustum, const void* bounds) 
             count_animated_visibility(AnimatedVisibilityCount::Culled);
         }
     }
-    const auto present = g_present_count.load(std::memory_order_relaxed);
-    const auto last_hmd_camera = g_engine_hmd_camera_last_present.load(
-        std::memory_order_relaxed);
-    const bool hmd_camera_recent = last_hmd_camera != UINT64_MAX &&
-        present >= last_hmd_camera && present - last_hmd_camera <= 8;
     // A box the game already found visible needs nothing: only culled ones
     // are forced, counted and logged ("forced full count=1" is then the
     // first component actually kept visible, not the first test).
     if (!culled ||
         !g_config.engine_animated_component_visible ||
         !animated_site ||
-        !g_config.hmd_freelook ||
-        !g_hmd_pose_valid.load(std::memory_order_relaxed) ||
-        g_engine_menu_state.load(std::memory_order_relaxed) != 0 ||
-        g_cinema_mode_active.load(std::memory_order_relaxed) ||
-        !hmd_camera_recent) {
+        !hmd_view_drives_animation_visibility()) {
         return result;
     }
 
@@ -39003,6 +39023,100 @@ void install_engine_animated_component_visibility_hook() {
         static_cast<unsigned long long>(return_rva), call, relay);
 }
 
+// [FIX:REMASTER-ASYNC-ANIM-TICK-VISIBILITY 3/5] Opens the async animation
+// tick's frustum while the HMD view is active: zero normals and a huge plane
+// distance give n.c + d + |n|.e > 0 for every box, so the tick updates
+// background NPCs beside and behind the game camera instead of leaving them
+// frozen until the game camera turns to them. Only the planes the tick tests
+// change (see kAsyncAnimTickCull501Bytes); the tick still sorts and budgets
+// the entities by distance as before.
+void __fastcall hook_engine_async_anim_frustum_build(void* frustum,
+    const void* world_to_clip) {
+    g_engine_async_anim_frustum_build(frustum, world_to_clip);
+    g_async_anim_tick_frustum_builds.fetch_add(1, std::memory_order_relaxed);
+    if (frustum == nullptr || !g_config.engine_async_anim_tick_visible ||
+        !hmd_view_drives_animation_visibility()) {
+        return;
+    }
+    constexpr size_t kLanes = 8;
+    constexpr size_t kNormalOffsets[] = {0x60, 0x80, 0xA0, 0xE0, 0x100, 0x120};
+    constexpr size_t kDistanceOffset = 0xC0;
+    constexpr float kOpenDistance = 1.0e30f;
+    auto* base = static_cast<uint8_t*>(frustum);
+    for (const size_t offset : kNormalOffsets) {
+        std::memset(base + offset, 0, kLanes * sizeof(float));
+    }
+    auto* distance = reinterpret_cast<float*>(base + kDistanceOffset);
+    for (size_t lane = 0; lane < kLanes; ++lane) {
+        distance[lane] = kOpenDistance;
+    }
+    const uint64_t count = g_async_anim_tick_frustum_opened.fetch_add(
+        1, std::memory_order_relaxed) + 1;
+    if (count == 1 || (g_config.runtime_diagnostics && count % 10000 == 0)) {
+        log_line("Async animation tick frustum opened count=%llu",
+            static_cast<unsigned long long>(count));
+    }
+}
+
+// [FIX:REMASTER-ASYNC-ANIM-TICK-VISIBILITY 4/5] 5.01 only, [engine]
+// async_anim_tick_visible=1. Redirects the sync step's one call of
+// FrustumFromMatrix (other callers keep the original) after checking the
+// call, the copy after it, the callee's entry and the tick's plane test.
+void install_engine_async_anim_tick_visibility_hook() {
+    namespace addresses = w3vr::engine_addresses;
+    if (!g_config.engine_async_anim_tick_visible ||
+        g_engine_async_anim_frustum_build != nullptr ||
+        running_game_build() != w3vr::game_build::Build::Remaster501) {
+        return;
+    }
+    auto* module = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
+    const auto code_matches = [module](uintptr_t rva, const uint8_t* bytes,
+                                  size_t size) {
+        return module != nullptr &&
+            addresses::signature_matches(
+                module + rva, addresses::Signature{bytes, size});
+    };
+    constexpr uintptr_t kReturnRva = addresses::kAsyncAnimTickFrustumReturn501Rva;
+    constexpr size_t kCallBytes = sizeof(addresses::kAsyncAnimTickFrustumCall501Bytes);
+    const bool call_matches = code_matches(kReturnRva - kCallBytes,
+        addresses::kAsyncAnimTickFrustumCall501Bytes, kCallBytes);
+    const bool copy_matches = code_matches(kReturnRva,
+        addresses::kAsyncAnimTickFrustumCopy501Bytes,
+        sizeof(addresses::kAsyncAnimTickFrustumCopy501Bytes));
+    const bool builder_matches = code_matches(addresses::kFrustumFromMatrix501Rva,
+        addresses::kFrustumFromMatrix501Bytes,
+        sizeof(addresses::kFrustumFromMatrix501Bytes));
+    const bool cull_matches = code_matches(addresses::kAsyncAnimTickCull501Rva,
+        addresses::kAsyncAnimTickCull501Bytes,
+        sizeof(addresses::kAsyncAnimTickCull501Bytes));
+    auto* call = module != nullptr ? module + kReturnRva - kCallBytes : nullptr;
+    const bool reaches_builder = call_matches &&
+        w3vr::call_site_hook::call_destination(call) ==
+            reinterpret_cast<uintptr_t>(module + addresses::kFrustumFromMatrix501Rva);
+    if (!call_matches || !copy_matches || !builder_matches || !cull_matches ||
+        !reaches_builder) {
+        log_line("Async animation tick visibility off: code mismatch call=%d "
+            "copy=%d builder=%d cull=%d reaches=%d",
+            call_matches ? 1 : 0, copy_matches ? 1 : 0, builder_matches ? 1 : 0,
+            cull_matches ? 1 : 0, reaches_builder ? 1 : 0);
+        return;
+    }
+    uint8_t* relay = w3vr::call_site_hook::install(call,
+        reinterpret_cast<void*>(&hook_engine_async_anim_frustum_build),
+        reinterpret_cast<void**>(&g_engine_async_anim_frustum_build));
+    if (relay == nullptr) {
+        g_engine_async_anim_frustum_build = nullptr;
+        log_line("Async animation tick visibility hook failed: call=%p not "
+            "redirected (no jump block within reach or protect failed)", call);
+        return;
+    }
+    log_line("Async animation tick visibility hooked build=%s builder_rva=0x%llX "
+        "caller_return_rva=0x%llX call=%p relay=%p",
+        w3vr::game_build::name(running_game_build()),
+        static_cast<unsigned long long>(addresses::kFrustumFromMatrix501Rva),
+        static_cast<unsigned long long>(kReturnRva), call, relay);
+}
+
 // [FIX:REMASTER-ANIMATED-VISIBILITY 8/8] Called from the census under
 // g_vrs_census_busy; window deltas. tests = frustum tests of the
 // animated-component update, culled = those that found the component
@@ -39030,6 +39144,26 @@ void log_animated_visibility_census_locked(uint64_t window_presents) {
         delta(AnimatedVisibilityCount::Culled),
         delta(AnimatedVisibilityCount::Forced));
     previous = current;
+}
+
+// [FIX:REMASTER-ASYNC-ANIM-TICK-VISIBILITY 5/5] Called from the census under
+// g_vrs_census_busy; window deltas. builds = async tick sync steps, opened =
+// those whose frustum was opened for the HMD view.
+void log_async_anim_tick_census_locked(uint64_t window_presents) {
+    if (window_presents == 0 || g_engine_async_anim_frustum_build == nullptr) {
+        return;
+    }
+    static uint64_t previous_builds{};
+    static uint64_t previous_opened{};
+    const uint64_t builds =
+        g_async_anim_tick_frustum_builds.load(std::memory_order_relaxed);
+    const uint64_t opened =
+        g_async_anim_tick_frustum_opened.load(std::memory_order_relaxed);
+    log_vrs_line("PERF anim tick frustum builds=%llu opened=%llu",
+        static_cast<unsigned long long>(builds - previous_builds),
+        static_cast<unsigned long long>(opened - previous_opened));
+    previous_builds = builds;
+    previous_opened = opened;
 }
 
 void capture_engine_original_temporal_matrix(float* view, uint64_t present) {
@@ -55067,6 +55201,7 @@ void ensure_initialized() {
         initialize_engine_player_pose_helpers();
         install_engine_world_vector_to_view_ratio_hook();
         install_engine_animated_component_visibility_hook();
+        install_engine_async_anim_tick_visibility_hook();
         install_engine_frame_factory_probe();
         // [FIX:PAIR-ENQUEUE-AFTER-FENCE 11/11]
         install_pair_enqueue_after_fence_hooks();

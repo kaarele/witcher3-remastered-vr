@@ -1071,3 +1071,25 @@ thread, just before xrWaitFrame/xrEndFrame.
   no regressions) and in the headset in a town, together with `UseWorkFreezing=false` in
   `bin/config/r4game/legacy/base/gameplay.ini`: people kept animating; a frozen character was seen
   once, in a cutscene.
+
+### Async animation tick outside the game camera's view (`async_anim_tick_visible`, 5.01, experimental)
+- The CAsyncAnimTickManager cull named above. Its tick (0x0265D900) loops over the registered
+  entities (CAnimatedEntity, CBgCutsceneEntity, CBgNpc) and tests each cached box against a
+  frustum inline (0x0265DA49..0x0265DAC5: n.c + d + |n|.e < 0 on any of 6 lanes = outside). An
+  entity outside is neither ticked nor gets its box refreshed, so it stays culled until the game
+  camera turns to it. The sync step (0x0265E870) builds that frustum each time from the game
+  camera's world-to-clip matrix with FrustumFromMatrix (0x026EE940, call 0x0265E9E4, return
+  0x0265E9E9) and copies it to manager+0x40.
+- `[engine] async_anim_tick_visible=1` (default 0) redirects that one call (`src/call_site_hook.h`;
+  other callers keep the original). After the original builds the frustum, and only while the HMD
+  view is active (same gates as `animated_component_visible`), the detour zeroes the plane normals
+  and sets a huge plane distance in the structure-of-arrays part the tick reads, so every box
+  passes. The tick still sorts its entities by distance to the camera and splits them into bucket
+  jobs as before. Checks before the patch: the call bytes and their decoded destination, the copy
+  after the call, the builder's entry, and the tick's whole plane test (which pins the plane
+  offsets). Any mismatch leaves the game unchanged and logs why.
+- Log: `Async animation tick visibility hooked build=remaster-5.01 ...` at startup and
+  `Async animation tick frustum opened count=1` the first time. Census: `PERF anim tick frustum
+  builds= opened=` per window.
+- Status: built, not yet run. To test: CPU cost in a busy town (census presents/s with the key on
+  and off) and whether background people beside or behind the game camera keep moving.
