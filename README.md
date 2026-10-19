@@ -2,24 +2,92 @@
 
 > This is an unofficial fan work and is not approved/endorsed by CD PROJEKT RED.
 
-Play *The Witcher 3: Wild Hunt* Remastered (patch 5.01) in VR, in full stereo 3D, through an OpenXR
-runtime. This project continues the [Witcher 3 VR](https://github.com/tig3rmast3r/witcher3-vr) mod
-by tig3rmast3r and the [Remastered port](https://github.com/joschi127/witcher3-vr/tree/remaster) by
-joschi127. It adds Linux/Proton support, DLSS with a separate history for each eye, a sharper
-per-eye projection, a cleaner VR HUD and a number of performance improvements.
+Play *The Witcher 3: Wild Hunt* Remastered (patch 5.01) in full stereo VR, on Linux with Steam +
+Proton today. Windows support is being worked on. This project continues the
+[Witcher 3 VR](https://github.com/tig3rmast3r/witcher3-vr) mod by tig3rmast3r and the
+[Remastered port](https://github.com/joschi127/witcher3-vr/tree/remaster) by joschi127.
 
-> [!WARNING]
-> **Pre-release. There is no release package yet.** Until the first release you install the mod
-> from source (see [Installation](#installation)).
+## How to install?
+
+**Linux** (Steam + Proton, headset through WiVRn): the tested setup.
+
+1. Download `Witcher3RemasteredVR-v0.1.0-alpha.1.zip` from **[Releases](https://github.com/kaarele/witcher3-remastered-vr/releases)**.
+2. In Steam: right-click *The Witcher 3* → **Manage** → **Browse local files**.
+3. Extract the zip into that folder and merge the folders.
+4. Close the game. Open a terminal in that folder and run:
+   ```bash
+   python3 Witcher3VR/linux/w3vr-linux.py backup-saves
+   python3 Witcher3VR/linux/w3vr-linux.py configure
+   python3 Witcher3VR/linux/w3vr-linux.py launch-options
+   ```
+5. Paste the line that `launch-options` prints into Steam → *The Witcher 3* → **Properties** →
+   **Launch Options**.
+6. Start WiVRn, connect the headset, start the game. Done.
+
+**Windows** (not tested yet, so please report how it goes):
+
+1. Download `Witcher3RemasteredVR-v0.1.0-alpha.1.zip` from **[Releases](https://github.com/kaarele/witcher3-remastered-vr/releases)**.
+2. Extract it into the game folder (the one with `bin`, `content` and `mods`).
+3. Start your headset's OpenXR runtime (SteamVR, Meta Quest Link, Virtual Desktop, ...).
+4. Start the game. In **Options → Graphics** set Anti-aliasing to **DLSS** (Quality or DLAA), and
+   turn **sharpening**, **NVIDIA Reflex** and **frame generation** off.
+
+**Uninstall:** delete `bin/x64_dx12/dxgi.dll` in the game folder. On Linux,
+`python3 Witcher3VR/linux/w3vr-linux.py uninstall --restore-settings` also puts your graphics
+settings back. Your saves are never touched.
+
+**Controls:** F9 recentres the view (look straight ahead first), F8 toggles the near view, F10 the
+cinema screen, F11 first person. Mouse/keyboard or a gamepad; VR controllers are not supported.
+
+## What works and what's next
+
+**Works, tested in the headset:** Linux (Bazzite), Steam, Proton Hotfix, NVIDIA RTX 3080, Meta Quest
+3 through WiVRn at 90 Hz.
+- Full stereo 3D with DLSS/DLAA kept separately for each eye, and a sharp per-eye projection.
+- HUD, menus and loading screens placed where you can read them. "Press A to talk" style markers
+  sit on the people and objects they belong to.
+- No black rectangles when cutscenes or loading screens fade.
+- Geralt stays centred in front of you, also after cutscenes.
+- Shadows and flickering lights look the same in both eyes.
+
+**Coming soon / being tested:**
+- SteamVR, on Linux and Windows.
+- Windows in general (the code should work, but nobody has run it yet).
+- About 15% more frames per second from letting the game prepare the next frame early. A fix
+  that keeps both eyes in sync is being tested.
+- NPCs a few metres away that stop animating when you look at them with your head instead of the
+  game camera. A fix is in progress.
+
+**Not tested:** AMD and Intel GPUs (use FXAA there), headsets other than Quest 3, the GOG edition,
+SteamOS / Steam Deck.
+
+**Known issues:** in first person (F11) Geralt can walk at an angle to where you look (press F9
+while facing forward) and the camera sits inside his head. "Press A to talk" labels float at the
+HUD's distance instead of at the person's depth. More in
+[Troubleshooting and known issues](#troubleshooting-and-known-issues).
+
+## Why this mod exists
+
+> I didn't find a working VR version for the game for the Remastered version nor something that
+> would work on a normal OS, so I asked Opus 5.5 to make one. It's 99% of its doing plus 1% of my
+> oversight and creative decisions on the VR taste. Tokens ain't free, so if you want this mod to
+> keep improving, consider donating or feel free to fork the repo and have fun with all the bugs.
 >
-> So far the mod has been tested on **one setup only**: Linux (Bazzite) with Steam, Proton Hotfix
-> and vkd3d-proton, an NVIDIA GeForce RTX 3080, and a Meta Quest 3 through WiVRn (OpenXR) at
-> 90 Hz, running the Steam edition of The Witcher 3 Remastered, patch 5.01. Windows, SteamVR, other
-> GPUs, other headsets and the GOG edition have **not** been tested yet. See
-> [Platform support](#platform-support).
+> — kaarele ([ko-fi.com/kaarele](https://ko-fi.com/kaarele))
+
+## Contributing
+
+Collaborators are welcome. Anyone can fork this repository and open a pull request: fixes,
+Windows fixes and test reports from other setups (SteamVR, other headsets, AMD/Intel GPUs) are
+especially welcome. For a bug, open an [issue](https://github.com/kaarele/witcher3-remastered-vr/issues)
+with your OS, GPU, headset, OpenXR runtime and what you saw. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Contents
 
+- [How to install?](#how-to-install)
+- [What works and what's next](#what-works-and-whats-next)
+- [Why this mod exists](#why-this-mod-exists)
+- [Contributing](#contributing)
 - [What this project adds](#what-this-project-adds)
 - [Requirements](#requirements)
 - [Installation](#installation)
@@ -144,18 +212,19 @@ file before it overwrites it:
 
 ### Linux (Steam + Proton)
 
-1. **Build `dxgi.dll`** from this repository, see [Building from source](#linux-clang-cl-in-a-distrobox).
-2. **Download a Witcher 3 VR Remastered release zip** from
-   [joschi127/witcher3-vr releases](https://github.com/joschi127/witcher3-vr/releases). It supplies
-   `openxr_loader.dll` and the base script mods. Check it against its SHA-256 file:
-   `sha256sum -c <name>-SHA256.txt`.
+1. **Get the files.** The easy way: extract this project's release zip from
+   [Releases](https://github.com/kaarele/witcher3-remastered-vr/releases) into the game folder, as in [How to install?](#how-to-install). It contains
+   everything below, including `openxr_loader.dll`, the 5.01 script mods and the setup tool
+   (`Witcher3VR/linux/w3vr-linux.py`). To use your own build instead, build `dxgi.dll` (see
+   [Building from source](#linux-clang-cl-in-a-distrobox)) and pass it with `install --dll`.
+2. **Check the download** (optional): `sha256sum -c SHA256SUMS.txt --ignore-missing`.
 3. **Connect your headset to WiVRn** (or start your OpenXR runtime). WiVRn only registers itself as
    the active OpenXR runtime while a headset is connected.
-4. From a checkout of this repository, run:
+4. From the game folder (or a checkout of this repository, using `linux/w3vr-linux.py`), run:
 
    ```bash
    python3 linux/w3vr-linux.py status        # Steam, game folder, game build, OpenXR runtime
-   python3 linux/w3vr-linux.py install <release>.zip --dll <path/to/your/dxgi.dll>
+   python3 linux/w3vr-linux.py install <release>.zip --dll <path/to/your/dxgi.dll>   # only for your own build
    python3 linux/w3vr-linux.py configure     # the tested 5.01 preset; see configure --help
    python3 linux/w3vr-linux.py launch-options
    python3 linux/w3vr-linux.py wivrn-shortcut   # optional: list the game in WiVRn's in-headset launcher
@@ -199,75 +268,42 @@ More details: [LINUX.md](LINUX.md).
 
 ### Windows (untested)
 
-Nobody has run this project's build on Windows yet. These steps follow the Windows launcher's
-design; if you try them, please [report](#reporting-problems) what happens.
+Nobody has run this project on Windows yet. If you try it, please [report](#reporting-problems) what
+happens, good or bad.
 
-> [!WARNING]
-> Known launcher problems on 5.01, to be fixed before the first release:
->
-> - The HUD editor setup expects `dx12filelist.txt`, which the Steam 5.01 build does not have.
->   This can stop **Save** and **Save & Launch**.
-> - Saving with the integration set to **Off** removes the game's own
->   `amd_fidelityfx_framegeneration_dx12.dll` (used for FSR frame generation). *Verify integrity
->   of game files* in Steam, or the same check in GOG Galaxy, restores it.
-> - The launcher's automatic (AUTO) render resolution is not usable on 5.01 yet. Set the per-eye
->   render size by hand to your runtime's recommended size.
+1. Extract the release zip from [Releases](https://github.com/kaarele/witcher3-remastered-vr/releases) into the game folder (the folder that contains
+   `bin`, `content` and `mods`) and merge the folders.
+2. Make sure your headset's OpenXR runtime is the active one (SteamVR, Meta Quest Link, Virtual
+   Desktop, ...), then start the game.
+3. In **Options → Graphics**: Anti-aliasing **DLSS** (Quality or DLAA) on an RTX GPU, otherwise
+   **FXAA**; sharpening, NVIDIA Reflex and frame generation **off**.
+4. The included `bin\x64_dx12\witcher3vr.ini` is the tested Quest 3 setup (2476x2594 per eye).
+   For another headset, set `render_width` and `render_height` under `[openxr]` to your runtime's
+   recommended per-eye size.
 
-1. Build `dxgi.dll` and the launcher with Visual Studio 2022, see
-   [Building from source](#windows-visual-studio-2022).
-2. Extract a Witcher 3 VR Remastered release zip from
-   [joschi127/witcher3-vr releases](https://github.com/joschi127/witcher3-vr/releases) into the game
-   folder (the folder that contains `bin`, `content` and `mods`) and merge the folders.
-3. Replace these files in the game folder with the ones you built:
-   - `bin\x64_dx12\witcher3vr-mod-reference\dxgi.dll`
-   - `bin\x64_dx12\Witcher3VRLauncher.exe`
-4. Replace
-   `mods\modWitcher3VRStateBridge\content\scripts\local\witcher3vr\first_person_state_bridge.ws`
-   with the 5.01 version from `support/remaster/modWitcher3VRStateBridge/`. The 4.04 version does
-   not compile on 5.01.
-5. Optional: copy `linux/extra-mods/modW3VRKeepHudFrameScale` into the game's `mods` folder. It is
-   not Linux-specific. It keeps the VR HUD frame scale when the game's *Rescale HUD* screen opens,
-   which matters when `hud_horizontal_scale` or `hud_vertical_scale` is below 0.9.
-6. Start `bin\x64_dx12\Witcher3VRLauncher.exe`, press **Configure Settings for VR** once (it backs
-   up your game settings first), choose a Stereo mode (**Stereo - DLSS** or **Stereo - No AA /
-   FXAA**) and press **Save & Launch**.
-7. Optional, to match the Linux preset: with the launcher and the game closed, set
-   `remaster_asymmetric_ndc=1` under `[engine]` in `bin\x64_dx12\witcher3vr.ini`. The
-   [optional settings](#optional-settings-not-yet-default) can be added the same way. The launcher
-   keeps keys that it does not manage itself.
+The upstream Windows launcher (`launcher/`) is not part of the release yet: on 5.01 it has known
+problems (it expects `dx12filelist.txt`, which Steam 5.01 does not have, and its *Off* mode removes
+the game's `amd_fidelityfx_framegeneration_dx12.dll`).
 
-**Uninstall:** press **Restore Original Settings** in the launcher, then delete
-`bin\x64_dx12\dxgi.dll`, `bin\x64_dx12\witcher3vr.ini` and the files the release zip added.
-Deleting `bin\x64_dx12\dxgi.dll` alone already switches the mod off. *Verify integrity of game
-files* does **not** remove the mod, because it only restores files that belong to the game.
+**Uninstall:** delete `bin\x64_dx12\dxgi.dll` (this alone switches the mod off), then
+`bin\x64_dx12\openxr_loader.dll`, `bin\x64_dx12\witcher3vr.ini`, the `Witcher3VR` folder, the
+`mods\modWitcher3VR*` and `mods\modW3VRKeepHudFrameScale` folders and
+`bin\config\r4game\user_config_matrix\pc\modWitcher3VRHUDEditor.xml`.
 
-### Planned releases
+### Releases
 
-None of this is available yet. Each release on the
-[Releases page](https://github.com/kaarele/witcher3-remastered-vr/releases) is planned to have:
+Each release on the [Releases page](https://github.com/kaarele/witcher3-remastered-vr/releases) has:
 
-- `Witcher3RemasteredVR-<version>.zip`: one package for both Windows and Linux.
-- `SHA256SUMS.txt`: checksums of the release files. Check them with
-  `sha256sum -c SHA256SUMS.txt --ignore-missing` on Linux, or `Get-FileHash` in PowerShell on
-  Windows.
+- `Witcher3RemasteredVR-<version>.zip`: one package for Windows and Linux. Its folders mirror the
+  game folder, so it can be extracted straight into it. It replaces no game files.
+- `SHA256SUMS.txt`: checksums. Check with `sha256sum -c SHA256SUMS.txt --ignore-missing` on Linux,
+  or `Get-FileHash` in PowerShell on Windows.
 
-The package will need no other software: no Visual C++ Redistributable, no .NET, and no Python on
-Windows. Linux uses the system's Python 3. It will not include any NVIDIA files; DLSS uses the
-runtime that comes with the game and the graphics driver.
-
-- **Windows:** extract the zip into the game folder, start `bin\x64_dx12\Witcher3VRLauncher.exe`,
-  press **Configure Settings for VR** once, then **Save & Launch**. A later release is meant to add
-  a single installer that finds the Steam or GOG game folder by itself. The files are not
-  code-signed, so Windows SmartScreen may warn: choose **More info**, then **Run anyway**.
-- **Linux, including SteamOS and Bazzite (desktop mode):** extract the zip anywhere and start
-  `install-linux.sh` (on KDE: double-click and choose **Execute**; elsewhere run
-  `./install-linux.sh` in a terminal). It is meant to find the game, back up your saves, install
-  the mod, write the tested preset, detect your OpenXR runtime and set up the Steam launch options.
-  SteamOS has not been tested yet.
-- **Uninstall** will be one step on both systems. It removes exactly the files the mod added,
-  restores your original settings and never touches saves.
-- **Game updates** change the game build, and the mod then switches itself off until a mod release
-  supports the new build.
+The package needs no other software (no Visual C++ Redistributable, no .NET; Linux uses the system's
+Python 3). It contains no NVIDIA files: DLSS uses the files that come with the game and the
+driver. The files are not code-signed, so Windows SmartScreen may warn (**More info** → **Run
+anyway**). Game updates change the game build; the mod then switches itself off until a release
+supports the new build. A one-click installer for both systems is planned.
 
 ## Recommended settings
 
