@@ -418,7 +418,7 @@ In the HUD editor: `Q` / `E` select a panel, the arrow keys move it, the mouse w
 
 All keys live in `bin/x64_dx12/witcher3vr.ini`. The table lists the keys this project added or
 changed. The `remaster_*` keys, `hud_fade_mode`, `world_marker_exact_projection`,
-`hud_centre_split_aim_only` and `[perf] pair_barrier_lag` only act on the 5.01 build. The others
+`hud_centre_split_aim_only`, `world_marker_depth` and `[perf] pair_barrier_lag` only act on the 5.01 build. The others
 also apply to 4.04, where this project has not re-tested them. Change them with the game closed.
 The original mod's keys are documented in [witcher3vr.example.ini](witcher3vr.example.ini).
 
@@ -433,6 +433,8 @@ The original mod's keys are documented in [witcher3vr.example.ini](witcher3vr.ex
 | `menu_vertical_center` | `visible` | `visible`: menus and loading screens are centred on the visible image. `forward`: old behaviour. All builds. |
 | `world_marker_exact_projection` | `1` | Project interaction prompts and NPC or door markers exactly through the HUD plane. Needs the controller-locked level HUD (`hud_controller_locked=1`, `hud_anchor_level=1`) in Stereo. `0`: the game's markers. |
 | `hud_centre_split_aim_only` | `1` | Redraw the HUD's centre square (crosshair) about the render centre only while aiming. If the crosshair is off target while aiming, try `0`. |
+| `world_marker_depth` | `0` | Experimental, not tested in the headset yet. `1`: interaction prompts and NPC labels appear at the person's or object's distance instead of the HUD's. Needs `world_marker_exact_projection=1` and the controller-locked level HUD. Read at startup. |
+| `world_marker_depth_box` | `240,130,70` | With `world_marker_depth=1`: the HUD area moved with each marker, as half width, height above and height below the marker point, in 1920x1080 HUD pixels. Raise it if a long label is split between two depths. |
 | `cinema_restore_gameplay_recenter` | `1` | After a cutscene, gameplay keeps the forward direction it had before the cutscene. |
 | `frame_wait_early` | `0` | Experimental. Strict Stereo: wait for the next OpenXR frame right after submitting, in standard OpenXR loop order. No gain measured in headless tests with a WiVRn-like pacer; not tried in the headset. |
 | `pair_rate_divisor` | `0` | Experimental, `0`-`6`. Strict Stereo: hold each stereo pair for exactly N refreshes (2 = 45 pairs/s at 90 Hz). In headless tests it was less even than running free; keep `0`. |

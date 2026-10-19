@@ -1162,6 +1162,122 @@ void test_asymmetric_hud_source_shift() {
 
 } // namespace
 
+// [openxr] world_marker_depth: a marker's box drawn on the cyclopean plane at
+// the marker's inverse depth must land, in each eye, exactly where that eye
+// sees the marker's world point, while the head centre sees it unchanged.
+void test_world_marker_depth_plane() {
+    constexpr float baseline = 0.064f;
+    const XrFovf source_fov{-0.942478f, 0.942478f, 0.978828f, -0.978828f};
+    const XrFovf eye_fov{
+        -52.0f * kPi / 180.0f, 40.0f * kPi / 180.0f,
+        44.0f * kPi / 180.0f, -55.0f * kPi / 180.0f};
+    const auto views = make_views(
+        {0, 0, 0, 1}, {0, 0, 0, 1},
+        {0, 0, 0}, {0, 0, 0, 1},
+        {-baseline * 0.5f, 0, 0},
+        {baseline * 0.5f, 0, 0});
+    eye_geometry::EyeGeometry geometry{};
+    require(eye_geometry::compute(views, geometry), "marker depth geometry");
+    constexpr uint32_t width = 2476;
+    constexpr uint32_t height = 2594;
+    constexpr float hud_size = 0.5f;
+    const float origin_y = eye_geometry::visible_center_tangent_y(eye_fov);
+
+    // Box of a marker right of and above the centre.
+    std::array<uint32_t, 4> box{};
+    require(eye_geometry::world_marker_texel_box(
+        width, height, 0.30f, -0.20f, 240.0f, 130.0f, 70.0f, box),
+        "marker depth texel box");
+    float stage_x{};
+    float stage_y{};
+    require(eye_geometry::scaleform_stage_ratio_scale(
+        width, height, stage_x, stage_y), "marker depth stage scale");
+    const float movie_scale = std::min(width / 1920.0f, height / 1080.0f);
+    const float anchor_x = (0.5f + 0.5f * 0.30f * stage_x) * width;
+    const float anchor_y = (0.5f + 0.5f * -0.20f * stage_y) * height;
+    require(std::fabs(static_cast<float>(box[0]) -
+            std::floor(anchor_x - 240.0f * movie_scale)) < 0.5f &&
+        std::fabs(static_cast<float>(box[3]) -
+            std::ceil(anchor_y + 70.0f * movie_scale)) < 0.5f,
+        "marker depth box follows the stage mapping");
+    std::array<uint32_t, 4> rejected{};
+    require(!eye_geometry::world_marker_texel_box(
+        width, height, 4.0f, 0.0f, 240.0f, 130.0f, 70.0f, rejected),
+        "marker depth box outside the texture is rejected");
+
+    const float u0 = static_cast<float>(box[0]) / width;
+    const float v0 = static_cast<float>(box[1]) / height;
+    const float u1 = static_cast<float>(box[2]) / width;
+    const float v1 = static_cast<float>(box[3]) / height;
+    const float test_u = u0 + 0.37f * (u1 - u0);
+    const float test_v = v0 + 0.61f * (v1 - v0);
+    // Plane tangent of that texel (composite: origin + size * (source - origin)).
+    const float source_left = std::tan(source_fov.angleLeft);
+    const float source_right = std::tan(source_fov.angleRight);
+    const float source_up = std::tan(source_fov.angleUp);
+    const float source_down = std::tan(source_fov.angleDown);
+    const float centre_x = (source_left + source_right) * 0.5f;
+    const float plane_x = centre_x + hud_size *
+        (source_left + test_u * (source_right - source_left) - centre_x);
+    const float plane_y = origin_y + hud_size *
+        (source_up - test_v * (source_up - source_down) - origin_y);
+
+    const float hud_inverse_distance = 1.0f / 1.2f;
+    float disparity[2]{};
+    for (const float depth_m : {0.8f, 6.0f, 40.0f}) {
+        for (uint32_t eye = 0; eye < 2; ++eye) {
+            std::array<float, 16> plane{};
+            require(eye_geometry::build_cyclopean_hud_plane_clip_positions(
+                geometry, eye, source_fov, eye_fov, hud_size,
+                1.0f / depth_m, plane, origin_y),
+                "marker depth plane build");
+            std::array<float, 16> quad{};
+            eye_geometry::hud_plane_sub_rect_clip_positions(
+                plane, u0, v0, u1, v1, quad);
+            // Interpolate the box quad at the texel's box-local position.
+            const float s = (test_u - u0) / (u1 - u0);
+            const float t = (test_v - v0) / (v1 - v0);
+            float clip[4]{};
+            for (size_t c = 0; c < 4; ++c) {
+                clip[c] = quad[c] + s * (quad[4 + c] - quad[c]) +
+                    t * (quad[8 + c] - quad[c]);
+            }
+            // The world point in that direction at depth_m, seen by this eye.
+            const float eye_x = eye == 0 ? -baseline * 0.5f : baseline * 0.5f;
+            const float point_x = plane_x * depth_m;
+            const float point_y = plane_y * depth_m;
+            const float expected_tangent_x = (point_x - eye_x) / depth_m;
+            const float expected_tangent_y = point_y / depth_m;
+            const float left = std::tan(eye_fov.angleLeft);
+            const float right = std::tan(eye_fov.angleRight);
+            const float up = std::tan(eye_fov.angleUp);
+            const float down = std::tan(eye_fov.angleDown);
+            const float tangent_x =
+                left + (clip[0] / clip[3] + 1.0f) * 0.5f * (right - left);
+            const float tangent_y =
+                down + (clip[1] / clip[3] + 1.0f) * 0.5f * (up - down);
+            require(std::fabs(tangent_x - expected_tangent_x) < 2.0e-5f &&
+                std::fabs(tangent_y - expected_tangent_y) < 2.0e-5f,
+                "marker depth box lands on the world point in each eye");
+            // Last corner of the sub-rectangle matches the plane at (u1, v1).
+            const float plane_br_x = quad[12] / quad[15];
+            const float corner_x = (plane[0] + u1 * (plane[4] - plane[0]) +
+                v1 * (plane[8] - plane[0])) /
+                (plane[3] + u1 * (plane[7] - plane[3]) +
+                    v1 * (plane[11] - plane[3]));
+            require(std::fabs(plane_br_x - corner_x) < 1.0e-5f,
+                "marker depth sub-rectangle corner");
+            disparity[eye] = tangent_x;
+        }
+        // Angular disparity relative to the HUD plane: baseline * (1/D - 1/H).
+        const float relative = (disparity[1] - disparity[0]) -
+            (-baseline * hud_inverse_distance);
+        require(std::fabs(relative - baseline *
+                (hud_inverse_distance - 1.0f / depth_m)) < 3.0e-5f,
+            "marker depth disparity follows inverse depth");
+    }
+}
+
 int main() {
     test_parallel();
     test_symmetric_cant_and_antipodal();
@@ -1178,6 +1294,7 @@ int main() {
     test_strict_stereo_final_presentation_scale();
     test_asymmetric_hud_source_shift();
     test_hud_marker_clip_mapping();
+    test_world_marker_depth_plane();
     if (failures != 0) {
         std::fprintf(stderr, "%d eye-geometry test(s) failed\n", failures);
         return 1;

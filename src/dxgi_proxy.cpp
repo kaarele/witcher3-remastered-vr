@@ -664,6 +664,13 @@ struct Config {
     // the aim crosshair is drawn. Outside aiming it only lifts whatever
     // crosses it (markers of NPCs in front) by the scale-origin offset.
     bool hud_centre_split_aim_only{true};
+    // 5.01, exact route only: draw each world marker's HUD region (a box
+    // around its projected anchor) on a plane at the anchor's depth instead
+    // of the HUD plane, so prompts and NPC labels sit at the person's
+    // distance in stereo. Box: half width, height above and height below the
+    // anchor, in 1920x1080 Scaleform movie pixels.
+    bool world_marker_depth{false};
+    float world_marker_depth_box_px[3]{240.0f, 130.0f, 70.0f};
     bool reverse_enabled{false};
     bool reverse_scan_periodic{false};
     bool reverse_scan_unmap{false};
@@ -1694,6 +1701,9 @@ ID3D12DescriptorHeap* g_xr_hud_srv_heap{};
 UINT g_xr_hud_srv_increment{};
 ID3D12RootSignature* g_xr_hud_root_signature{};
 ID3D12PipelineState* g_xr_hud_pipeline{};
+// Built with the world-marker depth pass: root parameter 3 exists and every
+// HUD draw sets it.
+bool g_xr_hud_marker_depth_pipeline{};
 ID3D12RootSignature* g_xr_cinema_projection_root_signature{};
 ID3D12PipelineState* g_xr_cinema_projection_pipeline{};
 ID3D12DescriptorHeap* g_xr_cinema_projection_srv_heap{};
@@ -2807,6 +2817,22 @@ struct PackedWorldMarkerCameraSlot {
 std::atomic<uint32_t> g_world_marker_hud_size_bits{};
 std::atomic<uint32_t> g_world_marker_hud_origin_y_bits{};
 std::atomic<bool> g_world_marker_hud_plane_valid{};
+// [FEATURE:WORLD-MARKER-DEPTH 1/4] Markers projected by the exact route on the
+// script thread: anchor view ratio and smoothed inverse depth, matched across
+// ticks by world position.
+struct WorldMarkerDepthEntry {
+    float world[3]{};
+    float ratio[2]{};
+    float inverse_depth_m{};
+    uint64_t last_present{UINT64_MAX};
+    int64_t last_qpc{};
+    uint32_t ticks{};
+};
+constexpr size_t kWorldMarkerDepthEntryCount = 32;
+constexpr size_t kWorldMarkerDepthBoxCount = 12;
+std::mutex g_world_marker_depth_mutex{};
+std::array<WorldMarkerDepthEntry, kWorldMarkerDepthEntryCount>
+    g_world_marker_depth_entries{};
 std::atomic<bool> g_hud_centre_split_active{};
 PackedWorldMarkerCameraSlot g_packed_world_marker_camera{};
 constexpr size_t kMode3WorldMarkerCameraPairSlotCount = 16;
@@ -17141,6 +17167,22 @@ void load_config() {
             "openxr", "world_marker_exact_projection", true);
         g_config.hud_centre_split_aim_only = read_ini_bool(
             "openxr", "hud_centre_split_aim_only", true);
+        g_config.world_marker_depth = read_ini_bool(
+            "openxr", "world_marker_depth", false);
+        {
+            const std::string box = read_ini_string(
+                "openxr", "world_marker_depth_box", "240,130,70");
+            float values[3]{};
+            if (sscanf_s(box.c_str(), "%f,%f,%f",
+                    &values[0], &values[1], &values[2]) == 3) {
+                for (size_t index = 0; index < 3; ++index) {
+                    g_config.world_marker_depth_box_px[index] =
+                        std::isfinite(values[index])
+                        ? std::clamp(values[index], 0.0f, 960.0f)
+                        : g_config.world_marker_depth_box_px[index];
+                }
+            }
+        }
         apply_hud_frame_scale();
 
         g_config.reverse_enabled = read_ini_bool("reverse", "enabled", false);
@@ -17752,6 +17794,11 @@ void load_config() {
             g_config.hud_anchor_level ? 1 : 0,
             g_config.hud_scale_origin_visible ? "visible" : "render",
             g_config.menu_center_visible ? "visible" : "forward");
+        log_line("Config world marker depth=%d box_px=%.0f,%.0f,%.0f",
+            g_config.world_marker_depth ? 1 : 0,
+            g_config.world_marker_depth_box_px[0],
+            g_config.world_marker_depth_box_px[1],
+            g_config.world_marker_depth_box_px[2]);
         log_line("RANDC config requested=%d reproject=%d cascade_fix=%d offset_index=0x%zX reprojection_index=0x%zX mode=%d native_stereo=%d hmd_freelook=%d",
             g_config.remaster_asymmetric_ndc ? 1 : 0,
             g_config.remaster_asymmetric_ndc_reproject ? 1 : 0,
@@ -46202,6 +46249,179 @@ bool sample_world_marker_exact_projection(
     return true;
 }
 
+// [FEATURE:WORLD-MARKER-DEPTH 2/4] [openxr] world_marker_depth: the exact
+// route projects each marker locally (the native's arithmetic, as the
+// diagnostics sample does) to learn its world point. The depth is clip w over
+// the length of the matrix's w column: the distance along the level marker
+// camera's forward axis, which is the HUD plane's normal.
+bool project_world_marker_with_depth(
+    void* camera_shadow,
+    void* stack,
+    uint8_t* result,
+    float* world,
+    float* ratio,
+    bool& fault) {
+    bool handled{};
+    __try {
+        handled = project_world_vector_to_view_ratio_locally(
+            camera_shadow, stack, result, 1.0f, world, ratio);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        fault = true;
+    }
+    return handled;
+}
+
+void track_world_marker_depth(
+    const float* world,
+    const float* ratio,
+    float depth_m,
+    uint64_t present) {
+    // One tick is two presents (one per eye). A label updated every tick
+    // moves well below 0.3 m between ticks; entries unseen for three ticks
+    // are free.
+    constexpr float kMatchDistanceM = 0.30f;
+    constexpr uint64_t kLivePresents = 6;
+    // Disparity is linear in inverse distance; smooth that, as the reticle.
+    constexpr float kDepthTauSeconds = 0.08f;
+    LARGE_INTEGER now{};
+    LARGE_INTEGER frequency{};
+    QueryPerformanceCounter(&now);
+    QueryPerformanceFrequency(&frequency);
+    const float inverse_depth = 1.0f / std::clamp(depth_m, 0.5f, 1000.0f);
+    std::scoped_lock lock{g_world_marker_depth_mutex};
+    WorldMarkerDepthEntry* match{};
+    WorldMarkerDepthEntry* free_entry{};
+    WorldMarkerDepthEntry* oldest{};
+    float match_distance_sq = kMatchDistanceM * kMatchDistanceM;
+    for (auto& entry : g_world_marker_depth_entries) {
+        const bool live = entry.last_present != UINT64_MAX &&
+            entry.last_present + kLivePresents >= present;
+        if (!live) {
+            if (free_entry == nullptr) {
+                free_entry = &entry;
+            }
+            continue;
+        }
+        if (oldest == nullptr || entry.last_present < oldest->last_present) {
+            oldest = &entry;
+        }
+        float distance_sq{};
+        for (size_t axis = 0; axis < 3; ++axis) {
+            const float delta = entry.world[axis] - world[axis];
+            distance_sq += delta * delta;
+        }
+        if (distance_sq < match_distance_sq) {
+            match_distance_sq = distance_sq;
+            match = &entry;
+        }
+    }
+    if (match == nullptr) {
+        match = free_entry != nullptr ? free_entry : oldest;
+        if (match == nullptr) {
+            return;
+        }
+        *match = {};
+        match->inverse_depth_m = inverse_depth;
+        match->ticks = 1;
+    } else if (match->last_present != present) {
+        match->ticks = std::min(match->ticks + 1, 1000u);
+        const float delta_seconds = frequency.QuadPart > 0 &&
+                now.QuadPart > match->last_qpc
+            ? std::clamp(
+                static_cast<float>(now.QuadPart - match->last_qpc) /
+                    static_cast<float>(frequency.QuadPart),
+                0.0f, 0.25f)
+            : 0.0f;
+        const float alpha = 1.0f - std::exp(-delta_seconds / kDepthTauSeconds);
+        match->inverse_depth_m +=
+            (inverse_depth - match->inverse_depth_m) * alpha;
+    }
+    memcpy(match->world, world, sizeof(match->world));
+    memcpy(match->ratio, ratio, sizeof(match->ratio));
+    match->last_present = present;
+    match->last_qpc = now.QuadPart;
+}
+
+// Returns true when the script stack was consumed (the native must not run).
+bool record_world_marker_depth(
+    void* camera_shadow,
+    void* stack,
+    uint8_t* result,
+    uint64_t present) {
+    float world[4]{};
+    float ratio[2]{NAN, NAN};
+    bool fault{};
+    const bool handled = project_world_marker_with_depth(
+        camera_shadow, stack, result, world, ratio, fault);
+    if (fault) {
+        // The cursor may be partly consumed; never run the native on it.
+        if (result != nullptr) {
+            *result = 0;
+        }
+        return true;
+    }
+    if (!handled) {
+        return false;
+    }
+    if (result == nullptr || *result == 0 ||
+        !std::isfinite(ratio[0]) || !std::isfinite(ratio[1]) ||
+        std::fabs(ratio[0]) > 1.5f || std::fabs(ratio[1]) > 1.5f) {
+        return true;
+    }
+    const auto* matrix = reinterpret_cast<const float*>(
+        static_cast<const uint8_t*>(camera_shadow) + 0x2E0);
+    const float clip_w = world[0] * matrix[3] + world[1] * matrix[7] +
+        world[2] * matrix[11] + world[3] * matrix[15];
+    const float w_axis = sqrtf(matrix[3] * matrix[3] +
+        matrix[7] * matrix[7] + matrix[11] * matrix[11]);
+    if (!std::isfinite(clip_w) || !std::isfinite(w_axis) ||
+        w_axis <= 1.0e-6f) {
+        return true;
+    }
+    const float depth_m = clip_w / w_axis;
+    if (!std::isfinite(depth_m) || depth_m < 0.05f) {
+        return true;
+    }
+    track_world_marker_depth(world, ratio, depth_m, present);
+    return true;
+}
+
+struct WorldMarkerDepthBox {
+    float ratio[2]{};
+    float inverse_depth_m{};
+};
+
+// Confirmed (seen in three ticks) and fresh markers, nearest first.
+size_t collect_world_marker_depth_boxes(
+    uint64_t present,
+    std::array<WorldMarkerDepthBox, kWorldMarkerDepthBoxCount>& boxes) {
+    constexpr uint64_t kFreshPresents = 6;
+    constexpr uint32_t kConfirmedTicks = 3;
+    std::array<WorldMarkerDepthBox, kWorldMarkerDepthEntryCount> candidates{};
+    size_t candidate_count{};
+    {
+        std::scoped_lock lock{g_world_marker_depth_mutex};
+        for (const auto& entry : g_world_marker_depth_entries) {
+            if (entry.last_present == UINT64_MAX ||
+                entry.ticks < kConfirmedTicks ||
+                entry.last_present + kFreshPresents < present) {
+                continue;
+            }
+            auto& candidate = candidates[candidate_count++];
+            candidate.ratio[0] = entry.ratio[0];
+            candidate.ratio[1] = entry.ratio[1];
+            candidate.inverse_depth_m = entry.inverse_depth_m;
+        }
+    }
+    std::sort(candidates.begin(), candidates.begin() + candidate_count,
+        [](const WorldMarkerDepthBox& left, const WorldMarkerDepthBox& right) {
+            return left.inverse_depth_m > right.inverse_depth_m;
+        });
+    const size_t count = std::min(candidate_count, boxes.size());
+    std::copy_n(candidates.begin(), count, boxes.begin());
+    return count;
+}
+
 void __fastcall hook_engine_world_vector_to_view_ratio(
     void* camera,
     void* stack,
@@ -46530,6 +46750,16 @@ void __fastcall hook_engine_world_vector_to_view_ratio(
                 camera, stack, result);
             return;
         }
+    }
+    // [FEATURE:WORLD-MARKER-DEPTH 3/4] Same result as the native, plus the
+    // marker's anchor and depth for the composite.
+    if (exact_projection && g_config.world_marker_depth &&
+        record_world_marker_depth(camera_shadow, stack, result, present)) {
+        record_world_marker_diagnostic(
+            1, present, projection_metadata,
+            fnv1a64(hmd_view_projection.data(), sizeof(hmd_view_projection)),
+            camera, stack, result);
+        return;
     }
     g_engine_world_vector_to_view_ratio(camera_shadow, stack, result);
     record_world_marker_diagnostic(
@@ -55568,6 +55798,16 @@ cbuffer HudPlaneVertices : register(b0) {
     float4 clip_bottom_left;
     float4 clip_bottom_right;
 };
+#if W3VR_MARKER_DEPTH
+// [FEATURE:WORLD-MARKER-DEPTH] uv rectangle of this quad (whole HUD: 0,0,1,1),
+// header (box count, box pass k + 1 or 0, skip the centre square) and up to
+// 12 texel boxes [x0,x1) x [y0,y1), 16 bits each, two per register.
+cbuffer HudMarkerDepth : register(b2) {
+    float4 marker_uv_rect;
+    uint4 marker_header;
+    uint4 marker_boxes[6];
+};
+#endif
 struct VertexOutput {
     float4 position : SV_Position;
     float2 uv : TEXCOORD0;
@@ -55590,6 +55830,10 @@ VertexOutput vs_main(uint vertex_id : SV_VertexID) {
         output.position = clip_bottom_right;
         output.uv = float2(1.0, 1.0);
     }
+#if W3VR_MARKER_DEPTH
+    output.uv = marker_uv_rect.xy +
+        output.uv * (marker_uv_rect.zw - marker_uv_rect.xy);
+#endif
     return output;
 }
 )";
@@ -55604,6 +55848,13 @@ cbuffer HudSamplingParameters : register(b1) {
     float reticle_half_extent_fraction;
     uint filtered_sampling;
 };
+#if W3VR_MARKER_DEPTH
+cbuffer HudMarkerDepth : register(b2) {
+    float4 marker_uv_rect;
+    uint4 marker_header;
+    uint4 marker_boxes[6];
+};
+#endif
 struct PixelInput {
     float4 position : SV_Position;
     float2 uv : TEXCOORD0;
@@ -55678,6 +55929,37 @@ float4 ps_main(PixelInput input) : SV_Target0 {
         (reticle_pass == 2u && !inside_reticle)) {
         return float4(0.0, 0.0, 0.0, 0.0);
     }
+#if W3VR_MARKER_DEPTH
+    // World-marker boxes are drawn on their own depth planes. The fixed-depth
+    // passes skip every box; the pass for box k keeps box k minus the earlier
+    // (nearer) boxes and, while a centre pass runs, minus the centre square.
+    uint marker_count = min(marker_header.x, 12u);
+    if (marker_count != 0u) {
+        bool inside_current = false;
+        bool inside_other = false;
+        [unroll] for (uint marker = 0u; marker < 12u; ++marker) {
+            uint4 packed_pair = marker_boxes[marker / 2u];
+            uint2 packed = (marker & 1u) != 0u
+                ? packed_pair.zw : packed_pair.xy;
+            int4 box = int4(
+                int(packed.x & 0xFFFFu), int(packed.x >> 16),
+                int(packed.y & 0xFFFFu), int(packed.y >> 16));
+            bool inside = marker < marker_count &&
+                all(coordinate >= box.xy) && all(coordinate < box.zw);
+            if (marker + 1u == marker_header.y) {
+                inside_current = inside;
+            } else if (inside &&
+                (marker_header.y == 0u || marker + 1u < marker_header.y)) {
+                inside_other = true;
+            }
+        }
+        if (inside_other ||
+            (marker_header.y != 0u && (!inside_current ||
+                (marker_header.z != 0u && inside_reticle)))) {
+            return float4(0.0, 0.0, 0.0, 0.0);
+        }
+    }
+#endif
     if (filtered_sampling != 0u && geometry_owns_hud_transform != 0u) {
         // Box-filter the pixel footprint with up to 4x4 bilinear taps in
         // premultiplied linear light. A single nearest Load drops 3 of 4 HUD
@@ -55744,11 +56026,18 @@ float4 ps_main(PixelInput input) : SV_Target0 {
         return shader;
     };
 
+    // [FEATURE:WORLD-MARKER-DEPTH] [openxr] world_marker_depth (read once at
+    // startup) selects the shader variant and the fourth root parameter.
+    const bool marker_depth = g_config.world_marker_depth;
+    const std::string marker_depth_define = marker_depth
+        ? "#define W3VR_MARKER_DEPTH 1\n" : "#define W3VR_MARKER_DEPTH 0\n";
+    const std::string vertex_source = marker_depth_define + kVertexShader;
+    const std::string pixel_source = marker_depth_define + kPixelShader;
     IDxcBlob* vertex_shader = compile_stage(
-        kVertexShader, sizeof(kVertexShader) - 1,
+        vertex_source.c_str(), vertex_source.size(),
         L"vs_main", L"vs_6_0");
     IDxcBlob* pixel_shader = compile_stage(
-        kPixelShader, sizeof(kPixelShader) - 1,
+        pixel_source.c_str(), pixel_source.size(),
         L"ps_main", L"ps_6_0");
     if (vertex_shader == nullptr || pixel_shader == nullptr) {
         if (vertex_shader != nullptr) vertex_shader->Release();
@@ -55762,7 +56051,7 @@ float4 ps_main(PixelInput input) : SV_Target0 {
     range.BaseShaderRegister = 0;
     range.RegisterSpace = 0;
     range.OffsetInDescriptorsFromTableStart = 0;
-    D3D12_ROOT_PARAMETER parameters[3]{};
+    D3D12_ROOT_PARAMETER parameters[4]{};
     parameters[0].ParameterType =
         D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     parameters[0].DescriptorTable = {1, &range};
@@ -55779,8 +56068,14 @@ float4 ps_main(PixelInput input) : SV_Target0 {
     parameters[2].Constants.RegisterSpace = 0;
     parameters[2].Constants.Num32BitValues = 8;
     parameters[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    parameters[3].ParameterType =
+        D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    parameters[3].Constants.ShaderRegister = 2;
+    parameters[3].Constants.RegisterSpace = 0;
+    parameters[3].Constants.Num32BitValues = 32;
+    parameters[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
     D3D12_ROOT_SIGNATURE_DESC root_desc{};
-    root_desc.NumParameters = static_cast<UINT>(std::size(parameters));
+    root_desc.NumParameters = marker_depth ? 4u : 3u;
     root_desc.pParameters = parameters;
     root_desc.Flags =
         D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
@@ -55857,9 +56152,12 @@ float4 ps_main(PixelInput input) : SV_Target0 {
     }
     g_xr_hud_srv_increment =
         g_d3d12_device->GetDescriptorHandleIncrementSize(heap_desc.Type);
+    g_xr_hud_marker_depth_pipeline = marker_depth;
     log_line(
-        "Mode 3 projection HUD pipeline ready descriptors=%u format=%u",
-        descriptor_count, static_cast<unsigned>(target_format));
+        "Mode 3 projection HUD pipeline ready descriptors=%u format=%u "
+        "marker_depth=%d",
+        descriptor_count, static_cast<unsigned>(target_format),
+        marker_depth ? 1 : 0);
     return true;
 }
 
@@ -56385,6 +56683,26 @@ bool composite_mode3_hud_into_projection_image(
                     reticle_inverse_distance_m,
                     reticle_clip_positions[eye]);
     }
+    // [FEATURE:WORLD-MARKER-DEPTH 4/4] World markers of the exact route on
+    // the fixed level plane: each marker's box is cut from the HUD-depth pass
+    // and drawn on the same cyclopean plane at the marker's inverse depth
+    // (identical from the head centre, the marker's disparity in each eye).
+    struct HudMarkerDepthConstants {
+        float uv_rect[4]{0.0f, 0.0f, 1.0f, 1.0f};
+        uint32_t header[4]{};
+        uint32_t boxes[kWorldMarkerDepthBoxCount * 2]{};
+    };
+    static_assert(sizeof(HudMarkerDepthConstants) == 32 * sizeof(uint32_t));
+    std::array<WorldMarkerDepthBox, kWorldMarkerDepthBoxCount>
+        marker_depth_boxes{};
+    size_t marker_depth_count{};
+    if (g_xr_hud_marker_depth_pipeline && g_config.world_marker_depth &&
+        controller_locked_hud_active && controller_hud_visible &&
+        world_marker_exact_projection_active()) {
+        marker_depth_count = collect_world_marker_depth_boxes(
+            g_present_count.load(std::memory_order_relaxed),
+            marker_depth_boxes);
+    }
     for (uint32_t eye = 0; eye < 2; ++eye) {
         const bool fitted_eye = !cinema_projection &&
             !headset_projection &&
@@ -56532,6 +56850,57 @@ bool composite_mode3_hud_into_projection_image(
             &sampling_constants[6],
             &kReticleHalfExtentFraction,
             sizeof(kReticleHalfExtentFraction));
+        // Texel boxes of this eye's HUD source (the anchor follows the exact
+        // mapping: texture NDC = view ratio * stage scale) and their quads,
+        // the box's part of the plane at the marker's depth. A box is cut
+        // from the HUD-depth pass only when its quad exists.
+        HudMarkerDepthConstants marker_constants{};
+        const HudMarkerDepthConstants no_marker_constants{};
+        std::array<std::array<float, 16>, kWorldMarkerDepthBoxCount>
+            marker_box_clips{};
+        std::array<std::array<float, 4>, kWorldMarkerDepthBoxCount>
+            marker_box_uvs{};
+        uint32_t marker_draw_count{};
+        const uint32_t source_width =
+            static_cast<uint32_t>(source_descs[eye].Width);
+        const uint32_t source_height = source_descs[eye].Height;
+        for (size_t index = 0;
+             index < marker_depth_count && controller_hud_visible;
+             ++index) {
+            const auto& marker = marker_depth_boxes[index];
+            std::array<uint32_t, 4> box{};
+            std::array<float, 16> plane_clip{};
+            if (!w3vr::openxr_eye_geometry::world_marker_texel_box(
+                    source_width, source_height,
+                    marker.ratio[0], marker.ratio[1],
+                    g_config.world_marker_depth_box_px[0],
+                    g_config.world_marker_depth_box_px[1],
+                    g_config.world_marker_depth_box_px[2], box) ||
+                !w3vr::openxr_eye_geometry::
+                    build_cyclopean_hud_plane_clip_positions(
+                        hud_plane_geometry, eye, source_render_fov,
+                        submitted_views[eye].fov, hud_size,
+                        marker.inverse_depth_m, plane_clip,
+                        hud_scale_origin_tangent_y)) {
+                continue;
+            }
+            const uint32_t slot = marker_draw_count++;
+            marker_constants.boxes[slot * 2] = box[0] | (box[1] << 16);
+            marker_constants.boxes[slot * 2 + 1] = box[2] | (box[3] << 16);
+            auto& uv = marker_box_uvs[slot];
+            uv[0] = static_cast<float>(box[0]) /
+                static_cast<float>(source_width);
+            uv[1] = static_cast<float>(box[1]) /
+                static_cast<float>(source_height);
+            uv[2] = static_cast<float>(box[2]) /
+                static_cast<float>(source_width);
+            uv[3] = static_cast<float>(box[3]) /
+                static_cast<float>(source_height);
+            w3vr::openxr_eye_geometry::hud_plane_sub_rect_clip_positions(
+                plane_clip, uv[0], uv[1], uv[2], uv[3],
+                marker_box_clips[slot]);
+        }
+        marker_constants.header[0] = marker_draw_count;
         if (controller_hud_visible) {
             g_xr_command_list->SetGraphicsRoot32BitConstants(
                 1, static_cast<UINT>(hud_clip_positions[eye].size()),
@@ -56539,7 +56908,15 @@ bool composite_mode3_hud_into_projection_image(
             g_xr_command_list->SetGraphicsRoot32BitConstants(
                 2, static_cast<UINT>(std::size(sampling_constants)),
                 sampling_constants, 0);
+            if (g_xr_hud_marker_depth_pipeline) {
+                g_xr_command_list->SetGraphicsRoot32BitConstants(
+                    3, 32, &marker_constants, 0);
+            }
             g_draw_instanced(g_xr_command_list, 6, 1, 0, 0);
+        }
+        if (g_xr_hud_marker_depth_pipeline) {
+            g_xr_command_list->SetGraphicsRoot32BitConstants(
+                3, 32, &no_marker_constants, 0);
         }
         if (distance_converged_reticle) {
             sampling_constants[5] = 2u;
@@ -56567,6 +56944,58 @@ bool composite_mode3_hud_into_projection_image(
                 sampling_constants,
                 0);
             g_draw_instanced(g_xr_command_list, 6, 1, 0, 0);
+        }
+        // Marker passes last, so a label shifted over neighbouring HUD
+        // pixels stays on top.
+        for (uint32_t box = 0; box < marker_draw_count; ++box) {
+            HudMarkerDepthConstants box_constants = marker_constants;
+            memcpy(box_constants.uv_rect, marker_box_uvs[box].data(),
+                sizeof(box_constants.uv_rect));
+            box_constants.header[1] = box + 1;
+            box_constants.header[2] =
+                (distance_converged_reticle || centre_split_draw) ? 1u : 0u;
+            sampling_constants[5] = 3u;
+            g_xr_command_list->SetGraphicsRoot32BitConstants(
+                1, static_cast<UINT>(marker_box_clips[box].size()),
+                marker_box_clips[box].data(), 0);
+            g_xr_command_list->SetGraphicsRoot32BitConstants(
+                2, static_cast<UINT>(std::size(sampling_constants)),
+                sampling_constants, 0);
+            g_xr_command_list->SetGraphicsRoot32BitConstants(
+                3, 32, &box_constants, 0);
+            g_draw_instanced(g_xr_command_list, 6, 1, 0, 0);
+        }
+        if (eye == 0 && marker_depth_count != 0 &&
+            g_config.world_marker_diagnostics) {
+            static std::atomic<uint64_t> last_depth_log_present{};
+            static std::atomic<uint32_t> depth_logs{};
+            const uint64_t depth_log_present =
+                g_present_count.load(std::memory_order_relaxed);
+            if (depth_log_present >=
+                    last_depth_log_present.load(std::memory_order_relaxed) +
+                        90 &&
+                take_bounded_log_slot(depth_logs, 200)) {
+                last_depth_log_present.store(
+                    depth_log_present, std::memory_order_relaxed);
+                const float hud_distance_m =
+                    fabsf(inverse_hud_distance) > 1.0e-6f
+                    ? 1.0f / inverse_hud_distance : INFINITY;
+                log_line(
+                    "World marker depth present=%llu pair=%llu markers=%zu "
+                    "drawn=%u hud_distance_m=%.2f nearest_m=%.2f "
+                    "nearest_ratio=%.3f,%.3f box0=%u,%u-%u,%u",
+                    static_cast<unsigned long long>(depth_log_present),
+                    static_cast<unsigned long long>(scene_pair_id),
+                    marker_depth_count, marker_draw_count, hud_distance_m,
+                    marker_depth_boxes[0].inverse_depth_m > 0.0f
+                        ? 1.0f / marker_depth_boxes[0].inverse_depth_m : 0.0f,
+                    marker_depth_boxes[0].ratio[0],
+                    marker_depth_boxes[0].ratio[1],
+                    marker_constants.boxes[0] & 0xFFFFu,
+                    marker_constants.boxes[0] >> 16,
+                    marker_constants.boxes[1] & 0xFFFFu,
+                    marker_constants.boxes[1] >> 16);
+            }
         }
     }
     return true;

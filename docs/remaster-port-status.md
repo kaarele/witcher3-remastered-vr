@@ -565,6 +565,29 @@ null OpenXR runtime.
 - Status: verified with the null OpenXR runtime; headset confirmation pending (the exact mapping is
   active with the values above). The aim-only centre split is not tested yet.
 
+### World markers at their target's depth (experimental)
+- Owner request: interaction prompts and NPC labels sat on their targets but at the HUD's depth.
+- `[openxr] world_marker_depth` (default 0, read at startup; 5.01, exact route only): the
+  WorldVectorToViewRatio hook projects each marker locally (the native's arithmetic, as the
+  diagnostics sample) and records its view ratio and depth (clip w over the length of the w
+  column: the distance along the level marker camera's forward axis, the HUD plane's normal).
+  Markers are matched across ticks by world position (0.3 m), smoothed in inverse depth (80 ms)
+  and used once seen in 3 ticks; nearest first, 12 at most.
+- Composite: each marker's box (`world_marker_depth_box`, movie pixels around the anchor) is cut
+  from the HUD-depth pass and drawn as its part of the same cyclopean plane at the marker's
+  inverse depth. From the head centre nothing moves; each eye gets the marker's disparity.
+  A nearer marker owns overlapping texels; the centre square stays with the reticle/centre pass.
+- With the key at 0 the shaders compile to the same DXIL as before (checked with DXC 1.8.2407),
+  the root signature is unchanged and the hook calls the native as before.
+- Limits: the box moves whatever HUD content lies inside it (a minimap corner next to a label);
+  a label longer than the box is split between two depths; callers of the native that are not
+  labels (bird and target checks) also make boxes, usually over empty HUD; markers refreshed
+  less often than every tick (Witcher Sense icons) stay at the HUD depth.
+- Unit test: `renderer_eye_geometry` checks that a texel of a marker box drawn at 0.8, 6 and 40 m
+  lands on the world point in each eye and that the disparity relative to the HUD plane is
+  baseline x (1/H - 1/D).
+- Status: built and unit-tested; not run in the game yet.
+
 ### Near view "zooming in and out" on 5.01
 - Camera trace (`[debug] camera_offset_trace=1`, null HMD, scripted panning): the near offset was
   applied on every factory camera (no flips), and the horse camera's orbit radius stayed constant
