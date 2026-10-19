@@ -664,10 +664,13 @@ Please reproduce problems without other mods installed first.
 
 ## Support the project
 
-Toss a coin to your modder! If this mod let you hunt drowners in VR without turning as green as
-one, you can buy me a coffee (or, at this rate, a new CPU) at
-**[ko-fi.com/kaarele](https://ko-fi.com/kaarele)**. The VR mod this all builds on is
-tig3rmast3r's work, and he has a Ko-fi too: [ko-fi.com/tig3rmast3r](https://ko-fi.com/tig3rmast3r).
+Toss a coin to your modder! If I get enough donations for a new GPU to keep up with the game, I
+might have motivation to keep this mod updated.
+
+**[ko-fi.com/kaarele](https://ko-fi.com/kaarele)**
+
+The VR mod this all builds on is tig3rmast3r's work, and he has a Ko-fi too:
+[ko-fi.com/tig3rmast3r](https://ko-fi.com/tig3rmast3r).
 
 Donations are entirely voluntary. The mod is free and non-commercial and will stay that way: no
 paid, early-access or supporter-only builds. Everyone gets the same Witcher, and the same Roach.
