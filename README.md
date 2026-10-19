@@ -11,7 +11,7 @@ Proton today. Windows support is being worked on. This project continues the
 
 **Linux** (Steam + Proton, headset through WiVRn): the tested setup.
 
-1. Download `Witcher3RemasteredVR-v0.1.1.zip` from **[Releases](https://github.com/kaarele/witcher3-remastered-vr/releases)**.
+1. Download `Witcher3RemasteredVR-v0.1.2.zip` from **[Releases](https://github.com/kaarele/witcher3-remastered-vr/releases)**.
 2. In Steam: right-click *The Witcher 3* → **Manage** → **Browse local files**.
 3. Extract the zip into that folder and merge the folders.
 4. Close the game. Open a terminal in that folder and run:
@@ -26,7 +26,7 @@ Proton today. Windows support is being worked on. This project continues the
 
 **Windows** (not tested yet, so please report how it goes):
 
-1. Download `Witcher3RemasteredVR-v0.1.1.zip` from **[Releases](https://github.com/kaarele/witcher3-remastered-vr/releases)**.
+1. Download `Witcher3RemasteredVR-v0.1.2.zip` from **[Releases](https://github.com/kaarele/witcher3-remastered-vr/releases)**.
 2. Extract it into the game folder (the one with `bin`, `content` and `mods`).
 3. Start your headset's OpenXR runtime (SteamVR, Meta Quest Link, Virtual Desktop, ...).
 4. Start the game. In **Options → Graphics** set Anti-aliasing to **DLSS** (Quality or DLAA), and
