@@ -61,8 +61,10 @@ cinema screen, F11 first person. Mouse/keyboard or a gamepad; VR controllers are
 **Not tested:** AMD and Intel GPUs (use FXAA there), headsets other than Quest 3, the GOG edition,
 SteamOS / Steam Deck.
 
-**Known issues:** in first person (F11) Geralt can walk at an angle to where you look (press F9
-while facing forward) and the camera sits inside his head. "Press A to talk" labels float at the
+**Known issues:** loading into the game takes much longer than usual (roughly 5 times as long on
+the test setup). It is not yet known how much of that is the mod and how much is the game under
+Proton, which also loads slowly without the mod. In first person (F11) Geralt can walk at an angle
+to where you look (press F9 while facing forward) and the camera sits inside his head. "Press A to talk" labels float at the
 HUD's distance instead of at the person's depth. More in
 [Troubleshooting and known issues](#troubleshooting-and-known-issues).
 
@@ -541,8 +543,12 @@ you built yourself or downloaded from this repository's releases.
 
 Known issues:
 
-- Under Proton, the game loads more slowly than on Windows, and the automatic reload after
-  Geralt dies can hang. Both also happen without the mod; quit the game and load the save manually.
+- **Slow loading.** With the mod, loading a save took roughly 5 times as long as usual on the test
+  setup: expect a few minutes. The game under Proton also loads more slowly than on Windows without
+  the mod, and how much of the slowdown the mod adds has not been measured yet. Be patient on the
+  loading screen; the game has not hung.
+- Under Proton the automatic reload after Geralt dies can hang, also without the mod. Quit the game
+  and load the save manually.
 - The desktop game window takes the per-eye size, so it can be taller than your monitor. This is
   harmless.
 - Some dialogue cameras clip slightly through walls.
