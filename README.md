@@ -669,12 +669,6 @@ might have motivation to keep this mod updated.
 
 **[ko-fi.com/kaarele](https://ko-fi.com/kaarele)**
 
-The VR mod this all builds on is tig3rmast3r's work, and he has a Ko-fi too:
-[ko-fi.com/tig3rmast3r](https://ko-fi.com/tig3rmast3r).
-
-Donations are entirely voluntary. The mod is free and non-commercial and will stay that way: no
-paid, early-access or supporter-only builds. Everyone gets the same Witcher, and the same Roach.
-
 ## License and credits
 
 ### License
@@ -747,9 +741,9 @@ Transitions DLC based on the
 This project's release packages will not include any of them. You can get them, with their credits
 and licenses, from the [original release](https://github.com/tig3rmast3r/witcher3-vr/releases).
 
-Ko-fi links for this project and for the original author are under
-[Support the project](#support-the-project). This project is free and non-commercial; there are no
-paid or supporter-only builds.
+To support this project, see [Support the project](#support-the-project); to support the original
+author, see [tig3rmast3r's Ko-fi](https://ko-fi.com/tig3rmast3r). This project is free and
+non-commercial; there are no paid or supporter-only builds.
 
 ### Disclaimer
 
