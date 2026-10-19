@@ -11,7 +11,7 @@ Proton today. Windows support is being worked on. This project continues the
 
 **Linux** (Steam + Proton, headset through WiVRn): the tested setup.
 
-1. Download `Witcher3RemasteredVR-v0.1.0-alpha.1.zip` from **[Releases](https://github.com/kaarele/witcher3-remastered-vr/releases)**.
+1. Download `Witcher3RemasteredVR-v0.1.1.zip` from **[Releases](https://github.com/kaarele/witcher3-remastered-vr/releases)**.
 2. In Steam: right-click *The Witcher 3* → **Manage** → **Browse local files**.
 3. Extract the zip into that folder and merge the folders.
 4. Close the game. Open a terminal in that folder and run:
@@ -26,7 +26,7 @@ Proton today. Windows support is being worked on. This project continues the
 
 **Windows** (not tested yet, so please report how it goes):
 
-1. Download `Witcher3RemasteredVR-v0.1.0-alpha.1.zip` from **[Releases](https://github.com/kaarele/witcher3-remastered-vr/releases)**.
+1. Download `Witcher3RemasteredVR-v0.1.1.zip` from **[Releases](https://github.com/kaarele/witcher3-remastered-vr/releases)**.
 2. Extract it into the game folder (the one with `bin`, `content` and `mods`).
 3. Start your headset's OpenXR runtime (SteamVR, Meta Quest Link, Virtual Desktop, ...).
 4. Start the game. In **Options → Graphics** set Anti-aliasing to **DLSS** (Quality or DLAA), and
@@ -49,14 +49,16 @@ cinema screen, F11 first person. Mouse/keyboard or a gamepad; VR controllers are
 - No black rectangles when cutscenes or loading screens fade.
 - Geralt stays centred in front of you, also after cutscenes.
 - Shadows and flickering lights look the same in both eyes.
+- About 15% more frames per second with DLSS Quality: the game prepares the next frame early, and
+  both eyes still show every character in the same pose. (With DLAA the graphics card is the limit,
+  so it gains nothing there.)
+- People keep animating when you look at them with your head rather than the game camera.
 
-**Coming soon / being tested:**
+**Coming soon:**
 - SteamVR, on Linux and Windows.
 - Windows in general (the code should work, but nobody has run it yet).
-- About 15% more frames per second from letting the game prepare the next frame early. A fix
-  that keeps both eyes in sync is being tested.
-- NPCs a few metres away that stop animating when you look at them with your head instead of the
-  game camera. A fix is in progress.
+- Interaction labels at the person's real depth.
+- Faster loading.
 
 **Not tested:** AMD and Intel GPUs (use FXAA there), headsets other than Quest 3, the GOG edition,
 SteamOS / Steam Deck.
@@ -64,8 +66,9 @@ SteamOS / Steam Deck.
 **Known issues:** loading into the game takes much longer than usual (roughly 5 times as long on
 the test setup). It is not yet known how much of that is the mod and how much is the game under
 Proton, which also loads slowly without the mod. In first person (F11) Geralt can walk at an angle
-to where you look (press F9 while facing forward) and the camera sits inside his head. "Press A to talk" labels float at the
-HUD's distance instead of at the person's depth. More in
+to where you look (press F9 while facing forward) and the camera sits inside his head. "Press A to
+talk" labels float at the HUD's distance instead of at the person's depth. A character can still
+freeze now and then (seen once, in a cutscene). More in
 [Troubleshooting and known issues](#troubleshooting-and-known-issues).
 
 ## Why this mod exists
@@ -152,9 +155,13 @@ without a headset; the [feature status table](#platform-support) shows which.
 **Performance** (the game is CPU-limited in VR because it renders the scene twice per frame)
 - Much less CPU overhead from the mod's own descriptor tracking on the render thread (on by
   default).
-- Optional one-pair run-ahead: the game prepares the next frame while the current one renders.
-  In our headless, CPU-limited tests this gave about 15% more frames per second.
-- Optional shared sun shadows: the second eye reuses the first eye's sun-shadow maps.
+- One-pair run-ahead (on in the release's settings): the game prepares the next frame while the
+  current one renders, about 15% more frames per second when the CPU is the limit (DLSS Quality).
+  The second eye is queued after the game's own frame fence, so both eyes show the same animation
+  poses (`pair_enqueue_after_fence`).
+- Shared sun shadows (on in the release's settings): the second eye reuses the first eye's
+  sun-shadow maps.
+- People the headset sees but the game camera doesn't keep animating (`animated_component_visible`).
 
 **Consistency between the eyes** (optional)
 - Flickering lights (torches, candles, fires) flicker the same in both eyes and at the normal
@@ -361,11 +368,10 @@ camera_mode=1
 close_camera_offset=-1.000
 ```
 
-The values below are **not the defaults** yet, because they still need more testing.
-`remaster_asymmetric_ndc_cascade_fix=0` has been used in the headset; the others have only been
-tested headless so far. To try them, add them to `bin/x64_dx12/witcher3vr.ini` with the game
-closed, ideally one at a time. See the [Configuration reference](#configuration-reference) for
-what each one does.
+The values below are **not the code defaults**, but the release's `bin/x64_dx12/witcher3vr.ini`
+already contains them and they are what the test setup plays with. If you build the DLL yourself
+or start from another ini, add them with the game closed. See the
+[Configuration reference](#configuration-reference) for what each one does.
 
 ```ini
 [engine]
@@ -376,6 +382,7 @@ remaster_local_light_pair_lock=1
 
 [perf]
 pair_barrier_lag=1
+pair_enqueue_after_fence=1
 ```
 
 Keep `[debug] logging_enabled` and `runtime_diagnostics` at `0` for playing; diagnostics cost a lot
@@ -439,6 +446,7 @@ The original mod's keys are documented in [witcher3vr.example.ini](witcher3vr.ex
 | `remaster_shadow_pair_reuse` | `0` | `1` = render the sun-shadow maps once per stereo pair; the second eye reuses them. Switches itself off after repeated mismatches. `9` is for measurements only. |
 | `remaster_light_flicker_per_pair` | `0` | `1` = flickering lights advance once per stereo pair: the same flicker in both eyes, at the normal speed. |
 | `remaster_local_light_pair_lock` | `0` | `1` = choose and fade local shadows for both eyes from the first eye's position. |
+| `animated_component_visible` | `1` | Keep animating characters the headset sees but the game camera does not (outside its view). 4.04 and 5.01. |
 | `remaster_local_shadow_slices` | `1` | `1`-`4` local-shadow atlas slices of 2048x2048. More slices let more lights cast shadows (4 costs about 24-48 MB more VRAM). |
 | `remaster_local_shadow_sort_corrected` | `0` | `1` = pack the nearest shadowed lights first, so an overflow drops far lights. |
 | `remaster_local_light_diag` | `0` | Log local-light and local-shadow choices per eye (needs diagnostics). |
@@ -455,7 +463,8 @@ The original mod's keys are documented in [witcher3vr.example.ini](witcher3vr.ex
 
 | Key | Default | What it does |
 |---|---|---|
-| `pair_barrier_lag` | `0` | 5.01 strict Stereo. `1` = the game thread runs one stereo pair ahead of the render thread instead of waiting for it. More frames per second when CPU-limited; game input reacts about one pair later. |
+| `pair_barrier_lag` | `0` | 5.01 strict Stereo. `1` = the game thread runs one stereo pair ahead of the render thread instead of waiting for it. More frames per second when CPU-limited; game input reacts about one pair later. Use it with `pair_enqueue_after_fence=1`. |
+| `pair_enqueue_after_fence` | `1` | 5.01. Queue the second eye after the game's per-frame fence, so that with `pair_barrier_lag=1` both eyes show the same animation poses. `0` = old order (the eyes can differ on moving characters at lag 1). |
 | `pair_pose_lead_adaptive` | `1` | With `pair_barrier_lag=1`: predict the head pose as far ahead as the pairs actually take. |
 | `shadow_profile`, `descriptor_shadow_verify` | `0` | Measurement switches; they need the `[vrs]` census log (`mode=3`, `log=1`). |
 
@@ -488,17 +497,25 @@ Feature status on the tested setup:
 | Per-eye DLSS, DLSS under Proton | With DLSS selected | Tested in the headset |
 | Per-eye projection (`remaster_asymmetric_ndc`) | Off (Linux tool: on) | Tested in the headset |
 | HUD filtering, level HUD, centred HUD and menus | On | Tested in the headset |
-| No black fade rectangle (`hud_fade_mode`) | On | Headless tests only |
-| Exact world markers | On, with the controller-locked HUD | Headless tests only |
-| Geralt centred in the near view | On in the near view | Headless tests only |
-| Forward direction kept after cutscenes | On | Not tested in the headset yet |
-| Descriptor store (`descriptor_metadata_store=shadow`) | On | Headless tests only |
-| Run-ahead (`pair_barrier_lag`) | Off | Headless tests only |
-| Shared sun shadows (`remaster_shadow_pair_reuse`) | Off | Headless tests only |
-| Per-pair flicker and local shadows | Off | Headless tests only |
+| No black fade rectangle (`hud_fade_mode`) | On | Played in the headset, no problems reported |
+| Exact world markers | On, with the controller-locked HUD | Tested in the headset |
+| Geralt centred in the near view | On in the near view | Played in the headset, no problems reported |
+| Forward direction kept after cutscenes | On | Played in the headset, no problems reported |
+| Descriptor store (`descriptor_metadata_store=shadow`) | On | Played in the headset, no problems reported |
+| Run-ahead (`pair_barrier_lag`) with `pair_enqueue_after_fence` | Off (release ini: on) | Tested in the headset |
+| Shared sun shadows (`remaster_shadow_pair_reuse`) | Off (release ini: on) | Played in the headset, no problems reported |
+| Per-pair flicker and local shadows | Off (release ini: on) | Played in the headset, no problems reported |
+| Animation outside the game camera's view (`animated_component_visible`) | On | Tested in the headset |
 | `frame_wait_early`, `pair_rate_divisor` | Off | Experimental, no gain measured |
 
 ## Troubleshooting and known issues
+
+**People a few metres away stand still or play only part of their animation**
+- Usually fixed by `animated_component_visible=1` (default). The game also freezes the work
+  animations (chopping, hammering) of people it thinks you can't see once they are more than 7 m
+  away. To switch that off, back up `bin/config/r4game/legacy/base/gameplay.ini` in the game folder
+  and set `UseWorkFreezing=false` under `[Work]`. The test setup plays with that change; Steam's
+  *Verify integrity of game files* restores the original.
 
 **The game does not enter VR (Linux)**
 - Connect the headset to WiVRn before you start the game. WiVRn only registers the active OpenXR
