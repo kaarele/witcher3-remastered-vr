@@ -571,8 +571,11 @@ def cmd_configure(args):
     g = require_game()
     require_game_closed()
     x64, docs = g['x64'], g['docs']
-    if not os.path.exists(os.path.join(x64, 'witcher3vr-mod-reference', 'dxgi.dll')):
-        die('mod not installed (run install first)')
+    # A release zip extracted into the game folder puts dxgi.dll in place directly; `install` (from an upstream
+    # release zip) also keeps the reference copy in witcher3vr-mod-reference.
+    if not os.path.exists(os.path.join(x64, 'dxgi.dll')) and \
+            not os.path.exists(os.path.join(x64, 'witcher3vr-mod-reference', 'dxgi.dll')):
+        die('mod not installed: bin/x64_dx12/dxgi.dll is missing (extract the release zip into the game folder first)')
     settings_path = os.path.join(docs, 'dx12user.settings')
     if not os.path.exists(settings_path):
         die('%s is missing. Start the game once without VR, reach the main menu, quit, then run configure.' % settings_path)
