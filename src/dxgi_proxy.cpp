@@ -750,6 +750,17 @@ struct Config {
     // enable bit through the passive provider handshake; launcher UI is
     // deliberately deferred until runtime validation.
     bool engine_first_person_strafe{true};
+    // [FIX:FIRST-PERSON-STATIONARY-TURN-GATE] The V9529 stationary body turn
+    // was always on with the provider. The key isolates it for the first 5.01
+    // runs of the provider; 1 keeps the 4.04 behaviour.
+    bool engine_first_person_stationary_turn{true};
+    // [FIX:FIRST-PERSON-ENTRY-RECENTER 1/2] Pressing F11 makes the current
+    // head direction the walking direction (game camera heading).
+    bool engine_first_person_recenter_on_entry{true};
+    // [FIX:REMASTER-NATIVE-HEAD-PROVIDER 1/2] 5.01: hook the head-bone
+    // natives for the anatomical F11 eye and head hiding. Off until the first
+    // 5.01 runs pass; 4.04 always installs them.
+    bool engine_remaster_native_head_provider{false};
     bool engine_first_person_snap_turn{false};
     float engine_first_person_snap_turn_degrees{45.0f};
     float engine_first_person_snap_turn_activation{0.55f};
@@ -796,6 +807,10 @@ struct Config {
     // is undone when gameplay resumes: the HMD centre used for gameplay
     // before the cutscene becomes the centre again.
     bool cinema_restore_gameplay_recenter{true};
+    // [FEATURE:FOLLOW-RUNTIME-RECENTER 1/3] Recenter when the runtime
+    // redefines the LOCAL space (Quest/WiVRn recenter, SteamVR's Reset
+    // seated position); the old centre no longer matches the new space.
+    bool follow_runtime_recenter{false};
     // [DIAG:FIRST-PERSON-ENGINE-AIM 1/3] Narrow edge-only trace for the
     // renderer-owned crosshair/F11 transaction. It intentionally works while
     // broad logging is disabled, without enabling any per-draw diagnostics.
@@ -1585,6 +1600,9 @@ XrQuaternionf g_hmd_center_yaw_orientation{0.0f, 0.0f, 0.0f, 1.0f};
 XrVector3f g_hmd_center_position{};
 XrView g_hmd_center_views[2]{{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
 std::atomic<bool> g_hmd_center_valid{};
+// [FEATURE:FOLLOW-RUNTIME-RECENTER 2/3] changeTime of a pending LOCAL space
+// change (0 = none); the centre is retaken once poses reach it.
+std::atomic<int64_t> g_xr_local_space_change_time{};
 // [FEATURE:CINEMA-RESTORE-GAMEPLAY-RECENTER 2/5] The gameplay centre saved
 // by the cutscene auto-recenter (guarded by g_hmd_pose_snapshot_mutex), the
 // two cross-thread requests that drive it, and whether a gameplay camera has
@@ -17218,6 +17236,8 @@ void load_config() {
             read_ini_float("engine", "camera_center_max_m", 1.5f), 0.0f, 3.0f);
         g_config.cinema_restore_gameplay_recenter = read_ini_bool(
             "openxr", "cinema_restore_gameplay_recenter", true);
+        g_config.follow_runtime_recenter = read_ini_bool(
+            "openxr", "follow_runtime_recenter", false);
         g_config.camera_offset_trace =
             read_ini_bool("debug", "camera_offset_trace", false);
         g_config.engine_first_person_camera_offset = std::clamp(
@@ -17349,6 +17369,12 @@ void load_config() {
             g_config.engine_first_person_snap_turn_activation - 0.05f);
         g_config.engine_first_person_hmd_body_follow = read_ini_bool(
             "engine", "first_person_hmd_body_follow", false);
+        g_config.engine_first_person_stationary_turn = read_ini_bool(
+            "engine", "first_person_stationary_turn", true);
+        g_config.engine_first_person_recenter_on_entry = read_ini_bool(
+            "engine", "first_person_recenter_on_entry", true);
+        g_config.engine_remaster_native_head_provider = read_ini_bool(
+            "engine", "remaster_native_head_provider", false);
         g_config.engine_first_person_combat_exit = read_ini_bool(
             "engine", "first_person_combat_exit", false);
         g_config.engine_first_person_combat_return_delay_seconds = std::clamp(
@@ -44874,6 +44900,7 @@ void __fastcall hook_engine_get_head_bone_index(
                             std::memory_order_relaxed) &&
                         ordinary_on_foot;
                     const bool enable_stationary_turn =
+                        g_config.engine_first_person_stationary_turn &&
                         provider_gameplay_owner &&
                         !g_first_person_engine_aim_active.load(
                             std::memory_order_acquire) &&
@@ -45572,40 +45599,45 @@ bool native_head_pose_signature_matches(
 }
 
 void install_engine_native_head_pose_hooks() {
-    if (!engine_build_supported()) {
+    // [FIX:REMASTER-NATIVE-HEAD-PROVIDER 2/2] 5.01 has the same two natives
+    // with the same opening bytes (address table). Without them F11 on 5.01
+    // keeps the fixed orbit offsets, which leave the eye inside the head, and
+    // the head-hiding/strafe scripts stay dormant.
+    const bool remaster =
+        running_game_build() == w3vr::game_build::Build::Remaster501;
+    if (!engine_build_supported() &&
+        !(remaster && g_config.engine_remaster_native_head_provider)) {
         return;
     }
     if (g_native_head_pose_hooks_ready.load(std::memory_order_acquire)) {
         return;
     }
-    auto* module = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
-    if (module == nullptr) {
-        return;
-    }
 
-    constexpr uintptr_t kGetHeadBoneIndexRva = 0x01C4B550;
-    constexpr uintptr_t kGetBoneWorldMatrixRva = 0x0152E600;
-    static constexpr uint8_t kGetHeadBoneIndexPrologue[] = {
-        0x40, 0x53, 0x48, 0x83, 0xEC, 0x20, 0x48, 0xFF, 0x42,
-        0x30, 0x48, 0x81, 0xC1, 0x00, 0x02, 0x00, 0x00, 0x49,
-        0x8B, 0xD8, 0x48, 0x8B, 0x01, 0xFF, 0x50, 0x38};
-    static constexpr uint8_t kGetBoneWorldMatrixPrologue[] = {
-        0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58, 0x08, 0x48, 0x89,
-        0x70, 0x18, 0x48, 0x89, 0x78, 0x20, 0x55, 0x48, 0x8D,
-        0x68, 0xA1, 0x48, 0x81, 0xEC, 0x00, 0x01, 0x00, 0x00};
-    auto* head_target = module + kGetHeadBoneIndexRva;
-    auto* matrix_target = module + kGetBoneWorldMatrixRva;
-    if (!native_head_pose_signature_matches(
+    using w3vr::engine_addresses::Function;
+    const uintptr_t head_rva = w3vr::engine_addresses::rva(
+        running_game_build(), Function::ActorGetHeadBoneIndex);
+    const uintptr_t matrix_rva = w3vr::engine_addresses::rva(
+        running_game_build(), Function::EntityGetBoneWorldMatrixByIndex);
+    auto* head_target =
+        engine_function_target(Function::ActorGetHeadBoneIndex);
+    auto* matrix_target =
+        engine_function_target(Function::EntityGetBoneWorldMatrixByIndex);
+    // 4.04 entries carry no table signature; check the shared opening bytes
+    // on every build.
+    if (head_target == nullptr || matrix_target == nullptr ||
+        !native_head_pose_signature_matches(
             head_target,
-            kGetHeadBoneIndexPrologue,
-            sizeof(kGetHeadBoneIndexPrologue)) ||
+            w3vr::engine_addresses::kActorGetHeadBoneIndexBytes,
+            sizeof(w3vr::engine_addresses::kActorGetHeadBoneIndexBytes)) ||
         !native_head_pose_signature_matches(
             matrix_target,
-            kGetBoneWorldMatrixPrologue,
-            sizeof(kGetBoneWorldMatrixPrologue))) {
+            w3vr::engine_addresses::kEntityGetBoneWorldMatrixByIndexBytes,
+            sizeof(w3vr::engine_addresses::
+                kEntityGetBoneWorldMatrixByIndexBytes))) {
         log_line(
-            "V9526 native head provider disabled: Witcher 3 4.04 "
-            "script callback signature mismatch head=%p matrix=%p",
+            "V9526 native head provider disabled: script callback "
+            "signature mismatch build=%s head=%p matrix=%p",
+            w3vr::game_build::name(running_game_build()),
             head_target, matrix_target);
         return;
     }
@@ -45664,8 +45696,8 @@ void install_engine_native_head_pose_hooks() {
         "matrix_rva=0x%llX anchor_up=0.07 anchor_forward=0.19 "
         "split=head_forward_0.05_camera_tangent_0.14 "
         "basis=raw_axis_y_forward_raw_axis_x_up",
-        static_cast<unsigned long long>(kGetHeadBoneIndexRva),
-        static_cast<unsigned long long>(kGetBoneWorldMatrixRva));
+        static_cast<unsigned long long>(head_rva),
+        static_cast<unsigned long long>(matrix_rva));
 }
 
 // The three scene queries resolve through the per-build address table and also
@@ -57754,6 +57786,24 @@ void poll_openxr_events() {
                 log_line("OpenXR xrEndSession result=%s (%d)", xr_result_name(result), result);
             }
         } else if (event.type ==
+                XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING) {
+            const auto* changed = reinterpret_cast<
+                const XrEventDataReferenceSpaceChangePending*>(&event);
+            const bool local_space = changed->referenceSpaceType ==
+                XR_REFERENCE_SPACE_TYPE_LOCAL;
+            if (local_space && g_config.follow_runtime_recenter) {
+                g_xr_local_space_change_time.store(
+                    std::max<int64_t>(changed->changeTime, 1),
+                    std::memory_order_release);
+            }
+            log_line(
+                "OpenXR reference space change pending type=%d "
+                "change_time=%lld pose_valid=%d follow=%d",
+                static_cast<int>(changed->referenceSpaceType),
+                static_cast<long long>(changed->changeTime),
+                changed->poseValid ? 1 : 0,
+                local_space && g_config.follow_runtime_recenter ? 1 : 0);
+        } else if (event.type ==
                 XR_TYPE_EVENT_DATA_VISIBILITY_MASK_CHANGED_KHR) {
             // [FIX:VISIBILITY-MASK-FIT 3/7] The runtime may change its lens
             // contour after session creation (for example with a different
@@ -57953,6 +58003,21 @@ void update_hmd_freelook_pose() {
                 hmd_center_heading_degrees(g_hmd_center_yaw_orientation));
         }
         saved_gameplay_center.valid = false;
+    }
+    // [FEATURE:FOLLOW-RUNTIME-RECENTER 3/3] Same path as any automatic
+    // recenter, once the located poses are in the new LOCAL space. Placed
+    // after the cinema restore: a saved centre belongs to the old space, and
+    // the recenter below discards it.
+    int64_t local_space_change_time =
+        g_xr_local_space_change_time.load(std::memory_order_acquire);
+    if (local_space_change_time != 0 &&
+        g_xr_render_frame_state.predictedDisplayTime >=
+            local_space_change_time &&
+        g_xr_local_space_change_time.compare_exchange_strong(
+            local_space_change_time, 0, std::memory_order_acq_rel)) {
+        g_hmd_center_valid.store(false, std::memory_order_release);
+        log_line("HMD runtime recenter followed present=%llu",
+            static_cast<unsigned long long>(g_present_count.load()));
     }
     if (manual_recenter || !g_hmd_center_valid.load()) {
         // Only the cutscene auto-recenter saves the gameplay centre it
@@ -64982,7 +65047,25 @@ HRESULT STDMETHODCALLTYPE hook_present(IDXGISwapChain* swapchain, UINT sync_inte
         const int current_mode =
             g_camera_mode.load(std::memory_order_acquire);
         const int camera_mode = current_mode == 2 ? 0 : 2;
-        set_first_person_camera_mode(camera_mode, "F11");
+        const bool changed =
+            set_first_person_camera_mode(camera_mode, "F11");
+        if (changed && camera_mode == 2 &&
+            g_config.engine_first_person_recenter_on_entry) {
+            // [FIX:FIRST-PERSON-ENTRY-RECENTER 2/2] Walking follows the game
+            // camera heading, which is the recenter direction. A centre taken
+            // earlier (session start, load, cutscene) with the head turned
+            // made Geralt walk at that angle to the view. Only the physical
+            // key: combat and aim handoffs must not move the view.
+            g_hmd_center_valid.store(false, std::memory_order_release);
+            log_line("HMD first-person entry recenter present=%llu",
+                static_cast<unsigned long long>(frame));
+        } else if (changed && camera_mode == 0 &&
+                   g_config.engine_camera_mode == 1) {
+            // [FIX:FIRST-PERSON-EXIT-NEAR-VIEW 1/1] Leaving F11 returns to
+            // the configured near view instead of the shoulder camera.
+            g_camera_mode.store(1, std::memory_order_release);
+            announce_camera_mode(1, "F11");
+        }
     }
     // [FIX:FIRST-PERSON-STANDARD-HANDOFF 2/2] Combat and the physical F11 key
     // share the exact Standard-camera transition; neither can
