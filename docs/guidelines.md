@@ -5,9 +5,7 @@
 > describe that fork's setup. This repository's own rules are in [CONTRIBUTING.md](../CONTRIBUTING.md),
 > and the Linux build is in [linux/BUILD-LINUX.md](../linux/BUILD-LINUX.md).
 
-Guidelines for everyone working on this fork: developers and AI coding agents alike. Agent
-entry files (`CLAUDE.md`, `AGENTS.md`, `.junie/guidelines.md`,
-`.github/copilot-instructions.md`) only point here; keep the content in this file.
+Guidelines for everyone working on this project, people and coding tools alike.
 
 Fork of [tig3rmast3r/witcher3-vr](https://github.com/tig3rmast3r/witcher3-vr) to port the mod
 from The Witcher 3 Next-Gen (DX12, patch 4.04) to the newer "Remaster" build (GOG edition

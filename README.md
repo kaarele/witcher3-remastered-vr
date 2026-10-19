@@ -36,8 +36,10 @@ Proton today. Windows support is being worked on. This project continues the
 `python3 Witcher3VR/linux/w3vr-linux.py uninstall --restore-settings` also puts your graphics
 settings back. Your saves are never touched.
 
-**Controls:** F9 recentres the view (look straight ahead first), F8 toggles the near view, F10 the
-cinema screen, F11 first person. Mouse/keyboard or a gamepad; VR controllers are not supported.
+**Controls:** no F keys are needed: the mod starts in the right mode. Play with mouse and keyboard,
+a gamepad or a Steam Controller (tested with the 2026 Steam Controller); VR motion controllers are
+not supported. Optional keys: F9 recentres the view (look straight ahead first), F8 toggles the
+near view, F10 the cinema screen, F11 first person.
 
 ## What works and what's next
 
@@ -179,7 +181,8 @@ without a headset; the [feature status table](#platform-support) shows which.
   edition is tested. The mod checks the game build at startup and does nothing on other builds.
 - A VR headset with an **OpenXR runtime**. Tested: WiVRn on Linux. Others (SteamVR, Meta Quest
   Link, Virtual Desktop, Monado, ...) are untested.
-- Mouse and keyboard, or a gamepad. VR motion controllers are not supported.
+- Mouse and keyboard, a gamepad, or a Steam Controller (tested with the 2026 Steam Controller). VR
+  motion controllers are not supported.
 - For DLSS: an NVIDIA GeForce RTX GPU. Other GPUs can use FXAA (untested by this project). On AMD
   GPUs, use a current Adrenalin driver: older drivers render some 5.x grass solid black, with or
   without the mod.
@@ -390,7 +393,8 @@ of performance.
 
 ## Controls
 
-These keys come from the original mod. `F9` is used on the test setup. The other keys have not
+You don't need any of these keys to play: the mod starts in Stereo with the near view and a
+controller-locked HUD. These keys come from the original mod. `F9` is used on the test setup. The other keys have not
 all been re-tested in the headset on 5.01 by this project; `F11` and the HUD editor have not been
 tested on 5.01 at all yet.
 

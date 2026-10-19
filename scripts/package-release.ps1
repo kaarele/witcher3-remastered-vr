@@ -99,7 +99,7 @@ $exampleIni = Join-Path $repositoryRoot 'witcher3vr.example.ini'
 $readme = Join-Path $repositoryRoot 'README.md'
 $license = Join-Path $repositoryRoot 'LICENSE'
 $thirdPartyNotices = Join-Path $repositoryRoot 'THIRD_PARTY_NOTICES.md'
-$releaseNotes = Join-Path $repositoryRoot 'RELEASE_NOTES.md'
+$releaseNotes = Join-Path $repositoryRoot 'docs/releases/v0.9.8.md'
 $componentLicenses = Join-Path $repositoryRoot 'licenses'
 $reshadeReference = Join-Path $repositoryRoot 'runtime/witcher3vr-reshade-reference'
 $modifiedOptiscalerReference = Join-Path $repositoryRoot 'runtime/witcher3vr-optiscaler-dlss5-reference'
@@ -120,9 +120,13 @@ $hudEditorScript = Join-Path $hudEditorRoot `
     'content/scripts/local/witcher3vr_hud_editor/hud_editor.ws'
 $hudEditorXml = Join-Path $repositoryRoot `
     'support/modWitcher3VRHUDEditor.xml'
+# Optional, 4.04 only: the Fast Transitions DLC is not part of this repository (its redistribution
+# rights are undocumented). Put the original release's dlc/dlcmovementinputfix here to include it.
 $movementDlcRoot = Join-Path $repositoryRoot 'support/dlcmovementinputfix'
 $movementDlcBundle = Join-Path $movementDlcRoot 'content/blob0.bundle'
 $movementDlcMetadata = Join-Path $movementDlcRoot 'content/metadata.store'
+$hasMovementDlc = (Test-Path -LiteralPath $movementDlcBundle -PathType Leaf) -and
+    (Test-Path -LiteralPath $movementDlcMetadata -PathType Leaf)
 
 if (-not (Test-Path -LiteralPath (Join-Path $openXrLoaderSource 'CMakeLists.txt') `
         -PathType Leaf)) {
@@ -176,9 +180,7 @@ foreach ($requiredFile in @(
         $firstPersonStrafeScript,
         $firstPersonVisibilityScript,
         $hudEditorScript,
-        $hudEditorXml,
-        $movementDlcBundle,
-        $movementDlcMetadata)) {
+        $hudEditorXml)) {
     if (-not (Test-Path -LiteralPath $requiredFile -PathType Leaf)) {
         throw "Missing release input: $requiredFile"
     }
@@ -258,10 +260,12 @@ try {
     New-Item -ItemType Directory -Path $configMatrixStage -Force | Out-Null
     Copy-Item -LiteralPath $hudEditorXml -Destination $configMatrixStage
 
-    $dlcStage = Join-Path $releaseStage 'dlc'
-    New-Item -ItemType Directory -Path $dlcStage | Out-Null
-    Copy-Item -LiteralPath $movementDlcRoot `
-        -Destination (Join-Path $dlcStage 'dlcmovementinputfix') -Recurse
+    if ($hasMovementDlc) {
+        $dlcStage = Join-Path $releaseStage 'dlc'
+        New-Item -ItemType Directory -Path $dlcStage | Out-Null
+        Copy-Item -LiteralPath $movementDlcRoot `
+            -Destination (Join-Path $dlcStage 'dlcmovementinputfix') -Recurse
+    }
 
     $documentationStage = Join-Path $releaseStage 'Witcher3VR'
     $configStage = Join-Path $documentationStage 'config'
@@ -349,10 +353,6 @@ try {
         (Get-FileHash -LiteralPath $optiscalerBridgeIni -Algorithm SHA256).Hash
     $renderDocDllHash =
         (Get-FileHash -LiteralPath $RenderDocDll -Algorithm SHA256).Hash
-    $movementDlcBundleHash =
-        (Get-FileHash -LiteralPath $movementDlcBundle -Algorithm SHA256).Hash
-    $movementDlcMetadataHash =
-        (Get-FileHash -LiteralPath $movementDlcMetadata -Algorithm SHA256).Hash
     $hudEditorScriptHash =
         (Get-FileHash -LiteralPath $hudEditorScript -Algorithm SHA256).Hash
     $hudEditorXmlHash =
@@ -379,8 +379,10 @@ try {
     $manifestLines += "optiscaler.sha256=$optiscalerDllHash"
     $manifestLines += "optiscaler_bridge_ini.sha256=$optiscalerBridgeIniHash"
     $manifestLines += "renderdoc_custom_v1273.sha256=$renderDocDllHash"
-    $manifestLines += "movement_dlc_bundle.sha256=$movementDlcBundleHash"
-    $manifestLines += "movement_dlc_metadata.sha256=$movementDlcMetadataHash"
+    if ($hasMovementDlc) {
+        $manifestLines += "movement_dlc_bundle.sha256=$((Get-FileHash -LiteralPath $movementDlcBundle -Algorithm SHA256).Hash)"
+        $manifestLines += "movement_dlc_metadata.sha256=$((Get-FileHash -LiteralPath $movementDlcMetadata -Algorithm SHA256).Hash)"
+    }
     $manifestLines += "hud_editor_script.sha256=$hudEditorScriptHash"
     $manifestLines += "hud_editor_xml.sha256=$hudEditorXmlHash"
     $manifestLines += "first_person_aim.sha256=$firstPersonAimHash"

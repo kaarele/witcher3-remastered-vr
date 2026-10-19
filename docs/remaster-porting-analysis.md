@@ -88,7 +88,7 @@ signatures have not been compared yet. The DLL↔script channel consists of:
 - in-game settings group `W3VRSettings`
 
 The channel therefore breaks with category 1.
-`support/dlcmovementinputfix` is a binary content bundle installed to `dlc/`. The Remaster
+`support/dlcmovementinputfix` (removed from this repository; it is in the original release) is a binary content bundle installed to `dlc/`. The Remaster
 layout has no `dlc` folder (content merged into `content/content0`).
 
 ### 6. Launcher
