@@ -38860,7 +38860,11 @@ int __fastcall hook_engine_frustum_aabb_test(void* frustum, const void* bounds) 
         std::memory_order_relaxed);
     const bool hmd_camera_recent = last_hmd_camera != UINT64_MAX &&
         present >= last_hmd_camera && present - last_hmd_camera <= 8;
-    if (!g_config.engine_animated_component_visible ||
+    // A box the game already found visible needs nothing: only culled ones
+    // are forced, counted and logged ("forced full count=1" is then the
+    // first component actually kept visible, not the first test).
+    if (!culled ||
+        !g_config.engine_animated_component_visible ||
         !animated_site ||
         !g_config.hmd_freelook ||
         !g_hmd_pose_valid.load(std::memory_order_relaxed) ||
@@ -38870,7 +38874,7 @@ int __fastcall hook_engine_frustum_aabb_test(void* frustum, const void* bounds) 
         return result;
     }
 
-    if (census && culled) {
+    if (census) {
         count_animated_visibility(AnimatedVisibilityCount::Forced);
     }
     const uint64_t count = g_engine_animated_component_visibility_forces.fetch_add(
