@@ -293,6 +293,15 @@ if(BUILD_TESTING)
         COMMAND w3vr_prefix_hook_tests
     )
 
+    add_executable(w3vr_call_site_hook_tests
+        tests/call_site_hook_tests.cpp
+    )
+    target_include_directories(w3vr_call_site_hook_tests PRIVATE src)
+    add_test(
+        NAME call_site_hook
+        COMMAND w3vr_call_site_hook_tests
+    )
+
     add_executable(w3vr_camera_light_yaw_tests
         tests/camera_light_yaw_tests.cpp
     )

@@ -1029,3 +1029,45 @@ thread, just before xrWaitFrame/xrEndFrame.
   past NPCs) the largest left/right difference on moving characters fell from about 110 (fix off) to
   about 2-3 (the static floor), with FXAA and DLAA, at unchanged throughput; `second_entries` was 0.
   Confirmed in the headset: run-ahead with the fix shows no per-eye pose or shading difference.
+
+### People outside the game camera's view keep animating (`animated_component_visible`, 5.01)
+- Symptom (5.01, in a town): many people stood in a T-pose or frozen (one man's axe moved,
+  his arms and body did not); they animated once Geralt got close. Raising the in-game background
+  characters setting made it less noticeable.
+- Cause: a 4.04 hook that was never ported. Every frame the animated-component visibility update
+  (CAnimatedComponent vtable slot 67; 4.04 0x015E1750, 5.01 0x02437970, shared by the mimic,
+  moving-agent and background-root components) tests the component's world bounds against the
+  game camera's frustum and stores the result at +0xF74. While that byte is set, the update skips
+  the skinned attachments: the body keeps its last pose (the bind pose if it was never updated),
+  and only plain child transforms such as a held weapon follow. In VR the head looks around
+  freely, so the headset shows people that are outside the game camera's frustum. On 4.04
+  `animated_component_visible=1` (default) hooks the frustum test (0x0031E050) and, only for the
+  call from that update (return 0x015E186C) and only while the HMD view is active, reports the box
+  as visible. On 5.01 the installer returned early (4.04-only addresses).
+- 5.01: the frustum test is 0x0099B2B0, an AVX rewrite over a structure-of-arrays frustum with
+  the same arguments and result (al = 1 when the box is fully outside a plane). Its only caller
+  is the same update (call 0x02437A8B, return 0x02437A90, followed by the store to +0xF74). MinHook
+  cannot patch the test (VEX instruction at byte 4) and its first 13 bytes are too short for
+  prefix_hook (RIP-relative instruction at byte 13), so the mod redirects that one call instead:
+  its rel32 now points at a 14-byte absolute jump to the existing detour, allocated within reach
+  of the call (`src/call_site_hook.h`). The test itself stays unpatched and is called as the
+  original. Checks before the patch: the test's 16 leading bytes, the call bytes (their rel32
+  encodes the test), the store after the call, and that the decoded destination is the verified
+  test. Any mismatch leaves the game unchanged and logs why.
+- Same gates as 4.04: `hmd_freelook`, a valid HMD pose, no menu (needs `menu_state_probe=1`), not
+  in cinema mode, and the HMD camera route active within the last 8 Presents.
+- Log: `Animated component visibility hooked build=remaster-5.01 call_site=1 ...` at startup and
+  `Animated component visibility forced full count=1` the first time a component is forced.
+  Census (VRS census log): `PERF anim visibility call_site= tests= culled= forced=` per window
+  (`culled` = tests that found the component outside the game camera's frustum, `forced` = those
+  reported visible).
+- Not covered (both builds): CAsyncAnimTickManager (5.01 tick 0x0265D900, run from
+  RenderSceneSetup) culls its registered entities (animated entities, background NPCs) against
+  the game camera's frustum on its own and skips their tick outside it. Work freezing in
+  `gameplay.ini [Work]` (UseWorkFreezing, 7 m radius for "invisible" actors) may also stop work
+  animations. If people outside the game camera's view still stand still with this fix, those
+  are the next candidates.
+- Status: verified with the null OpenXR runtime (the redirect is installed, `forced` equals `culled`,
+  no regressions) and in the headset in a town, together with `UseWorkFreezing=false` in
+  `bin/config/r4game/legacy/base/gameplay.ini`: people kept animating; a frozen character was seen
+  once, in a cutscene.

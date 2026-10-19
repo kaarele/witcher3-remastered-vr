@@ -44,6 +44,7 @@
 #include "optiscaler_jitter_policy.h"
 #include "pipeline_flight_recorder.h"
 #include "prefix_hook.h"
+#include "call_site_hook.h"
 #include "hotkey_name.h"
 #include "camera_light_yaw.h"
 #include "route_flight_recorder.h"
@@ -3005,6 +3006,15 @@ using EngineFrustumAabbTestFn = int(__fastcall*)(void*, const void*);
 EngineFrustumAabbTestFn g_engine_frustum_aabb_test{};
 void* g_engine_animated_component_visibility_return{};
 std::atomic<uint64_t> g_engine_animated_component_visibility_forces{};
+// [FIX:REMASTER-ANIMATED-VISIBILITY 4/8] Census counters (only counted while
+// the census log is on): frustum tests from the animated-component update,
+// how many of them found the component outside the game camera's frustum,
+// and how many of those the hook reported as visible. 5.01 redirects the
+// call itself (call_site=1); 4.04 hooks the test function.
+enum class AnimatedVisibilityCount : size_t { Tests, Culled, Forced, Count };
+std::array<std::atomic<uint64_t>, static_cast<size_t>(AnimatedVisibilityCount::Count)>
+    g_animated_visibility_counts{};
+bool g_animated_visibility_call_site{};
 thread_local uint64_t g_engine_producer_pair_id{};
 using EngineIsAnyMenuFn = void(__fastcall*)(void*, void*, uint8_t*);
 EngineIsAnyMenuFn g_engine_is_any_menu{};
@@ -16303,6 +16313,7 @@ void log_pair_enqueue_census_locked(uint64_t window_presents);
 void log_pair_rate_limit_census_locked(uint64_t window_presents, int64_t qpc_frequency);
 void log_shadow_census_locked(uint64_t window_presents, int64_t qpc_frequency);
 void log_descriptor_shadow_census_locked();
+void log_animated_visibility_census_locked(uint64_t window_presents);
 
 // One line per kVrsCensusPresentInterval Presents, written by the first bind
 // after the boundary; the counters are window deltas.
@@ -16397,6 +16408,8 @@ void log_vrs_census_locked(uint64_t present) {
     log_pair_rate_limit_census_locked(window_presents, frequency.QuadPart);
     log_shadow_census_locked(window_presents, frequency.QuadPart);
     log_descriptor_shadow_census_locked();
+    // [FIX:REMASTER-ANIMATED-VISIBILITY 5/8]
+    log_animated_visibility_census_locked(window_presents);
 }
 
 void apply_vrs_pipeline_rate(
@@ -38819,15 +38832,36 @@ bool apply_native_canted_eye_transform(
         view, transformed.data(), sizeof(transformed));
 }
 
+void count_animated_visibility(AnimatedVisibilityCount which) {
+    g_animated_visibility_counts[static_cast<size_t>(which)].fetch_add(
+        1, std::memory_order_relaxed);
+}
+
+// Keeps animated components outside the game camera's frustum fully updated
+// while the HMD view (which looks around freely) is active: the visibility
+// update then skins them like visible ones. Only the call from that update
+// is changed (return address check; on 5.01 only that call reaches here).
 int __fastcall hook_engine_frustum_aabb_test(void* frustum, const void* bounds) {
     const int result = g_engine_frustum_aabb_test(frustum, bounds);
+    // [FIX:REMASTER-ANIMATED-VISIBILITY 6/8] The test returns its verdict in
+    // al; census counts only while the census log is on.
+    const bool animated_site =
+        _ReturnAddress() == g_engine_animated_component_visibility_return;
+    const bool census = animated_site && g_config.vrs_log_file;
+    const bool culled = static_cast<uint8_t>(result) != 0;
+    if (census) {
+        count_animated_visibility(AnimatedVisibilityCount::Tests);
+        if (culled) {
+            count_animated_visibility(AnimatedVisibilityCount::Culled);
+        }
+    }
     const auto present = g_present_count.load(std::memory_order_relaxed);
     const auto last_hmd_camera = g_engine_hmd_camera_last_present.load(
         std::memory_order_relaxed);
     const bool hmd_camera_recent = last_hmd_camera != UINT64_MAX &&
         present >= last_hmd_camera && present - last_hmd_camera <= 8;
     if (!g_config.engine_animated_component_visible ||
-        _ReturnAddress() != g_engine_animated_component_visibility_return ||
+        !animated_site ||
         !g_config.hmd_freelook ||
         !g_hmd_pose_valid.load(std::memory_order_relaxed) ||
         g_engine_menu_state.load(std::memory_order_relaxed) != 0 ||
@@ -38836,6 +38870,9 @@ int __fastcall hook_engine_frustum_aabb_test(void* frustum, const void* bounds) 
         return result;
     }
 
+    if (census && culled) {
+        count_animated_visibility(AnimatedVisibilityCount::Forced);
+    }
     const uint64_t count = g_engine_animated_component_visibility_forces.fetch_add(
         1, std::memory_order_relaxed) + 1;
     if (count == 1 || (g_config.runtime_diagnostics && count % 10000 == 0)) {
@@ -38845,31 +38882,124 @@ int __fastcall hook_engine_frustum_aabb_test(void* frustum, const void* bounds) 
     return 0;
 }
 
+// [FIX:REMASTER-ANIMATED-VISIBILITY 7/8] Per-build address table. 4.04 hooks
+// the frustum test itself, as before. On 5.01 MinHook cannot patch it (see
+// kFrustumAabbTest501Bytes), so its one call in the animated-component
+// update is pointed at the same detour, after checking the test's code, the
+// call (its rel32 encodes the test) and the store of the result after it.
 void install_engine_animated_component_visibility_hook() {
-    if (!engine_build_supported()) {
+    namespace addresses = w3vr::engine_addresses;
+    const auto build = running_game_build();
+    const bool remaster = build == w3vr::game_build::Build::Remaster501;
+    if (!engine_build_supported() && !remaster) {
         return;
     }
     if (!g_config.engine_animated_component_visible ||
         g_engine_frustum_aabb_test != nullptr) {
         return;
     }
-    constexpr uintptr_t kEngineFrustumAabbTestRva = 0x0031E050;
-    constexpr uintptr_t kAnimatedComponentVisibilityReturnRva = 0x015E186C;
+    const uintptr_t tester_rva =
+        addresses::rva(build, addresses::Function::FrustumAabbTest);
+    const uintptr_t return_rva = addresses::value(
+        build, addresses::Value::AnimatedComponentVisibilityReturn);
     auto* module = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
-    auto* target = module != nullptr ? module + kEngineFrustumAabbTestRva : nullptr;
-    g_engine_animated_component_visibility_return =
-        module != nullptr ? module + kAnimatedComponentVisibilityReturnRva : nullptr;
-    if (target != nullptr && g_engine_animated_component_visibility_return != nullptr &&
-        MH_CreateHook(target, reinterpret_cast<void*>(&hook_engine_frustum_aabb_test),
-            reinterpret_cast<void**>(&g_engine_frustum_aabb_test)) == MH_OK &&
-        MH_EnableHook(target) == MH_OK) {
-        log_line("Animated component visibility hooked tester_rva=0x%llX caller_return_rva=0x%llX",
-            static_cast<unsigned long long>(kEngineFrustumAabbTestRva),
-            static_cast<unsigned long long>(kAnimatedComponentVisibilityReturnRva));
-    } else {
-        log_line("Animated component visibility hook failed tester_rva=0x%llX target=%p",
-            static_cast<unsigned long long>(kEngineFrustumAabbTestRva), target);
+    if (!remaster) {
+        auto* target = module != nullptr ? module + tester_rva : nullptr;
+        g_engine_animated_component_visibility_return =
+            module != nullptr ? module + return_rva : nullptr;
+        if (target != nullptr && g_engine_animated_component_visibility_return != nullptr &&
+            MH_CreateHook(target, reinterpret_cast<void*>(&hook_engine_frustum_aabb_test),
+                reinterpret_cast<void**>(&g_engine_frustum_aabb_test)) == MH_OK &&
+            MH_EnableHook(target) == MH_OK) {
+            log_line("Animated component visibility hooked tester_rva=0x%llX "
+                "caller_return_rva=0x%llX",
+                static_cast<unsigned long long>(tester_rva),
+                static_cast<unsigned long long>(return_rva));
+        } else {
+            log_line("Animated component visibility hook failed tester_rva=0x%llX target=%p",
+                static_cast<unsigned long long>(tester_rva), target);
+        }
+        return;
     }
+
+    constexpr size_t kCallBytes =
+        sizeof(addresses::kAnimatedComponentFrustumCall501Bytes);
+    const auto code_matches = [module](uintptr_t rva, const uint8_t* bytes,
+                                  size_t size) {
+        return module != nullptr && rva != 0 &&
+            addresses::signature_matches(
+                module + rva, addresses::Signature{bytes, size});
+    };
+    const bool call_matches = return_rva > kCallBytes &&
+        code_matches(return_rva - kCallBytes,
+            addresses::kAnimatedComponentFrustumCall501Bytes, kCallBytes);
+    const bool store_matches = code_matches(return_rva,
+        addresses::kAnimatedComponentFrustumStore501Bytes,
+        sizeof(addresses::kAnimatedComponentFrustumStore501Bytes));
+    if (!call_matches || !store_matches) {
+        log_line("Animated component visibility off: code mismatch call=%d "
+            "store=%d caller_return_rva=0x%llX",
+            call_matches ? 1 : 0, store_matches ? 1 : 0,
+            static_cast<unsigned long long>(return_rva));
+        return;
+    }
+    auto* tester = engine_function_target(addresses::Function::FrustumAabbTest);
+    auto* call = module + return_rva - kCallBytes;
+    if (tester == nullptr ||
+        w3vr::call_site_hook::call_destination(call) !=
+            reinterpret_cast<uintptr_t>(tester)) {
+        log_line("Animated component visibility off: the call does not reach "
+            "the frustum test tester=%p", tester);
+        return;
+    }
+    // Both are read by the detour, so they are set before the call changes.
+    g_engine_animated_component_visibility_return = module + return_rva;
+    g_animated_visibility_call_site = true;
+    uint8_t* relay = w3vr::call_site_hook::install(call,
+        reinterpret_cast<void*>(&hook_engine_frustum_aabb_test),
+        reinterpret_cast<void**>(&g_engine_frustum_aabb_test));
+    if (relay == nullptr) {
+        g_engine_animated_component_visibility_return = nullptr;
+        g_animated_visibility_call_site = false;
+        g_engine_frustum_aabb_test = nullptr;
+        log_line("Animated component visibility hook failed: call=%p not "
+            "redirected (no jump block within reach or protect failed)", call);
+        return;
+    }
+    log_line("Animated component visibility hooked build=%s call_site=1 "
+        "tester_rva=0x%llX caller_return_rva=0x%llX call=%p relay=%p",
+        w3vr::game_build::name(build),
+        static_cast<unsigned long long>(tester_rva),
+        static_cast<unsigned long long>(return_rva), call, relay);
+}
+
+// [FIX:REMASTER-ANIMATED-VISIBILITY 8/8] Called from the census under
+// g_vrs_census_busy; window deltas. tests = frustum tests of the
+// animated-component update, culled = those that found the component
+// outside the game camera's frustum, forced = culled ones reported visible.
+// culled - forced stayed culled (menu, cinema, HMD camera not recent).
+void log_animated_visibility_census_locked(uint64_t window_presents) {
+    if (window_presents == 0 || g_engine_frustum_aabb_test == nullptr) {
+        return;
+    }
+    constexpr size_t kCounts = static_cast<size_t>(AnimatedVisibilityCount::Count);
+    static std::array<uint64_t, kCounts> previous{};
+    std::array<uint64_t, kCounts> current{};
+    for (size_t index = 0; index < kCounts; ++index) {
+        current[index] =
+            g_animated_visibility_counts[index].load(std::memory_order_relaxed);
+    }
+    const auto delta = [&](AnimatedVisibilityCount which) {
+        const size_t index = static_cast<size_t>(which);
+        return static_cast<unsigned long long>(current[index] - previous[index]);
+    };
+    log_vrs_line(
+        "PERF anim visibility call_site=%d tests=%llu culled=%llu forced=%llu",
+        g_animated_visibility_call_site ? 1 : 0,
+        delta(AnimatedVisibilityCount::Tests),
+        delta(AnimatedVisibilityCount::Culled),
+        delta(AnimatedVisibilityCount::Forced));
+    previous = current;
 }
 
 void capture_engine_original_temporal_matrix(float* view, uint64_t present) {

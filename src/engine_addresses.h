@@ -40,6 +40,7 @@ enum class Function : size_t {
     GuiFillRect,           // 2D colour quad into the GUI target (_, x, y, w, h, const uint8_t rgba[4])
     RenderFenceWait,       // CRenderFence wait, vtable +0x18 (fence): blocks until it is signalled
     ParallelFlushCommands, // ParallelRenderCommands::FlushCommands (commands): staged batches -> ready, apply
+    FrustumAabbTest,       // (frustum, world box {min, max}): 1 = box fully outside the frustum
     Count,
 };
 
@@ -219,6 +220,29 @@ inline constexpr uint8_t kRenderSceneFenceWaitCall501Bytes[] = {
     0x48, 0x8B, 0x8F, 0xD0, 0x01, 0x00, 0x00, 0xC5, 0xF8, 0x28, 0xF0, 0x48,
     0x8B, 0x01, 0xFF, 0x50, 0x18};
 
+// [FIX:REMASTER-ANIMATED-VISIBILITY 1/8] Frustum AABB test (frustum, world
+// box {min at +0, max at +0x10}). Both builds return al = 1 when the box is
+// fully outside one of the six planes and 0 when it is inside or
+// intersecting. 5.01 rewrote it with AVX over a structure-of-arrays frustum
+// (planes at +0x80..+0x140). In each build its only caller is the
+// animated-component visibility update (AnimatedComponentVisibilityReturn).
+// The 5.01 code has a VEX instruction at byte 4 (MinHook cannot relocate it)
+// and a RIP-relative one at byte 13 (too short for prefix_hook), so on 5.01
+// the mod redirects that one call (src/call_site_hook.h) and leaves the
+// function itself unpatched.
+inline constexpr uint8_t kFrustumAabbTest501Bytes[] = {
+    0x48, 0x83, 0xEC, 0x18, 0xC5, 0xF8, 0x10, 0x52, 0x10, 0xC5, 0xE8, 0x58,
+    0x02, 0xC5, 0xF8, 0x59};
+// The visibility update's call of the test (call rel32, ending at the return
+// address; the rel32 encodes FrustumAabbTest) and the code right after it:
+// lea rcx,[r15+0xF50]; mov [r15+0xF74],al (the "outside" byte the update
+// branches on).
+inline constexpr uint8_t kAnimatedComponentFrustumCall501Bytes[] = {
+    0xE8, 0x20, 0x38, 0x56, 0xFE};
+inline constexpr uint8_t kAnimatedComponentFrustumStore501Bytes[] = {
+    0x49, 0x8D, 0x8F, 0x50, 0x0F, 0x00, 0x00, 0x41, 0x88, 0x87, 0x74, 0x0F,
+    0x00, 0x00};
+
 inline constexpr Entry kEntries[] = {
     {"IsAnyMenu", 0x01F3C5C0, 0x01DF41A0, {kIsAnyMenuBytes, sizeof(kIsAnyMenuBytes)}},
     {"IsLoadingScreenVideoPlaying", 0x0154EED0, 0x0227A0F0,
@@ -269,6 +293,8 @@ inline constexpr Entry kEntries[] = {
         {kRenderFenceWait501Bytes, sizeof(kRenderFenceWait501Bytes)}},
     {"ParallelRenderCommands.FlushCommands", 0, 0x01C1CA10,
         {kParallelFlushCommands501Bytes, sizeof(kParallelFlushCommands501Bytes)}},
+    {"FrustumAabbTest", 0x0031E050, 0x0099B2B0,
+        {kFrustumAabbTest501Bytes, sizeof(kFrustumAabbTest501Bytes)}},
 };
 static_assert(sizeof(kEntries) / sizeof(kEntries[0]) ==
     static_cast<size_t>(Function::Count));
@@ -323,6 +349,8 @@ enum class Value : size_t {
     ParallelStagedCountOffset,    // FlushCommands' this: entry count of staged bucket 0
     ParallelBucketStride,         // bytes from one bucket of a list to the next
     ParallelBucketCount,          // buckets per list (hashed by proxy address)
+    AnimatedComponentVisibilityReturn,  // return address of the frustum test call in the
+                                        // animated-component visibility update
     Count,
 };
 
@@ -416,6 +444,14 @@ inline constexpr ValueEntry kValues[] = {
     {"ParallelStagedCountOffset", 0, 0x15C},
     {"ParallelBucketStride", 0, 0xC},
     {"ParallelBucketCount", 0, 17},
+    // [FIX:REMASTER-ANIMATED-VISIBILITY 2/8] CAnimatedComponent vtable slot 67
+    // (4.04 0x015E1750, 5.01 0x02437970; shared by the mimic, moving-agent
+    // and background-root components) tests the component's world bounds
+    // against the game camera's frustum and stores the result at +0xF74.
+    // While it is set, the update skips the skinned attachments (the body
+    // keeps its last pose, or the bind pose if it was never updated) and only
+    // moves plain child transforms such as a held weapon.
+    {"AnimatedComponentVisibilityReturn", 0x015E186C, 0x02437A90},
 };
 static_assert(sizeof(kValues) / sizeof(kValues[0]) == static_cast<size_t>(Value::Count));
 
