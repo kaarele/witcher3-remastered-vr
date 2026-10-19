@@ -204,16 +204,17 @@ void WriteBaseFixtures(const w3vr::ConfigPaths& paths) {
 void TestRemasteredAndOptionalAfw(const w3vr::ConfigPaths& paths) {
     w3vr::LauncherState state;
     state.remastered = true;
-    for (const auto mode : {w3vr::RenderMode::StereoNone, w3vr::RenderMode::MonoNone}) {
+    for (const auto mode : {w3vr::RenderMode::StereoNone, w3vr::RenderMode::MonoNone,
+             w3vr::RenderMode::StereoDlssSequential, w3vr::RenderMode::MonoDlss}) {
         state.mode = mode;
         Require(w3vr::RenderModeUnavailableReason(state, false).empty(),
-            "Remastered allows Stereo/Mono No AA without AFW");
+            "Remastered allows Stereo/Mono No AA and DLSS without AFW");
     }
-    for (const auto mode : {w3vr::RenderMode::StereoTaau, w3vr::RenderMode::StereoDlssSequential,
-             w3vr::RenderMode::AerAfwDlss, w3vr::RenderMode::MonoTaau}) {
+    for (const auto mode : {w3vr::RenderMode::StereoTaau, w3vr::RenderMode::AerAfwDlss,
+             w3vr::RenderMode::AerAfwTaau, w3vr::RenderMode::MonoTaau}) {
         state.mode = mode;
         Require(!w3vr::RenderModeUnavailableReason(state, true).empty(),
-            "Remastered rejects TAAU, DLSS and AER");
+            "Remastered rejects TAAU and AER");
     }
     state.mode = w3vr::RenderMode::StereoNone;
     state.integration_mode = w3vr::IntegrationMode::Reshade;
@@ -246,6 +247,26 @@ void TestRemasteredAndOptionalAfw(const w3vr::ConfigPaths& paths) {
         "Remastered disables DLSS");
     Require(game.Get("DLC", "DlcEnabled_movementinputfix") == "0",
         "Remastered keeps the 4.04 movement DLC off");
+
+    WriteBaseFixtures(paths);
+    state.mode = w3vr::RenderMode::StereoDlssSequential;
+    state.dlss_quality = 2;
+    Require(w3vr::BuildUpdatedDocuments(paths, state, vr, game, error),
+        "Remastered DLSS documents build");
+    Require(game.Get("PostProcess", "AAMode") == "6" &&
+        game.Get("Rendering", "AllowDLSS") == "true" &&
+        game.Get("PostProcess", "DLSSQuality") == "2" &&
+        game.Get("Rendering", "AllowDLSSG") == "false" &&
+        game.Get("Rendering", "AllowReflex") == "false",
+        "Remastered DLSS writes the game's own DLSS without frame generation");
+    Require(vr.Get("engine", "temporal_backend") == "dlss" &&
+        vr.Get("openxr", "native_stereo") == "0",
+        "Remastered DLSS selects the engine DLSS route");
+    WriteBaseFixtures(paths);
+    state.dlss_quality = 0;
+    Require(w3vr::BuildUpdatedDocuments(paths, state, vr, game, error) &&
+        game.Get("PostProcess", "DLSSQuality") == "5",
+        "Remastered DLAA maps to 5.x DLSSQuality 5");
 }
 
 void TestAllModes(const w3vr::ConfigPaths& paths) {
@@ -1743,7 +1764,10 @@ void TestRemasteredVrSettingsAndRestore(const w3vr::ConfigPaths& paths) {
         configured->Get("PostProcess", "AllowShafts") == "false" &&
         configured->Get("Rendering/RT", "EnableRT") == "false" &&
         configured->Get("Rendering/RT/PathTracer", "PTEnable") == "false" &&
-        configured->Get("Visuals", "HdrEnabled") == "false",
+        configured->Get("Visuals", "HdrEnabled") == "false" &&
+        configured->Get("Gameplay", "EnableAlternateExplorationCamera") == "1" &&
+        configured->Get("Gameplay", "EnableAlternateCombatCamera") == "1" &&
+        configured->Get("PostProcess", "SharpenAmount") == "0",
         "Remastered VR settings were not applied");
     Require(configured->Get("PostProcess", "GTAOQuality") == "3" &&
         configured->Get("Galaxy", "tokenRefA") == "user-secret" &&
@@ -1754,8 +1778,12 @@ void TestRemasteredVrSettingsAndRestore(const w3vr::ConfigPaths& paths) {
         "Remastered restore did not reproduce the original file");
 
     Require(w3vr::AvailableRenderMode(w3vr::RenderMode::AerAfwDlss, true, true) ==
+            w3vr::RenderMode::StereoDlssSequential &&
+        w3vr::AvailableRenderMode(w3vr::RenderMode::AerAfwTaau, true, true) ==
             w3vr::RenderMode::StereoNone &&
         w3vr::AvailableRenderMode(w3vr::RenderMode::MonoDlss, true, true) ==
+            w3vr::RenderMode::MonoDlss &&
+        w3vr::AvailableRenderMode(w3vr::RenderMode::MonoTaau, true, true) ==
             w3vr::RenderMode::MonoNone &&
         w3vr::AvailableRenderMode(w3vr::RenderMode::AerAfwDlss, false, false) ==
             w3vr::RenderMode::StereoDlssSequential &&

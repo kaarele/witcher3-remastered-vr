@@ -519,6 +519,237 @@ void test_controller_locked_hud_plane() {
         "F9 recenter restores the HUD to the current head direction");
 }
 
+// hud.ws UpdateScaleformStageSize plus Scaleform's showAll letterbox: the
+// HUD texture pixel of a script view ratio (x right, y down, -1..1).
+void script_ratio_to_texture_fraction(
+    float ratio_x,
+    float ratio_y,
+    uint32_t width,
+    uint32_t height,
+    float& fraction_x,
+    float& fraction_y) {
+    const float w = static_cast<float>(width);
+    const float h = static_cast<float>(height);
+    const float aspect = w / h;
+    float stage_width = 1920.0f;
+    float stage_height = 1080.0f;
+    float offset_x = 0.0f;
+    float offset_y = 0.0f;
+    if (std::fabs(aspect - 4.0f / 3.0f) < 0.01f) {
+        stage_height = 1440.0f;
+        offset_y = -180.0f;
+    } else if (std::fabs(aspect - 21.0f / 9.0f) < 0.01f) {
+        stage_width = 2520.0f;
+        offset_x = -300.0f;
+    }
+    const float stage_x = (ratio_x + 1.0f) * 0.5f * stage_width + offset_x;
+    const float stage_y = (ratio_y + 1.0f) * 0.5f * stage_height + offset_y;
+    const float movie_scale = std::min(w / 1920.0f, h / 1080.0f);
+    fraction_x = ((w - 1920.0f * movie_scale) * 0.5f +
+        stage_x * movie_scale) / w;
+    fraction_y = ((h - 1080.0f * movie_scale) * 0.5f +
+        stage_y * movie_scale) / h;
+}
+
+struct MarkerCase {
+    const char* label;
+    float hud_size;
+    bool visible_origin;
+    uint32_t width;
+    uint32_t height;
+    XrQuaternionf head;
+    bool fixed_plane;
+};
+
+// World point -> WorldVectorToViewRatio with the mapped marker matrix ->
+// script stage -> HUD texel -> build_cyclopean_hud_plane_clip_positions:
+// the texel must lie in the point's direction from the cyclopean head.
+void run_hud_marker_case(const MarkerCase& test) {
+    const XrFovf source_fov{-0.942478f, 0.942478f, 0.978828f, -0.978828f};
+    const float half_x = std::tan(source_fov.angleRight);
+    const float half_y = std::tan(source_fov.angleUp);
+    const XrFovf eye_fov{
+        -52.0f * kPi / 180.0f, 40.0f * kPi / 180.0f,
+        44.0f * kPi / 180.0f, -55.0f * kPi / 180.0f};
+    const float origin_y = test.visible_origin && test.hud_size < 0.999f
+        ? (eye_geometry::visible_center_tangent_y(eye_fov) +
+            eye_geometry::visible_center_tangent_y(eye_fov)) * 0.5f
+        : NAN;
+    float stage_x{};
+    float stage_y{};
+    require(eye_geometry::scaleform_stage_ratio_scale(
+        test.width, test.height, stage_x, stage_y), test.label);
+    eye_geometry::HudMarkerClipMapping mapping{};
+    require(eye_geometry::hud_marker_clip_mapping(
+        source_fov, half_x, half_y, test.hud_size, origin_y,
+        stage_x, stage_y, mapping), test.label);
+
+    const auto views = make_views(
+        test.head, test.head, {0.1f, 1.6f, -0.2f}, test.head,
+        {-0.032f, 0.0f, 0.0f}, {0.032f, 0.0f, 0.0f});
+    eye_geometry::EyeGeometry current{};
+    require(eye_geometry::compute(views, current), test.label);
+    eye_geometry::EyeGeometry plane = current;
+    if (test.fixed_plane) {
+        require(eye_geometry::with_hud_plane_orientation(
+            current, {0.0f, 0.0f, 0.0f, 1.0f}, plane), test.label);
+    }
+    // Infinite plane distance: the texel direction is then the same from
+    // either eye, which isolates the angular mapping from stereo parallax.
+    std::array<float, 16> corners{};
+    require(eye_geometry::build_cyclopean_hud_plane_clip_positions(
+        plane, 0, source_fov, eye_fov, test.hud_size, 0.0f, corners,
+        origin_y), test.label);
+    XrQuaternionf relative{};
+    require(eye_geometry::normalize(plane.relative_orientations[0], relative),
+        test.label);
+
+    // Marker camera in a z-up world (REDengine): yawed basis, any position.
+    const float yaw_radians = 0.7f;
+    const float camera_right[3]{
+        std::cos(yaw_radians), std::sin(yaw_radians), 0.0f};
+    const float camera_forward[3]{
+        -std::sin(yaw_radians), std::cos(yaw_radians), 0.0f};
+    const float camera_up[3]{0.0f, 0.0f, 1.0f};
+    const float camera_position[3]{12.0f, -40.0f, 3.5f};
+    std::array<float, 16> matrix{};
+    for (size_t axis = 0; axis < 3; ++axis) {
+        matrix[axis * 4 + 0] = camera_right[axis] / half_x;
+        matrix[axis * 4 + 1] = camera_up[axis] / half_y;
+        matrix[axis * 4 + 2] = camera_forward[axis] * 0.5f;
+        matrix[axis * 4 + 3] = camera_forward[axis];
+    }
+    float right_offset{};
+    float up_offset{};
+    float forward_offset{};
+    for (size_t axis = 0; axis < 3; ++axis) {
+        right_offset -= camera_position[axis] * camera_right[axis];
+        up_offset -= camera_position[axis] * camera_up[axis];
+        forward_offset -= camera_position[axis] * camera_forward[axis];
+    }
+    matrix[12] = right_offset / half_x;
+    matrix[13] = up_offset / half_y;
+    matrix[14] = forward_offset * 0.5f;
+    matrix[15] = forward_offset;
+    eye_geometry::apply_hud_marker_clip_mapping(mapping, matrix.data());
+
+    uint32_t seed = 12345u;
+    auto next = [&seed]() {
+        seed = seed * 1664525u + 1013904223u;
+        return static_cast<float>(seed >> 8) / 16777216.0f;
+    };
+    float max_error{};
+    for (int sample = 0; sample < 200; ++sample) {
+        float target_x{};
+        float target_y{};
+        require(eye_geometry::hud_marker_ratio_to_plane_tangent(
+            mapping, next() * 1.8f - 0.9f, next() * 1.8f - 0.9f,
+            target_x, target_y), test.label);
+        const float depth = 0.5f + next() * 40.0f;
+        float world[4]{0.0f, 0.0f, 0.0f, 1.0f};
+        for (size_t axis = 0; axis < 3; ++axis) {
+            world[axis] = camera_position[axis] +
+                camera_right[axis] * target_x * depth +
+                camera_up[axis] * target_y * depth +
+                camera_forward[axis] * depth;
+        }
+        float clip[4]{};
+        for (size_t column = 0; column < 4; ++column) {
+            for (size_t row = 0; row < 4; ++row) {
+                clip[column] += world[row] * matrix[row * 4 + column];
+            }
+        }
+        // The native helper: x = clip_x / w, y = -(clip_y / w).
+        const float ratio_x = clip[0] / clip[3];
+        const float ratio_y = -(clip[1] / clip[3]);
+        float fraction_x{};
+        float fraction_y{};
+        script_ratio_to_texture_fraction(ratio_x, ratio_y,
+            test.width, test.height, fraction_x, fraction_y);
+        // Corners TL, TR, BL, BR; clip is linear across the plane.
+        float texel[4]{};
+        for (size_t component = 0; component < 4; ++component) {
+            const float top = corners[component] +
+                fraction_x * (corners[4 + component] - corners[component]);
+            const float bottom = corners[8 + component] + fraction_x *
+                (corners[12 + component] - corners[8 + component]);
+            texel[component] = top + fraction_y * (bottom - top);
+        }
+        const float eye_tangent_x = std::tan(eye_fov.angleLeft) +
+            (texel[0] / texel[3] + 1.0f) * 0.5f *
+                (std::tan(eye_fov.angleRight) - std::tan(eye_fov.angleLeft));
+        const float eye_tangent_y = std::tan(eye_fov.angleDown) +
+            (texel[1] / texel[3] + 1.0f) * 0.5f *
+                (std::tan(eye_fov.angleUp) - std::tan(eye_fov.angleDown));
+        const auto plane_direction = eye_geometry::rotate(
+            relative, {eye_tangent_x, eye_tangent_y, -1.0f});
+        const float plane_x = plane_direction.x / -plane_direction.z;
+        const float plane_y = plane_direction.y / -plane_direction.z;
+        max_error = std::max(max_error, std::max(
+            std::fabs(plane_x - target_x), std::fabs(plane_y - target_y)));
+        float recovered_x{};
+        float recovered_y{};
+        require(eye_geometry::hud_marker_ratio_to_plane_tangent(
+            mapping, ratio_x, ratio_y, recovered_x, recovered_y), test.label);
+        max_error = std::max(max_error, std::max(
+            std::fabs(recovered_x - target_x),
+            std::fabs(recovered_y - target_y)));
+    }
+    if (max_error > 2.0e-5f) {
+        std::fprintf(stderr, "%s: max tangent error %.3g\n",
+            test.label, max_error);
+    }
+    require(max_error <= 2.0e-5f, test.label);
+}
+
+void test_hud_marker_clip_mapping() {
+    // Quest 3, 2476x2594 HUD, hud_size 0.5 about the visible centre.
+    float stage_x{};
+    float stage_y{};
+    require(eye_geometry::scaleform_stage_ratio_scale(
+        2476, 2594, stage_x, stage_y), "marker stage scale");
+    require(std::fabs(stage_x - 1.0f) < 1.0e-6f &&
+        std::fabs(stage_y - 0.536912f) < 1.0e-4f,
+        "marker stage scale is the 16:9 width-fit band");
+    const XrFovf source_fov{-0.942478f, 0.942478f, 0.978828f, -0.978828f};
+    const float visible_origin = (std::tan(44.0f * kPi / 180.0f) +
+        std::tan(-55.0f * kPi / 180.0f)) * 0.5f;
+    eye_geometry::HudMarkerClipMapping owner{};
+    require(eye_geometry::hud_marker_clip_mapping(
+        source_fov, std::tan(0.942478f), std::tan(0.978828f), 0.5f,
+        visible_origin, stage_x, stage_y, owner), "marker owner mapping");
+    require(std::fabs(owner.scale_x - 2.0f) < 1.0e-4f &&
+        std::fabs(owner.offset_x) < 1.0e-6f &&
+        std::fabs(owner.scale_y - 3.725f) < 2.0e-3f &&
+        std::fabs(owner.offset_y - 0.2896f) < 1.0e-3f,
+        "marker owner mapping x 2.000, y 3.725, offset +0.2896");
+    // Full-size HUD about the render centre: only the stage band remains.
+    eye_geometry::HudMarkerClipMapping full{};
+    require(eye_geometry::hud_marker_clip_mapping(
+        source_fov, std::tan(0.942478f), std::tan(0.978828f), 1.0f, NAN,
+        stage_x, stage_y, full), "marker full-size mapping");
+    require(std::fabs(full.scale_x - 1.0f) < 1.0e-6f &&
+        std::fabs(full.scale_y - 1.0f / stage_y) < 1.0e-4f &&
+        std::fabs(full.offset_y) < 1.0e-6f,
+        "marker full-size mapping is 1 / stage band");
+    eye_geometry::HudMarkerClipMapping rejected{};
+    require(!eye_geometry::hud_marker_clip_mapping(
+        source_fov, std::tan(0.942478f), std::tan(0.978828f), 0.0f, NAN,
+        stage_x, stage_y, rejected), "marker mapping rejects hud_size 0");
+    require(!eye_geometry::scaleform_stage_ratio_scale(0, 2594,
+        stage_x, stage_y), "marker stage scale rejects empty texture");
+
+    const auto turned = eye_geometry::from_hmd_euler_degrees(-10.0f, 20.0f, 3.0f);
+    run_hud_marker_case({"marker fixed HUD, Quest 3, size 0.5, visible origin",
+        0.5f, true, 2476, 2594, turned, true});
+    run_hud_marker_case({"marker head-locked HUD, size 1, render origin",
+        1.0f, false, 2476, 2594, turned, false});
+    run_hud_marker_case({"marker fixed HUD, 4:3 stage, size 0.75",
+        0.75f, true, 1600, 1200, {0.0f, 0.0f, 0.0f, 1.0f}, true});
+    run_hud_marker_case({"marker fixed HUD, 21:9 stage, size 1.25",
+        1.25f, true, 2520, 1080, turned, true});
+}
+
 void test_parallel_headset_adaptation() {
     constexpr float baseline = 0.068047f;
     constexpr float width = 2160.0f;
@@ -946,6 +1177,7 @@ int main() {
     test_asymmetric_presentation_scale();
     test_strict_stereo_final_presentation_scale();
     test_asymmetric_hud_source_shift();
+    test_hud_marker_clip_mapping();
     if (failures != 0) {
         std::fprintf(stderr, "%d eye-geometry test(s) failed\n", failures);
         return 1;

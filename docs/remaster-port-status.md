@@ -487,3 +487,491 @@ Layout changes that block a direct port:
   scene without errors (its desktop captures do not show the HMD view, so only stability was
   checked there).
 - Open: headset check on 4.04.
+
+## 2026-10-18/19: Linux/Proton and further 5.01 work (this repository)
+
+Added by [witcher3-remastered-vr](https://github.com/kaarele/witcher3-remastered-vr). Test setup:
+Linux with Steam, Proton and vkd3d-proton, NVIDIA RTX 3080, Meta Quest 3 through WiVRn at 90 Hz,
+2476x2594 per eye. "Null HMD" below means the headless runtime in `tools/w3vr-nullxr` (next
+section). Status lines say whether a change was tested in the headset or only verified with the
+null OpenXR runtime.
+
+### Headset-free OpenXR runs under Proton (w3vr null HMD)
+- The SteamVR null driver route does not fit Proton: the Windows OpenXR loader ignores
+  `XR_RUNTIME_JSON` under Wine (elevated token) and always takes Proton's wineopenxr. Instead:
+  `tools/w3vr-nullxr`, a minimal D3D12 OpenXR runtime that exports every `xr*` entry point, plus
+  `[test] openxr_loader=<dll>` so the mod loads it in place of `openxr_loader.dll`. Quest 3 FOV
+  and recommended size, paced `xrWaitFrame`, BMP captures of the submitted projection/quad layers
+  (post-HUD composite). Setup in `linux/BUILD-LINUX.md`.
+
+### DLSS SR on 5.01 under Proton
+- Proton blocks it before the mod does anything: 5.01 skips its Streamline setup when
+  `ntdll!wine_get_version` exists. The DLL now NOPs that jump in memory at load (exact 5.01 build,
+  18 context bytes checked), on by default with `temporal_backend=dlss`.
+- Flat (no OpenXR): Streamline 2, `_nvngx` and `nvngx_dlss` load, no Streamline errors, DLSS image.
+- Strict Stereo: the game evaluates DLSS once per eye frame through one state and viewport, so one
+  history mixed both eyes. Fix: hooks on the constants builder, input prepare and SR apply give
+  each eye its own Streamline viewport (engine id, +0x100 for the right eye) and their own copy of
+  the state's frame guards (both eyes of a pair share `frame_data+0xC44`, so the second eye's
+  constants were otherwise skipped). The per-eye motion-vector camera record (V14003) is ported
+  (builder 0x02291600, view+0x530). Null HMD: every pair gets constants/prepare/apply for both
+  viewports, 0 Streamline errors, both eyes clean and consistent (no blending), same frame rate
+  as FXAA (CPU bound).
+- Status: tested in the headset (DLSS Quality to DLAA).
+
+### HUD and menu placement / sharpness
+- The projection HUD shader sampled the 2476x2592 HUD with one nearest `Load`; at `hud_size` 0.5
+  it dropped 3 of 4 texels (broken glyphs that crawl with the head). Now a premultiplied box of
+  bilinear taps over the pixel footprint (`hud_filtered_sampling`, default on).
+- The controller-locked HUD plane used the full head orientation captured at recenter, which can
+  include several degrees of pitch. Now heading only (`hud_anchor_level`).
+- `hud_size` < 1 shrank the HUD toward the straight-ahead axis, which on Quest 3 is 40% from the top
+  of the visible image (FOV +44/-55). Now toward the visible-image centre (`hud_scale_origin`), the
+  same at `hud_size` 1. Null HMD at 0.5: minimap about +10 degrees, hints about -21 degrees.
+- Menus and loading screens are centred on the visible-image centre (`menu_vertical_center`; -13
+  degrees on Quest 3).
+- Status: tested in the headset.
+
+### World markers on 5.01
+- Interaction prompts and NPC icons sat too high and moved with the camera pitch: the
+  `CameraDirector.WorldVectorToViewRatio` hook that corrects them was 4.04-only, so 5.01 used the
+  game's pitched 60-degree camera, drawn into a HUD that the mod shows on a level plane.
+- The native is ported (address table entry, 32-byte 5.01 signature; at installation its decoder
+  table, out-parameter global and helper constants must match the table values, else the hook
+  stays off). The local projection used for manual cinema and the first-person reticle reads the
+  same values and skips empty decoder entries like 5.01's native.
+- `[openxr] world_marker_exact_projection` (default 1, 5.01 only): with the controller-locked
+  level HUD in Stereo, each pair publishes a marker matrix that maps a world point to the HUD
+  texel in its direction from the cyclopean head: the render camera without HMD rotation or eye
+  offset (level, game yaw) and an off-axis frustum equal to the plane's stage window. Two clip
+  columns change: x by 1/(s kx), y by 1/(s ky) plus an origin term (s = `hud_size`, origin =
+  the composite's visible-centre origin, kx/ky = the Scaleform stage band of the HUD texture from
+  hud.ws `UpdateScaleformStageSize` and letterboxing). Quest 3, 2476x2594, s 0.5: x 2.000,
+  y 3.725, +0.290 clip w. No tuned values; the five `world_marker_*` gains stay for the other
+  routes (head-locked HUD, `hud_anchor_level=0`) and for 4.04. 0 leaves the native untouched.
+- `[openxr] hud_centre_split_aim_only` (default 1, 5.01 only): the centre square of a reduced
+  HUD is redrawn about the render centre only within 4 presents of an AimProbe crosshair draw;
+  outside aiming it lifted markers crossing it by 6.6 degrees. On 5.01 the AimProbe signal also
+  fires for about 160 presents at the start of gameplay without aiming (`HUD centre split`
+  lines).
+- `[debug] world_marker_diagnostics=1` (with logging): one `World marker exact` line every 30
+  presents (400 at most) with the world point, the returned ratio, the vanilla ratio, the
+  expected plane tangent (from the marker camera) and the plane tangent of the ratio through the
+  composite geometry (`error_deg` should stay below 0.01); `World marker exact mapping` when the
+  mapping changes; `HUD centre split active=` on changes.
+- Unit test: `renderer_eye_geometry` runs world points through the mapped matrix, the script
+  stage and `build_cyclopean_hud_plane_clip_positions` (fixed and head-locked planes, 16:9 band,
+  4:3 and 21:9 stages).
+- Status: verified with the null OpenXR runtime; headset confirmation pending (the exact mapping is
+  active with the values above). The aim-only centre split is not tested yet.
+
+### Near view "zooming in and out" on 5.01
+- Camera trace (`[debug] camera_offset_trace=1`, null HMD, scripted panning): the near offset was
+  applied on every factory camera (no flips), and the horse camera's orbit radius stayed constant
+  during 360-degree pans. On foot the 5.01 Modern exploration camera snaps up to 1.3 m backwards
+  and 1.5 m up within 2-3 frames while walking and glides back; with the game pitch locked for VR
+  only that translation is visible. The Close preset: no such snaps (0 vs 16 in the same script).
+- Changes: near view moves along the level heading when the game pitch is locked
+  (`close_camera_level`); the launcher and the Linux tool set the Close exploration/combat cameras.
+
+### Geralt centred in the near view; gameplay recenter kept across cutscenes
+- Geralt sat left of centre because the Close camera is an over-the-shoulder camera (scripts:
+  0.74 m right, 1.88 m behind, about 21.5 degrees off-axis). The near view (`camera_mode=1`) only
+  moved the camera along the heading, so it never removed the lateral offset.
+- `[engine] camera_center=1.0` (strength 0..1, 0 = the old near view): once per stereo pair (per
+  Present under AER) the player position (player+0xA0; the 5.01 CNode.GetWorldPosition native at
+  0x142267E50 reads it there, and its bytes are checked once, otherwise centring stays off) is
+  measured against the game camera along the level right and forward vectors, and the camera
+  moves along the level right vector by strength x lateral offset, the same amount for both eyes.
+  It is filtered with `camera_center_smoothing_seconds=0.30` and resets to the measured value on
+  the first gameplay camera after a cutscene, dialogue, loading screen or F10 panel, after a gap
+  over 0.25 s, and on jumps over 1 m. A measurement with the player not 1.2-8 m in front of the
+  camera, more than 5 m above or below it, or more than `camera_center_max_m=1.5` to the side
+  targets 0 (the game's shoulder camera). While aiming (crossbow, bombs: the aim camera sits
+  0.1-0.9 m behind Geralt, or the AimProbe crosshair is live) the camera glides back onto the game
+  camera, because the game aims from its own unshifted camera. The near-view distance
+  (`close_camera_offset`) is unchanged. No game collision for the shifted camera.
+- F8 still toggles 0/1; the log names are `vanilla_shoulder` and `vr_centred` (`near` when
+  `camera_center=0`).
+- Cutscenes: on cinema entry the mod arms an automatic HMD recenter, which the first accepted
+  stereo pair turns into an F9-style recenter (head yaw, the full orientation, head position and
+  the centre views). Nothing restored the gameplay centre when the cutscene ended, so gameplay
+  continued with the head direction of the cutscene's first frames as its forward axis. With
+  `[openxr] cinema_restore_gameplay_recenter=1` (default) that recenter first saves the centre
+  gameplay used, and the cinema exit restores it. Only a centre a gameplay camera has rendered
+  with is saved, and never the session's first centre (taken when OpenXR started, often in the
+  menu), so the recenter that starts gameplay after a load behaves as before, whether it comes from
+  a post-load cinema or from an arm left over from a cinema without stereo pairs. F9, or any other
+  recenter during the cutscene, drops the saved centre.
+- Logs (`[debug] logging_enabled=1 runtime_diagnostics=1`): `HMD auto-recenter armed by first
+  packed pair=... save_gameplay=1`, `HMD cinema gameplay centre saved/restored/discarded/not saved`,
+  `Camera centre player position verified`, `Camera centre reset reason=first|epoch|gap|jump`.
+  With `camera_offset_trace=1` each CAMTRACE line adds `player=`, `meas=`, `lat=` (before), `fwd=`,
+  `shift=`, `lat_after=`, `centre=`, `epoch=`, `auth=`, `top=`, `ncut=`, `nscene=`, `cine=`
+  (`linux/tools/camtrace.py` summarises them).
+- Status: centring verified with the null OpenXR runtime (without it Geralt sits about 22 degrees
+  left; with `camera_center=1` the median is 0 degrees, with the same shift in both eyes); headset
+  confirmation pending. The cutscene recenter restore and the release while aiming are not tested
+  yet.
+
+### Per-eye asymmetric projection on 5.01 (`remaster_asymmetric_ndc`)
+- Without this option 5.01 renders each eye with a symmetric envelope (+-54 x +-56 degrees on
+  Quest 3) and submits a 1993x2089 crop of the 2476x2594 image, so about 35% of the shaded pixels
+  are never shown and the visible area has 0.805x the pixel density of 4.04, which renders each eye
+  with its own asymmetric frustum (`native_stereo=1`). That 4.04 path writes the optical centre into
+  the view's centre block, which on 5.01 is owned by the temporal writer as the DLSS jitter.
+- 5.01's ViewRebuild has a separate NDC projection offset (view+0x520/+0x524; translation P*T applied
+  to the projection and the previous projection after the centre/jitter translation; nothing in the
+  game writes it). `[engine] remaster_asymmetric_ndc=1` sets each factory eye view to its own FOV
+  span and writes that eye's optical centre there; the full image is submitted with the eye's real
+  FOV through the existing native-asymmetric pair ledger. The centre block (jitter) is untouched.
+- The engine's current-to-previous clip reprojection (view+0x400, read by the DLSS input prepare and
+  other temporal passes) is built from the projections before any translation, so it is conjugated
+  with the offset after every rebuild (`remaster_asymmetric_ndc_reproject`, default on). The shadow
+  cascade frustum helper (0x02291CA0) ignores the offset, so it is folded into its private centre
+  block during the call (`remaster_asymmetric_ndc_cascade_fix`, default on).
+- Null HMD: every pair verified for both eyes (P[2][0], P[2][1] equal offset + jitter), 0 rejected
+  pairs; the headset view lines up with the old crop within 0.2 px in every image region; HUD and
+  shadows at the outer and bottom edges unchanged; 6-11% sharper at the new density; scripted head
+  turns (40 deg/s) smear less with the reprojection fix than without.
+- Per-eye frusta need each eye's temporal history to be its own (the previous projection carries
+  the current eye's offset): they are used while the mod's per-eye DLSS runs, or when no temporal AA
+  runs at all (no jitter for 240 presents, e.g. FXAA). The game's own TAA/FSR/XeSS alternate one
+  history between the eyes and keep the envelope. The decision is latched per stereo pair, and a
+  change restarts both per-eye DLSS histories.
+- The baked bootstrap HUD (shown until the retained HUD pair exists) uses the optical-centre
+  variants for eyes rendered with a per-eye frustum; without a runtime visibility mask (WiVRn
+  returns an empty one) those variants are derived from the eye FOVs.
+- After 90 distinct consecutive rejected pairs the option switches itself off for the session (log
+  `RANDC disabled`). Menus, cinema panels, loading screens and fallback cameras keep the envelope.
+- Status: tested in the headset (with per-eye DLSS). The headset setup uses
+  `remaster_asymmetric_ndc_cascade_fix=0`, see the next section.
+
+### Sun shadow cascades once per stereo pair (`[engine] remaster_shadow_pair_reuse`)
+- In strict Stereo both eyes run the whole sun-shadow job inside the frame builder, one after the
+  other on the render thread: cascade fit and caster cull (0x01BF39B0), SpeedTree cascade views
+  (0x01CEBC30) and the cascade depth passes (0x01D1EBF0, called from RenderShadows 0x01C34E90).
+  They overwrite the same persistent state: the cascade set (collector+0x100), the SpeedTree
+  cascade frusta ([collector+0x4EE8]+0x1C0) and one D16 shadow map array. The lighting rebuilds its
+  cascade constants from the set on every render, so the same set gives the same constants.
+- `remaster_shadow_pair_reuse=1`: the first exact render of a pair (eye/pair/generation tag from
+  the frame-data registry, either eye) runs everything and is the seed. The other eye skips the
+  fit/cull and the depth passes, so its lighting samples the seed's map with the seed's constants.
+- The frame builder's end-of-render cleanup (0x01BF7F10, after the recording step) zeroes the
+  set header (set+0 = collector, set+0x8 = cascade count) and the sixteen draw-list counts after
+  every render. The second render's SpeedTree cascade views and its lighting constants
+  (0x01C704B0) read the count, so the seed keeps the header and a skipped fit writes it back. The
+  draw lists stay empty; only the depth passes read them.
+- The skip needs: a hash of the set's persistent fit bytes for the seed's cascade count (caster
+  frusta, each cascade's views and texel constants, parity; about 19 KB) equal to the one taken
+  after the seed's fit; a header that is cleared or still the seed's; the same frame shadow inputs
+  (far plane, sun direction, splits, bias and per-cascade parameters, shadow flags) and SpeedTree
+  object; and no depth passes since the seed's (a counter of depth-pass calls).
+- Fit skip and depth-pass skip are one decision per render: after a skipped fit the depth passes
+  always return the way the engine's own early exit does (nothing recorded: no clear, no barrier,
+  no draw), with no further check and no fallback; after a fit that ran they always draw. The
+  render's SpeedTree gather job is joined by the cleanup, as on that early exit.
+- Gate: Mode 3 dual render, no menu, cinema or loading video. After 8 mismatching pairs in a row,
+  or more than 32 in 256 attempts, the option switches itself off for the session (log `Shadow
+  pair reuse disabled`).
+- `=9` is measurement only: it skips the depth passes but keeps each eye's own fit, so the second
+  eye's shadows are misregistered by up to the IPD. It separates the depth-pass saving from the
+  fit/cull saving.
+- Logs: the install line `Shadow pair reuse requested=... mode=... code fit=... render=...
+  cleanup=... hooks fit=... render=...`; per window `Shadow pair reuse mode=...
+  seeded=+w/total fit_skipped=... render_skipped=... frusta_restored=... fallbacks:
+  <reason>=+w/total` (census log in a measurement run, otherwise every 1200 Presents with
+  diagnostics on). Fallback reasons: gate, no_tag, same_eye, seed_not_rendered, busy,
+  foreign_render (another render drew the map or replaced the slot), and the mismatches that feed
+  the fail-safe: thread, collector, cascades (set header neither cleared nor the seed's), frame,
+  set_hash, scene_object, read_fault.
+- `[perf] shadow_profile=1` (needs the VRS census log) times the four stages per eye with QPC
+  and logs per census `PERF shadow eye=left|right|untagged` (ms per call of each stage, render
+  calls per Present, skipped fits/renders, mean cascade count and parity, share of renders with
+  sun shadows on, draws per depth-pass call, the last set hash, shadow map size and handle),
+  `PERF shadow set` (fits that followed the other eye of the same pair, how many found the set's
+  fit bytes as that eye left them (`untouched`; the cleared header aside) or produced the same set
+  (`same_fit`), shadow map handle changes,
+  all draws per Present and the depth passes' share) and once `PERF shadow frame` (split count,
+  split distances, per-cascade parameters, far plane).
+- With `=1` both eyes use the seed eye's fit (the engine's sphere from three corners of that eye's
+  frustum). With `remaster_asymmetric_ndc_cascade_fix=0` both eyes' fits have the same shape, so the
+  other eye only adds the eye separation to a single eye's coverage; with `cascade_fix=1` the seed's
+  fit follows the seed eye's asymmetric frustum and may cover the other eye's outer side less. Not
+  done yet: Stage 2 (a pair-locked fit, the minimal sphere around both eyes' frustum corners) and
+  Stage 3 (skipping the reuser's SpeedTree cascade gathers).
+- Status: verified with the null OpenXR runtime; headset confirmation pending. In a village scene
+  (DLSS Quality, run-ahead on) every pair was seeded and skipped on the other eye, with no mismatch
+  fallbacks; both eyes' sun shadows matched in captures, with no coverage loss visible at the
+  reusing eye's outer edge; about 1.4% more Presents/s.
+
+### Local lights per eye on 5.01 (`remaster_local_*`)
+- Symptom: inside and near buildings a light can look blocked for one eye but not the other.
+  Every engine render (one per eye in strict Stereo) picks its own shadowed local lights and their
+  atlas tiles from its own camera: one 2048x2048 dynamic slice, tile size halved per distance step
+  (512 up to 1.2 light radii), all lights halved and packed once more when the packing fails, and
+  faces that still get no tile cast no shadow (light through walls in that eye). The legacy order
+  packs the smallest lights first. Flickering lights never use the static cube cache, and their
+  flicker advances once per render, i.e. at twice the speed and one step apart between the eyes.
+- `[engine] remaster_local_light_diag=1` (no behaviour change): per render `LL render` (pair, eye,
+  render order, light and shadowed counts, packing attempts (2 = overflow), tile failures per
+  attempt, static cube misses, tile-size histogram, flicker calls), a few `LL light` tables,
+  `LLDIFF` when the two renders of a pair differ (lights shadowed in one eye only, different tile
+  size or allocated faces), and an `LL summary` every 1800 tagged renders. Lines also reach the
+  census log of a `[vrs] log=1` run.
+- `remaster_local_shadow_slices=2..4` and `remaster_local_shadow_sort_corrected=1` write
+  `Rendering/LocalShadows NumDynamicSlices` / `UseCorrectedLightSort` (names checked first) when the
+  shadow manager is created; 4 is the most the tile packing can address. Log `LL capacity`.
+- `remaster_light_flicker_per_pair=1`: a light already advanced in this pair keeps the first
+  render's flicker state (lock-free table keyed by light; renders are matched through the frame
+  index the engine stamps on each visited light).
+- `remaster_local_light_pair_lock=1`: both renders of a pair size and fade local shadows from the
+  first render's view position (the selection reads nothing else of its render). One of the
+  selection's two call sites keeps volatile registers live across the call, so the detour runs
+  behind a stub that preserves them.
+- All off by default; both pair options stay off under AER (one eye per tick).
+- Status: `remaster_light_flicker_per_pair` and `remaster_local_light_pair_lock` are verified with
+  the null OpenXR runtime; headset confirmation pending (a candle-lit interior at night).
+
+### Fixed foveated rendering, Phase 0: VRS measurement build (`[vrs] mode=3`)
+- Purpose: measure the most variable rate shading can save before building per-eye foveated
+  rate maps. Mode 3 shades the scene passes at one uniform coarse rate everywhere (centre
+  included), so it is for measurement only. Default `mode=0` installs no detour and changes
+  nothing; modes 1/2 are reserved and currently mean off.
+- Classes come from each graphics PSO's render-target signature at creation (scene depth
+  D32_FLOAT_S8X24, one sample): `gbuffer` = 4 RTs RGBA8, RGBA8, RGBA8, RGBA16F velocity;
+  `decal` = 1 or 3 RGBA8 RTs; `scene_hdr` = RT0 RGBA16F (forward/transparent, sky, ocean, light
+  volumes). Everything else (shadows, UI on D24S8, post passes without depth, HUD composite, the
+  mod's own PSOs) stays at 1x1. `RSSetShadingRate` is called at SetPipelineState only when a
+  list's rate changes; Reset/ClearState/Close return the record to 1x1 and the list is classified
+  again on its next bind. Bundles, compute lists, the XR list and ReShade's list are never
+  touched. The mod's own terrain motion replay draw runs at
+  1x1; its smoke/focus-fire PSO substitutes replace one engine draw and keep that draw's rate.
+- Startup logs `VRS caps` (OPTIONS6: tier, tile size, additional rates); tier below 1 turns it
+  off, and 2x4/4x2/4x4 fall back to 2x2 without additional-rate support. Every 600 Presents a
+  `VRS census` line gives Presents/s and per-class bind counts for the window, the list states,
+  and `unknown_pso_binds` (binds of PSOs that neither creation detour saw; it should stay 0, or
+  the measured ceiling is too low). The first bind of each classified PSO logs one `VRS pso` line
+  (64 at most), and the first 8 unknown binds log their PSO.
+- Measurement INI: `[debug] runtime_diagnostics=0` (`logging_enabled` does not matter, so the
+  launcher's or a test run's diagnostics-off state works); `[vrs] mode=3`, `uniform_rate=2x2`,
+  `classes=gbuffer,decal,scene_hdr`, `log=1`. The VRS lines are the only ones written to
+  `witcher3vr.log` in that state.
+- Baseline: the same INI with `uniform_rate=1x1`. It runs the same detours and census but never
+  calls `RSSetShadingRate`, because every list record starts at 1x1. A `mode=0` run writes no
+  census, so it can only be timed from outside the mod.
+
+### Descriptor metadata store (`[engine] descriptor_metadata_store`)
+- Problem (null HMD, 5.01, Proton): the `CopyDescriptors`/`CopyDescriptorsSimple` detours took
+  about 15% of the engine render thread and 16% of both RenderDispatcher threads. Every copied
+  descriptor did several hashed lookups (Witcher Senses cache, 1M-slot CBV table, resource
+  mirror), and each CBV miss, i.e. every non-CBV source, also locked a shared fallback-map mutex.
+  `[perf] skip_descriptor_tracking=1` raised CPU-bound throughput from 69 to about 100 eye
+  renders/s; the render thread's job wait at 0x141D335A9 fell from about 3.2 to 1.0 ms.
+- `shadow` (default): one 48-byte entry per descriptor holds every metadata kind (CBV address and
+  size, retained-HUD resource and format, Witcher Senses target). Entries are ordered by CPU
+  handle in lazily allocated pages of 2048 granules. The granule is the largest power of two
+  dividing the CBV_SRV_UAV increment: 32 on NVIDIA and on vkd3d-proton's default path, the
+  native descriptor size on its embedded/descriptor-heap paths (64 on RDNA2/Steam Deck, 128 on
+  Intel). Handle bits below the granule (vkd3d-proton's per-heap tag) are part of the page key,
+  so heaps whose handle windows overlap never share entries. A copy walks source and destination
+  entries run by run under a per-entry seqlock, with no hashing or lock; a per-thread page
+  cache resolves the pages. Waits on a writer pause, then yield the core. The startup log has
+  `Descriptor metadata store=...` (in the census log during a measurement run); an increment
+  that is not a multiple of 8 keeps `legacy`.
+- Deliberate difference: a copy now gives the destination exactly the source's metadata, empty
+  included. `legacy` kept the destination's old CBV/resource entry when the source had none.
+  The shadow store also never evicts (the legacy Witcher Senses cache and the full legacy
+  resource table could lose entries). The smoke lookup finds handles the legacy one could not:
+  those in the fallback map, and descriptors briefly mid-write (up to 8 attempts instead of 1).
+  Witcher Senses lookups wait for a writer instead of giving up after 3 attempts. All of these
+  only add hits. TAAU/RT keep the `g_resource_descriptors` map path unchanged under
+  `g_reverse_mutex`.
+- `legacy` runs the previous code; its CBV lookup no longer takes the fallback mutex on an empty
+  probe slot (slots are never cleared, so such a handle cannot be in the map).
+- Memory: 96 KiB per touched page, never freed; a fully used 1M-descriptor heap is 48 MiB. Each
+  census has `PERF descriptor store=... pages=... shadow_mib=...` and guard counters
+  (`directory_overflows`, `alloc_failures`, `owner_collisions` (should stay 0),
+  `long_waits`); a legacy run logs `PERF descriptor store=legacy`. One line warns past 4096
+  pages.
+- `[perf] descriptor_shadow_verify=1` (needs the VRS census log) keeps both stores and compares
+  every lookup. Each census adds a `PERF descriptor verify kind=...` line per kind with
+  `+window/total` counts: match, empty, legacy_only_stale (expected: legacy kept stale data
+  after a copy), legacy_only (shadow lost data), shadow_only (legacy evicted or missed),
+  differ, transient (a difference that did not repeat on a second look) and copy_source_lost
+  (copies whose legacy source had data the shadow source lost). The first 20 examples of
+  differ, shadow_only and legacy_only are logged once.
+- Status: on by default; verified with the null OpenXR runtime; headset confirmation pending.
+
+### Render-thread CPU trims (descriptor copy, aim detector, pair barrier)
+- Descriptor copy, shadow store (`copy_descriptor_shadow_ranges`): both copy detours read one
+  atomic route mask instead of about eight predicate chains per call. The mask holds only terms
+  that depend on the INI and build constants; it is computed in `load_config` and again when the
+  store falls back to legacy. The runtime-variable terms of `descriptor_metadata_hooks_needed()`
+  (native-asymmetric state, cinema panel, AFW) are evaluated in full only when the configured
+  terms are all off. The startup log has `Descriptor copy routes=0x...` (in the census log
+  during a measurement run).
+- Per copy: switches are read once per call instead of once per run. The last source and
+  destination pages are kept across runs, so a gather looks its destination page up once. With
+  one entry per descriptor (stride 1, NVIDIA/vkd3d-proton) the run limit needs no division.
+  The run minimum no longer uses the initializer-list `std::min`.
+- Per descriptor: source and destination are read header first. A source without metadata
+  kinds (or held by another owner) loads no value fields. An empty copy onto an entry that
+  already reads as empty is skipped: no owner stamp, lock or store. Owner bits alone are not
+  observable: every consumer checks the kind bits, and under verification also the
+  copied-empty markers, which count as content here. No new key: `[engine]
+  descriptor_metadata_store=legacy` bypasses the shadow copy entirely, and
+  `[perf] descriptor_shadow_verify=1` checks it (expected: differ 0, legacy_only 0).
+- Aim detector (`sample_aim_pso_probe`, feeds `g_aim_crosshair_last_present`): the 6x1 draw
+  check no longer takes `g_reverse_mutex` or runs `strstr` on the draw source. Every record into
+  `g_pipeline_infos` refreshes a 4-slot lock-free set of PSOs recorded with the AimProbe VS/PS
+  pair. A PSO recorded again with another pair leaves the set, so the set stays equal to the map.
+  A fifth AimProbe PSO logs `Aim probe PSO set full` and the detector goes back to the locked
+  map lookup. With `[debug] first_person_aim_diagnostics=1` every candidate draw is also checked
+  against that lookup: `FPAIM probe set hit ... lookup=1` (first 4), `FPAIM probe set mismatch`
+  (must never appear).
+- Strict-Stereo pair barrier (`wait_for_engine_pair_completion`): the spin before parking is a
+  pause budget, `[engine] pair_barrier_spin_pauses` (default 4096, roughly 60-130 us), instead
+  of a ~200 us window that called `QueryPerformanceCounter` (a syscall under Proton) on every
+  pause. `0` restores the timed spin. Measurement runs log `PERF pair_barrier_spin_pauses=...`.
+
+### Strict-Stereo pair barrier run-ahead (`[perf] pair_barrier_lag`)
+- Problem (null HMD, 5.01, Proton): after RenderSceneSetup queues both eyes of pair P, the game
+  (main) thread waits in `hook_engine_render_scene_setup` until P has rendered
+  (`wait_for_engine_pair_completion`). The next game tick therefore never overlaps rendering, and
+  the render thread idles in the engine's command-ring wait (0x141C69AE0, ~26% of its samples)
+  for a whole tick per pair.
+- `pair_barrier_lag=1` (5.01 only; other builds log it and keep 0) waits for the pair queued by
+  the previous tick instead, so tick P+1 runs while P renders: at most one pair of run-ahead.
+  The masks and floors of a pair are still settled by the same wait, one tick later; a pair is
+  never released on its first eye (that would drop its second completion, its captures and its
+  0x3 mask). A tick that queues no pair (menu, loading video, retry window) waits for the
+  pending pair; a pending pair from before a route reset (new capture generation) is dropped
+  without waiting, because it can no longer complete. Default 0: unchanged behaviour.
+- Audit of state that assumed one pair in flight:
+  - The right-eye scene descriptor copy was indexed by `present % 16`; with lag 1 every pair gets
+    its own slot of the 16 (a counter), since the next factory can run before the Present count
+    moves.
+  - Capture ring: a full ring drops the capture, it never overwrites a slot in use (fence and
+    `recording_pending` checks). With lag 1 the ring has 4 slots per eye instead of 3, because
+    the render thread no longer idles through the tick while the GPU still holds the oldest slot.
+    The census counts dropped captures (`ring_full`).
+  - Pair-frozen views, HMD pose snapshots, FOVs and frame tags travel with the frame data
+    (`g_engine_dual_frame_eyes`, pruned only 256 pairs back); native-asymmetric, shadow-cascade,
+    temporal-matrix and world-marker camera rings are keyed by pair (16-128 slots). The live HMD
+    globals (`g_xr_views`, `g_hmd_*`) are written and read on the game thread (pair factory,
+    view rebuild); render-thread hooks read the frame tag instead. Strict Stereo HUD placement
+    uses the submitted (pair-frozen) views and the F9 centre. The 5.01 world-marker hook
+    (`world_marker_exact_projection`) reads its camera on the game thread: at lag 1 it uses the pair
+    the previous tick queued (`g_engine_pair_barrier_pending`), the same pair lag 0 reads from the
+    completed signal, so the marker camera age does not depend on render-thread progress.
+  - The per-eye DLSS guards (`call_remaster_dlss_per_eye`) run only on the render thread, in
+    render order, which run-ahead does not change.
+  - Pair pose lead: the pose was predicted 2 display periods after the last completed frame, which
+    assumes no run-ahead. Every pair now remembers the completed time its pose was located from,
+    and its first real publication measures how many periods passed (average over pairs). With
+    `pair_barrier_lag=1` and `pair_pose_lead_adaptive=1` the rounded average (1-6) replaces the 2
+    after 8 samples.
+- Census (VRS census log), one line per window: `PERF pair barrier lag= waits= waits_per_present=
+  ms_per_wait= ms_per_present= max_ms= long_waits= timeouts= drains= stale= masks= ring_slots=
+  ring_full= pose_lead= observed_lead= lead_samples=`. `ms_per_wait` is the game thread's wait per
+  pair (lag 0 expected about one pair's render time, lag 1 near 0 when the render thread keeps
+  up); `masks` (completion-mask backlog) must stay small; `timeouts` and `ring_full` should stay 0.
+  The pipeline flight recorder still times the wait as `EnginePairWait`.
+- Status: off by default; verified with the null OpenXR runtime; headset confirmation pending. With
+  lag 1 the game thread's wait per pair fell to near 0 with no timeouts; CPU-limited headless runs
+  gave about 15% more frames per second.
+
+### Black HUD rectangle during fades (`hud_fade_mode`, 5.01)
+- Symptom: a black rectangle over about 2/3 of the view for 1-2 s when a cutscene loads,
+  with a small see-through area near the middle; after a loading screen a rectangle fades away.
+- Cause: 5.01 draws its screen fade (`FadeOut`/`FadeIn`, blackscreens) in the GUI pass 0x01C26A60,
+  after the HUD movies and into the same target, the UI texture t1: fill-rect helper 0x01C99780
+  called at 0x01C26F1E (and from the standalone fade draw at 0x01C0B948), only while the fade
+  amount (fade block +0x48) is above 0. Mode 3 removes t1 from the eye images and shows it as the
+  shrunk HUD plane, so the full-screen fade became a HUD-sized rectangle; the see-through area is
+  the part of the centre-split hole that the centre square does not cover.
+- Fix: a detour on the fill-rect helper (prologue, the amount test and both call sites checked;
+  5.01 only) drops the fade fill while the VR HUD plane owns t1: Mode 3 with the retained HUD
+  route, not in menus, the loading video or a normal/manual (F10) Cinema panel. The HUD movies
+  are drawn as before; other callers and other return addresses pass through.
+  `[openxr] hud_fade_mode`:
+  - `remove` (default): no fade in that state; the world stays visible during blackscreens.
+  - `uniform`: same, plus each whole eye image is blended with the latched fade colour and amount
+    in the XR submit, before the HUD plane (so subtitles stay readable). The latch goes stale 3
+    Presents after the last fill. Without its XR pipeline it keeps the native fade.
+  - `native`: the game's draw (the rectangle). Nothing is hooked unless diagnostics are on, where
+    the detour only logs.
+- Logs (diagnostics on): `HUD fade fill hooked`, then per fade `fade fill start|full|partial|gate`
+  lines (`site=gui|object rgba=RRGGBBAA suppressed=0|1 mode=...`), one `fade fill end ... calls=
+  suppressed= max_a=` summary, and `fade fill uniform drawn` (first 16) in uniform mode; also
+  `HUD_FADE` in the minimal XR log.
+- Status: verified with the null OpenXR runtime; headset confirmation pending. In captures `remove`
+  shows the world and the HUD where `native` shows the rectangle, and every fade fill at a load-in
+  was suppressed.
+
+### Even pair cadence on a fixed-refresh headset (`[openxr] pair_rate_divisor`)
+
+A headset panel has no VRR: every refresh shows the newest finished stereo pair (re-aimed to the
+current head rotation), so a game running at 37-44 pairs/s on a 90 Hz panel shows some pairs for 2
+refreshes and others for 3. Head rotation stays smooth; game motion (camera orbit, animation) steps
+unevenly. Headless runs with a WiVRn-like pacer in the null runtime (`W3VR_NULLXR_PACER=wivrn`)
+show why WiVRn does not lock to 45/30 here: its measured GPU time per frame (~13 ms) exceeds one
+90 Hz period, so its app pacer stops sleeping the application and the cadence becomes uneven
+(a village scene, DLSS Quality: ~37 unique pairs/s, holds 2:60% 3:40%). `frame_wait_early=1` did not
+change that (36.7 vs 37.1).
+
+`pair_rate_divisor=N` holds each pair to exactly N display periods on the game thread (after the
+strict-Stereo barrier): 2 = 45/s at 90 Hz, 40/s at 80 Hz, 36/s at 72 Hz; 3 = 40/s at 120 Hz. It only
+caps: a pair that is already late restarts the schedule instead of catching up. Pick the refresh
+rate and divisor the game can hold in heavy scenes. With `[vrs] log=1` the census writes
+`PERF pair rate limit divisor= period_ms= ticks= waits= ms_per_wait= resyncs= phase_shifts=`.
+
+Measured with the WiVRn-like pacer (a village scene, run-ahead, shadow reuse), the cap is not worth
+using yet, so it stays 0:
+
+| Setup | Unique pairs/s | Pairs held exactly 2 refreshes | Judder |
+|---|---|---|---|
+| 90 Hz, DLSS Quality, free | 44.0 | 92-94% | 1.4 ms |
+| 90 Hz, DLSS Balanced, cap 2 | 45.0 | 67-73% (78-91% with phase hunting) | 3.1 ms |
+| 80 Hz, DLSS Quality, cap 2 | 40.0 | 56-85% (56-63% with phase hunting) | 3.5-3.8 ms |
+
+The cap runs on the game thread, before the render, so the render-time jitter decides on which side
+of a refresh a pair lands. Phase hunting (move the schedule half a period whenever the runtime's
+predicted display time jumps by a period) keeps shifting instead of settling. Free-running just
+below the refresh rate is smoother. A useful cap would have to hold the finished pair on the render
+thread, just before xrWaitFrame/xrEndFrame.
+
+### OpenXR frame loop order for strict Stereo (`[openxr] frame_wait_early`)
+- Strict Stereo binds one OpenXR frame to each published pair and calls `xrWaitFrame` and
+  `xrBeginFrame` inline, right before that pair's `xrEndFrame`. WiVRn's application pacer
+  (`server/driver/app_pacer.cpp`) measures the app time from the `xrWaitFrame` wake-up to
+  `xrEndFrame`, so it sees only those few milliseconds, takes the game for fast and sleeps each
+  `xrWaitFrame` to a display slot. The pair rate then locks to whole display periods: 30 pairs/s
+  at 90 Hz for a 25-28 ms pair, 40 at 120 Hz for a 24 ms pair.
+- `frame_wait_early=1` (default 0) uses the standard loop order instead: right after a successful
+  `xrEndFrame`, the same render thread calls `xrWaitFrame` and `xrBeginFrame` for the next pair and
+  keeps the frame state. The next submit (new pair, two-Present rescue, cinema or menu layer)
+  consumes it: it locates its views at that frame's predicted display time and ends it with that
+  display time. A submit that finds no begun frame (first pair, after a failure or a session
+  restart) waits and begins inline as before. WiVRn then measures about one pair of app time, which
+  exceeds one period, and stops sleeping ("limited by app time, don't wait"): the game runs at its
+  own rate and each pair is shown at the next display slot, with uneven holds (for example 2,2,3
+  periods at 90 Hz for 40 pairs/s).
+- Only the pair-bound strict-Stereo lifecycle arms an early frame (the predicate of the Present
+  hook's `pair_bound_openxr_frame`); AER, Mono and the non-pair-bound prepare paths are unchanged.
+  While an early frame is pending, `prepare_openxr_render_frame` (factory and Present-boundary
+  prepares) does not wait or begin another frame, so there is no double `xrBeginFrame`. Session
+  stop, loss and restart drop the pending frame (`xrEndSession` discards it).
+- Log (diagnostics on): `OpenXR early frame wait configured=1 pair_bound=...`, `... armed first
+  frame ...`, up to 8 `... no pending frame, inline wait ...` and `... prepare origin=... deferred
+  ...` lines, and every 1024 early frames a summary with the mean and maximum `xrWaitFrame` time
+  and the mean time a begun frame waited for its pair.
+- Null HMD: `W3VR_NULLXR_PACER=wivrn` (`tools/w3vr-nullxr`) reproduces WiVRn's pacer, and the
+  `pacing` summary lines of `w3vr_nullxr.log` show unique frames per second and the hold histogram.
+  With an offline driver of the runtime (fixed 25 ms per pair, 90 Hz): inline order 30.0 pairs/s,
+  all holds 3; early order 39.9 pairs/s, holds 2 and 3. Note that WiVRn also skips the sleep when the
+  ideal slot is out of reach but the next one is not, so an inline pair of about 13-23 ms at 90 Hz
+  already runs free.
+- Status: experimental, off by default. Measured with the null OpenXR runtime only: with the
+  WiVRn-like pacer it made no difference in the game (previous section). Not tried in the headset.

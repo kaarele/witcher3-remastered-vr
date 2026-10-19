@@ -448,6 +448,8 @@
 #include <vector>
 #include <array>
 
+void log_remaster_streamline_wine_bypass();
+
 namespace {
 
 // Source annotation convention:
@@ -529,6 +531,14 @@ enum class TemporalBackend : uint8_t {
     Dlss,
 };
 
+// [PERF:DESCRIPTOR-SHADOW-STORE 1/14] Which store owns descriptor metadata
+// (CBV address/size, retained-HUD resource, Witcher Senses targets). Shadow is
+// the address-ordered page store; Legacy is the hashed tables of V1441/V1501.
+enum class DescriptorMetadataStore : uint8_t {
+    Shadow,
+    Legacy,
+};
+
 constexpr int kRtHistoryDefaultBufferCount = 8;
 constexpr int kRtHistoryMinimumBufferCount = 4;
 constexpr int kRtHistoryMaximumBufferCount = 16;
@@ -558,7 +568,56 @@ struct Config {
     float hud_vertical_scale{0.7f};
     int hud_stereo_shift_px{-16};
     float hud_size{1.0f};
+    bool hud_filtered_sampling{true};
+    // 5.01 only: [engine] temporal_backend=dlss runs the game's own DLSS SR
+    // (Streamline 2) with one Streamline viewport and history per eye; the mod
+    // keeps the No-AA presentation transport.
+    bool remaster_engine_dlss{};
+    bool remaster_dlss_per_eye_motion{true};
+    // 5.01 only: render each eye with its own asymmetric frustum through the
+    // engine's NDC projection offset (view+0x520) and submit the full image,
+    // instead of the symmetric envelope and a cropped subimage. _reproject
+    // carries the offset into the camera reprojection matrix that feeds the
+    // temporal passes; _cascade_fix fits shadow cascades to the envelope.
+    bool remaster_asymmetric_ndc{};
+    bool remaster_asymmetric_ndc_reproject{true};
+    bool remaster_asymmetric_ndc_cascade_fix{true};
+    // 5.01 only: render the sun shadow cascades once per stereo pair. 1 = the
+    // second render of an exact pair skips the cascade fit/cull and the
+    // cascade depth passes and samples the first render's map with the same
+    // cascade set; 9 = measurement only (skips the depth passes, keeps each
+    // eye's own fit, so the second eye's shadows are misregistered).
+    // [perf] shadow_profile times the shadow stages per eye in the VRS census.
+    int remaster_shadow_pair_reuse{};
+    bool perf_shadow_profile{false};
+    // Local lights
+    // 5.01 only: each engine render (one per eye in strict Stereo) picks its
+    // own local-shadow sizes and atlas tiles and advances light flicker.
+    // _diag logs those decisions per eye and pair; _slices (1-4, 1 keeps the
+    // engine value) and _sort_corrected (biggest lights first) set the
+    // dynamic shadow atlas cvars when the shadow manager is created;
+    // _flicker_per_pair advances each flickering light once per stereo pair;
+    // _pair_lock sizes both eyes' local shadows from the first eye's position.
+    bool remaster_local_light_diag{};
+    int remaster_local_shadow_slices{1};
+    bool remaster_local_shadow_sort_corrected{};
+    bool remaster_light_flicker_per_pair{};
+    bool remaster_local_light_pair_lock{};
+    // Controller-locked HUD faces the recentered heading only (no pitch/roll).
+    bool hud_anchor_level{true};
+    // A reduced HUD (hud_size < 1) shrinks toward the centre of the visible
+    // image instead of the straight-ahead render centre.
+    bool hud_scale_origin_visible{true};
+    // Menus and loading screens are centred on the visible image centre.
+    bool menu_center_visible{true};
     bool hud_controller_locked{};
+    // [FIX:HUD-FADE-FILL 1/5] 5.01 only: the game's screen fade is drawn
+    // into the HUD texture. While the VR HUD plane owns that texture, remove
+    // drops the fill (the world stays visible), uniform drops it and darkens
+    // each whole eye image with the same colour instead, native keeps the
+    // game's draw (a fading HUD-sized rectangle).
+    enum class HudFadeMode : uint8_t { Remove, Uniform, Native };
+    HudFadeMode hud_fade_mode{HudFadeMode::Remove};
     int recenter_virtual_key{VK_F9};
     float menu_scale{0.7f};
     float cinema_scale{0.7f};
@@ -575,6 +634,14 @@ struct Config {
     bool hmd_compositor_only{false};
     bool disable_desktop_vsync{true};
     bool pipeline_frame_wait{true};
+    // Strict Stereo: wait for and begin the next pair's OpenXR frame right
+    // after xrEndFrame instead of inline before that pair's submit.
+    bool frame_wait_early{false};
+    // Strict Stereo: hold each pair to exactly this many display periods
+    // (0 = off), so the headset shows every pair for the same number of
+    // refreshes: 2 = 45/s at 90 Hz, 40/s at 80 Hz, 36/s at 72 Hz; 3 = 30/s at
+    // 90 Hz, 40/s at 120 Hz. Only a cap: a slower pair is not held further.
+    int pair_rate_divisor{};
     float hmd_yaw_scale{1.0f};
     float hmd_pitch_scale{1.0f};
     float hmd_roll_scale{-1.0f};
@@ -587,6 +654,15 @@ struct Config {
     bool world_marker_game_pitch_depth_enabled{true};
     float world_marker_game_pitch_depth_scale{-0.033333f};
     float world_marker_vertical_offset_ndc{0.24f};
+    // 5.01: hook CameraDirector.WorldVectorToViewRatio. On the fixed level
+    // HUD, markers are projected through the HUD plane itself (cyclopean
+    // camera, no tuned gains); other routes keep the gains above. 4.04
+    // always keeps the gains. 0 leaves the 5.01 native untouched.
+    bool world_marker_exact_projection{true};
+    // 5.01: redraw the HUD centre square about the render centre only while
+    // the aim crosshair is drawn. Outside aiming it only lifts whatever
+    // crosses it (markers of NPCs in front) by the scale-origin offset.
+    bool hud_centre_split_aim_only{true};
     bool reverse_enabled{false};
     bool reverse_scan_periodic{false};
     bool reverse_scan_unmap{false};
@@ -701,6 +777,24 @@ struct Config {
     // It is additionally gated by the general logging switch and does not
     // enable the expensive renderer diagnostics.
     bool first_person_state_diagnostics{false};
+    // Logs every factory camera (classification, near-view offset, entry and
+    // final position) for camera pumping investigations.
+    bool camera_offset_trace{false};
+    // Near view (camera_mode 1) moves the camera along the level heading when
+    // the game pitch is locked, instead of along the hidden game pitch.
+    bool close_camera_level{true};
+    // [FEATURE:CAMERA-CENTRE 1/6] Near view (camera_mode 1) also moves the
+    // camera along the level right vector by the measured lateral offset of
+    // the player, cancelling the Close camera's shoulder offset. Strength
+    // 0..1 (0 = shoulder camera), filter time constant, and the largest
+    // lateral offset that is still trusted as a measurement.
+    float camera_center{1.0f};
+    float camera_center_smoothing_seconds{0.30f};
+    float camera_center_max_m{1.5f};
+    // [FEATURE:CINEMA-RESTORE-GAMEPLAY-RECENTER 1/5] The cutscene auto-recenter
+    // is undone when gameplay resumes: the HMD centre used for gameplay
+    // before the cutscene becomes the centre again.
+    bool cinema_restore_gameplay_recenter{true};
     // [DIAG:FIRST-PERSON-ENGINE-AIM 1/3] Narrow edge-only trace for the
     // renderer-owned crosshair/F11 transaction. It intentionally works while
     // broad logging is disabled, without enabling any per-draw diagnostics.
@@ -717,6 +811,9 @@ struct Config {
     // to the exe on top of it (see test_input_script.h).
     bool test_record_input{false};
     std::string test_input_script;
+    // Test only: OpenXR loader (or loader-compatible runtime) to load instead
+    // of openxr_loader.dll, e.g. the headless null HMD. Relative to the exe.
+    std::string test_openxr_loader;
     // Lightweight ten-second CPU/GPU phase recorder. Independent from broad
     // Diagnostic Logging; the shared F3 action is the only file writer.
     bool pipeline_flight_recorder{false};
@@ -749,6 +846,40 @@ struct Config {
     // general Diagnostic checkbox cannot silently disable a requested TAAU
     // run. It never enables readbacks or broad renderer logging.
     bool taau_drop_diagnostics{false};
+    // [FEATURE:VRS-MEASUREMENT 1/8] [vrs] Phase-0 shading-rate ceiling test.
+    // mode 3 shades the selected scene PSO classes at one uniform coarse
+    // rate; mode 0 installs nothing. vrs_log_file is the narrow exception to
+    // the paired logging switches (see log_vrs_line).
+    int vrs_mode{0};
+    D3D12_SHADING_RATE vrs_uniform_rate{D3D12_SHADING_RATE_2X2};
+    uint32_t vrs_class_mask{};
+    bool vrs_log_file{false};
+    // [PERF:CPU-MEASUREMENT 1/5] [perf] measurement-only switches; they need
+    // the VRS census log ([vrs] mode=3 log=1), which marks gameplay and
+    // reports presents/s. skip_descriptor_tracking drops the descriptor-copy
+    // metadata (smoke, foliage, focus, HUD and Witcher Senses lose their
+    // CBV/target lookups) to measure its CPU cost; job_wait_profile times the
+    // render thread's REDengine job waits per call site.
+    bool perf_skip_descriptor_tracking{false};
+    bool perf_job_wait_profile{false};
+    // [PERF:PAIR-BARRIER-LAG 1/11] [perf] pair_barrier_lag is a behaviour
+    // switch, not a measurement: 0 holds the strict-Stereo producer until the
+    // pair it just queued has rendered (the original barrier); 1 holds it
+    // until the pair before that one, so the next game tick overlaps the
+    // render of the current pair. pair_pose_lead_adaptive (only with lag 1)
+    // derives the pair pose lead from measured publication times.
+    int perf_pair_barrier_lag{0};
+    bool perf_pair_pose_lead_adaptive{true};
+    // [engine] descriptor_metadata_store: release switch, read whatever the
+    // [debug] switches say. [perf] descriptor_shadow_verify (VRS census log
+    // only) maintains both stores and compares every load.
+    DescriptorMetadataStore descriptor_metadata_store{
+        DescriptorMetadataStore::Shadow};
+    bool perf_descriptor_shadow_verify{false};
+    // [PERF:PAIR-BARRIER-SPIN 1/3] [engine] pair_barrier_spin_pauses: pause
+    // instructions the strict-Stereo producer pair barrier spins before it
+    // parks. 0 restores the QueryPerformanceCounter-timed ~200 us spin.
+    uint32_t pair_barrier_spin_pauses{4096};
 };
 
 Config g_config{};
@@ -871,9 +1002,18 @@ bool mode3_taau_native_full_motion_active() {
         g_config.temporal_backend == TemporalBackend::Taau;
 }
 
+// [FEATURE:REMASTER-ENGINE-DLSS 2/6] strict Stereo with the 5.01 engine DLSS.
+bool remaster_engine_dlss_per_eye_running();
+bool remaster_engine_dlss_stereo_active() {
+    return g_config.remaster_engine_dlss && g_config.openxr_enabled &&
+        g_config.openxr_mode == 3;
+}
+
 bool engine_native_per_eye_temporal_history_active() {
     return dlss_sequential_mode_active() ||
-        mode3_taau_native_full_motion_active();
+        mode3_taau_native_full_motion_active() ||
+        (remaster_engine_dlss_stereo_active() &&
+            g_config.remaster_dlss_per_eye_motion);
 }
 
 bool dlss_submitted_cache_route_active() {
@@ -1244,15 +1384,21 @@ bool mode3_hud_descriptor_hooks_needed() {
 
 bool native_temporal_terrain_motion_route_active();
 
-bool descriptor_metadata_hooks_needed() {
+// The terms that read only g_config and build constants; the descriptor copy
+// hooks cache them (see descriptor_copy_route_mask).
+bool descriptor_metadata_hooks_configured() {
     return taau_metadata_hooks_needed() ||
         mode3_hud_descriptor_hooks_needed() ||
         real_smoke_world_up_binding_route_active() ||
         foliage_bound_basis_route_active() ||
         focus_projection_metadata_hooks_needed() ||
-        asymmetric_tiled_culling_fix_needed() ||
-        native_temporal_terrain_motion_route_active() ||
         rt_symmetric_dlss_per_eye_ao_history_active();
+}
+
+bool descriptor_metadata_hooks_needed() {
+    return descriptor_metadata_hooks_configured() ||
+        asymmetric_tiled_culling_fix_needed() ||
+        native_temporal_terrain_motion_route_active();
 }
 
 bool graphics_binding_hooks_needed() {
@@ -1380,6 +1526,34 @@ bool g_xr_render_views_valid{};
 std::atomic<XrViewStateFlags> g_xr_render_view_state_flags{};
 std::atomic<int64_t> g_xr_last_completed_display_time{};
 std::atomic<int64_t> g_xr_last_completed_display_period{};
+// [FEATURE:OPENXR-EARLY-FRAME-WAIT 1/5] [openxr] frame_wait_early: the next
+// strict-Stereo runtime frame, already waited for and begun right after the
+// previous xrEndFrame. The Present/render thread arms and consumes it; every
+// other xrWaitFrame path leaves it alone while it is pending.
+std::atomic<bool> g_xr_early_frame_pending{};
+// Held while prepare_openxr_render_frame (game thread) or
+// begin_openxr_frame_early (render thread) is between its checks and the
+// flag it sets after xrWaitFrame/xrBeginFrame, so the two can never both
+// begin a frame (the runtime holds one begun frame).
+std::atomic<bool> g_xr_frame_wait_claim{};
+
+struct XrFrameWaitClaim {
+    bool held{};
+    XrFrameWaitClaim() {
+        bool expected{};
+        held = g_xr_frame_wait_claim.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel);
+    }
+    ~XrFrameWaitClaim() {
+        if (held) {
+            g_xr_frame_wait_claim.store(false, std::memory_order_release);
+        }
+    }
+    XrFrameWaitClaim(const XrFrameWaitClaim&) = delete;
+    XrFrameWaitClaim& operator=(const XrFrameWaitClaim&) = delete;
+};
+XrFrameState g_xr_early_frame_state{XR_TYPE_FRAME_STATE};
+std::atomic<uint32_t> g_xr_early_frame_prepare_deferrals{};
 
 enum class PoseTimelineEvent : uint32_t {
     PairFactory = 1,
@@ -1402,6 +1576,21 @@ XrQuaternionf g_hmd_center_yaw_orientation{0.0f, 0.0f, 0.0f, 1.0f};
 XrVector3f g_hmd_center_position{};
 XrView g_hmd_center_views[2]{{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
 std::atomic<bool> g_hmd_center_valid{};
+// [FEATURE:CINEMA-RESTORE-GAMEPLAY-RECENTER 2/5] The gameplay centre saved
+// by the cutscene auto-recenter (guarded by g_hmd_pose_snapshot_mutex), the
+// two cross-thread requests that drive it, and whether a gameplay camera has
+// rendered with the current centre (only such a centre is worth restoring).
+struct HmdSavedGameplayCenter {
+    XrQuaternionf orientation{0.0f, 0.0f, 0.0f, 1.0f};
+    XrQuaternionf yaw_orientation{0.0f, 0.0f, 0.0f, 1.0f};
+    XrVector3f position{};
+    XrView views[2]{{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
+    bool valid{};
+};
+HmdSavedGameplayCenter g_hmd_cinema_saved_gameplay_center{};
+std::atomic<bool> g_hmd_cinema_recenter_save_requested{};
+std::atomic<bool> g_hmd_cinema_center_restore_requested{};
+std::atomic<bool> g_hmd_center_gameplay_used{};
 std::atomic<bool> g_hmd_pose_valid{};
 std::atomic<bool> g_hmd_game_pitch_lock_pending{true};
 bool g_hmd_game_pitch_lock_valid{};
@@ -1875,7 +2064,16 @@ void reset_mode3_aer_presentation_state(
     }
 }
 
-constexpr size_t kStreamlineCaptureRingSize = 3;
+constexpr size_t kStreamlineCaptureRingSize = 4;
+// [PERF:PAIR-BARRIER-LAG 2/11] Slots in use per eye: the published pair, the
+// pair being promoted and the one being captured. With pair run-ahead the
+// render thread no longer idles through the next game tick, so the GPU can
+// still hold the oldest slot when the next capture starts; give it a fourth.
+// A full ring drops the capture (never overwrites); the census counts that.
+uint32_t streamline_capture_ring_slots() {
+    return g_config.perf_pair_barrier_lag != 0 ? 4u : 3u;
+}
+std::atomic<uint64_t> g_streamline_capture_ring_full{};
 struct StreamlineCaptureSlot {
     ID3D12Resource* resource{};
     ID3D12Fence* last_use_fence{};
@@ -2584,7 +2782,23 @@ struct PackedWorldMarkerCameraSlot {
     std::atomic<uint64_t> present{UINT64_MAX};
     std::atomic<uint64_t> pair_id{};
     std::atomic<uint64_t> sequence{};
+    // [FIX:WORLD-MARKER-EXACT-HUD-PLANE 1/9] Final marker world-to-clip of
+    // the pair on the 5.01 fixed level HUD (cyclopean camera with the HUD
+    // plane mapping applied), and the mapping for diagnostics.
+    static constexpr size_t kExactMappingFloatCount =
+        sizeof(w3vr::openxr_eye_geometry::HudMarkerClipMapping) / sizeof(float);
+    static_assert(sizeof(w3vr::openxr_eye_geometry::HudMarkerClipMapping) ==
+        kExactMappingFloatCount * sizeof(float));
+    std::array<std::atomic<uint32_t>, 16> exact_clip_bits{};
+    std::array<std::atomic<uint32_t>, kExactMappingFloatCount> exact_mapping_bits{};
+    std::atomic<bool> exact_clip_valid{};
 };
+// The fixed-HUD composite's plane scale and vertical scale origin (NaN: the
+// source centre), published for the marker mapping.
+std::atomic<uint32_t> g_world_marker_hud_size_bits{};
+std::atomic<uint32_t> g_world_marker_hud_origin_y_bits{};
+std::atomic<bool> g_world_marker_hud_plane_valid{};
+std::atomic<bool> g_hud_centre_split_active{};
 PackedWorldMarkerCameraSlot g_packed_world_marker_camera{};
 constexpr size_t kMode3WorldMarkerCameraPairSlotCount = 16;
 std::array<PackedWorldMarkerCameraSlot, kMode3WorldMarkerCameraPairSlotCount>
@@ -3024,6 +3238,97 @@ bool native_asymmetric_noaa_route_active() {
         g_config.hmd_freelook;
 }
 
+size_t engine_view_projection_offset();
+size_t engine_view_reprojection_matrix();
+void log_line(const char* fmt, ...);
+
+// [FEATURE:REMASTER-ASYMMETRIC-NDC 2/6] Runtime fail-safe: cleared when the
+// per-eye frusta stop verifying, so the session falls back to the envelope.
+std::atomic<bool> g_runtime_randc{true};
+std::atomic<uint32_t> g_randc_consecutive_rejected_pairs{};
+std::atomic<uint64_t> g_randc_accepted_pairs{};
+std::atomic<uint64_t> g_randc_symmetric_pairs{};
+std::atomic<uint32_t> g_randc_cascade_fits{};
+// Present of the last rebuilt view carrying a temporal jitter (centre block),
+// i.e. some temporal AA is running.
+std::atomic<uint64_t> g_randc_last_jitter_present{UINT64_MAX};
+// Per-pair decision, so both eyes of a pair always agree.
+std::atomic<uint64_t> g_randc_latched_pair{};
+std::atomic<bool> g_randc_latched_value{};
+// Eyes (bit 0 left, bit 1 right) whose per-eye DLSS history must restart.
+std::atomic<uint8_t> g_remaster_dlss_external_reset_mask{};
+
+bool remaster_asymmetric_ndc_configured() {
+    return g_config.remaster_asymmetric_ndc &&
+        running_game_build() == w3vr::game_build::Build::Remaster501 &&
+        engine_view_projection_offset() != 0;
+}
+
+// Per-eye frusta need strict Stereo dual render (both eyes rendered each
+// pair, each with its own factory rebuild) and the submitted FOV equal to the
+// rendered one, so FOV scaling keeps the envelope.
+bool remaster_asymmetric_ndc_active() {
+    return remaster_asymmetric_ndc_configured() &&
+        g_runtime_randc.load(std::memory_order_acquire) &&
+        g_config.openxr_mode == 3 &&
+        mode3_stereo_transport_active() &&
+        !mode3_aer_presentation_active() &&
+        g_config.hmd_freelook &&
+        !native_stereo_runtime_enabled() &&
+        g_engine_dual_render_active.load(std::memory_order_acquire) &&
+        fabsf(g_hmd_fov_scale.load(std::memory_order_relaxed) - 1.0f) < 1e-6f;
+}
+
+// A per-eye frustum needs each eye's temporal history to be its own: the
+// previous projection the engine reprojects with carries the current eye's
+// offset. That holds with the mod's per-eye DLSS, and trivially without any
+// temporal AA (FXAA/off: no jitter). The game's own TAA/FSR/XeSS keep one
+// history alternating between the eyes, which would miss by twice the offset.
+bool remaster_asymmetric_ndc_history_ok() {
+    if (remaster_engine_dlss_per_eye_running()) {
+        return true;
+    }
+    const uint64_t last =
+        g_randc_last_jitter_present.load(std::memory_order_acquire);
+    const uint64_t now = g_present_count.load(std::memory_order_relaxed);
+    return last == UINT64_MAX || (now >= last && now - last > 240);
+}
+
+// Decided once per stereo pair (by its first eye). A change restarts both
+// per-eye DLSS histories, whose previous frame used the other projection.
+bool remaster_asymmetric_ndc_pair_gate(uint64_t pair_id) {
+    if (pair_id != 0 &&
+        g_randc_latched_pair.load(std::memory_order_acquire) == pair_id) {
+        return g_randc_latched_value.load(std::memory_order_relaxed);
+    }
+    const bool per_eye_dlss = remaster_engine_dlss_per_eye_running();
+    const bool value = remaster_asymmetric_ndc_active() &&
+        remaster_asymmetric_ndc_history_ok() &&
+        g_engine_menu_state.load(std::memory_order_relaxed) == 0;
+    const bool previous =
+        g_randc_latched_value.exchange(value, std::memory_order_relaxed);
+    g_randc_latched_pair.store(pair_id, std::memory_order_release);
+    if (previous != value) {
+        g_remaster_dlss_external_reset_mask.fetch_or(
+            0x3u, std::memory_order_release);
+        static std::atomic<uint32_t> gate_logs{};
+        if (gate_logs.fetch_add(1, std::memory_order_relaxed) < 64) {
+            const uint64_t last_jitter =
+                g_randc_last_jitter_present.load(std::memory_order_relaxed);
+            log_line(
+                "RANDC pair gate %d -> %d pair=%llu active=%d per_eye_dlss=%d "
+                "jitter_age=%lld menu=%d",
+                previous ? 1 : 0, value ? 1 : 0,
+                static_cast<unsigned long long>(pair_id),
+                remaster_asymmetric_ndc_active() ? 1 : 0, per_eye_dlss ? 1 : 0,
+                last_jitter == UINT64_MAX ? -1LL : static_cast<long long>(
+                    g_present_count.load(std::memory_order_relaxed) - last_jitter),
+                g_engine_menu_state.load(std::memory_order_relaxed));
+        }
+    }
+    return value;
+}
+
 bool automatic_focus_projection_route_configured() {
     const bool supported_backend =
         g_config.temporal_backend == TemporalBackend::None ||
@@ -3079,6 +3384,8 @@ NativeAsymmetricPairSlot* native_asymmetric_pair_slot(uint64_t pair_id) {
         : nullptr;
 }
 
+bool store_native_asymmetric_pair_slot(uint64_t pair_id);
+
 bool initialize_native_asymmetric_pair(uint64_t pair_id) {
     if (!native_asymmetric_noaa_route_active() ||
         !g_native_asymmetric_noaa_writer_seen.load(
@@ -3089,6 +3396,23 @@ bool initialize_native_asymmetric_pair(uint64_t pair_id) {
         g_xr_views.size() < 2 || pair_id == 0 || pair_id == UINT64_MAX) {
         return false;
     }
+    return store_native_asymmetric_pair_slot(pair_id);
+}
+
+// [FEATURE:REMASTER-ASYMMETRIC-NDC 3/6] Same ledger slot as the 4.04 native
+// path (the cache promotion and the OpenXR submit key on it), without the
+// 4.04 temporal-writer prerequisites: on 5.01 the frustum offset lives in
+// view+0x520, which the temporal writer never touches.
+bool initialize_remaster_asymmetric_ndc_pair(uint64_t pair_id) {
+    if (!remaster_asymmetric_ndc_active() ||
+        !g_hmd_pose_valid.load(std::memory_order_acquire) ||
+        g_xr_views.size() < 2 || pair_id == 0 || pair_id == UINT64_MAX) {
+        return false;
+    }
+    return store_native_asymmetric_pair_slot(pair_id);
+}
+
+bool store_native_asymmetric_pair_slot(uint64_t pair_id) {
     // [TRIAL:STANDARD-PRODUCER-FOV-RESCALE V23038 2/5] Freeze the exact FOV
     // rendered by the native producer. Presentation Size scales its tangent
     // interval here so temporal, DLSS and AFW metadata follow the same camera.
@@ -3202,7 +3526,8 @@ completed_engine_frame_pixel_projection(uint64_t pair_id, uint32_t eye) {
     if (native_asymmetric_source_eye_tagged(pair_id, eye)) {
         return Projection::NativeAsymmetric;
     }
-    if (!native_stereo_runtime_enabled()) {
+    if (!native_stereo_runtime_enabled() &&
+        !remaster_asymmetric_ndc_active()) {
         return Projection::SharedSymmetric;
     }
     // A current slot with no source-eye factory bit means the native rebuild
@@ -4423,7 +4748,8 @@ bool load_cbv_descriptor_fallback(SIZE_T cpu_handle, CbvDescriptorInfo& info) {
     return true;
 }
 
-void store_cbv_descriptor(SIZE_T cpu_handle, const CbvDescriptorInfo& info) {
+void store_cbv_descriptor_legacy(
+    SIZE_T cpu_handle, const CbvDescriptorInfo& info) {
     const auto base = cbv_descriptor_slot_index(cpu_handle);
     for (size_t probe = 0; probe < kCbvDescriptorProbeCount; ++probe) {
         auto& slot = g_cbv_descriptor_slots[(base + probe) & (kCbvDescriptorSlotCount - 1)];
@@ -4458,13 +4784,20 @@ void store_cbv_descriptor(SIZE_T cpu_handle, const CbvDescriptorInfo& info) {
     store_cbv_descriptor_fallback(cpu_handle, info);
 }
 
-bool load_cbv_descriptor(SIZE_T cpu_handle, CbvDescriptorInfo& info) {
+bool load_cbv_descriptor_legacy(
+    SIZE_T cpu_handle, CbvDescriptorInfo& info) {
     const auto base = cbv_descriptor_slot_index(cpu_handle);
     for (size_t probe = 0; probe < kCbvDescriptorProbeCount; ++probe) {
         auto& slot = g_cbv_descriptor_slots[(base + probe) & (kCbvDescriptorSlotCount - 1)];
         const auto key = slot.key.load(std::memory_order_acquire);
         if (key == 0) {
-            return load_cbv_descriptor_fallback(cpu_handle, info);
+            // [PERF:DESCRIPTOR-SHADOW-STORE 2/14] Slots are claimed once and
+            // never cleared, and store_cbv_descriptor_legacy reaches the
+            // fallback map only after all 64 slots of this run were taken by
+            // other handles. An empty slot here therefore proves the handle
+            // was never sent to the map: a miss no longer takes the shard
+            // mutex. Only a completely full run still consults the map.
+            return false;
         }
         if (key == kCbvDescriptorClaimed) {
             YieldProcessor();
@@ -4483,7 +4816,7 @@ bool load_cbv_descriptor(SIZE_T cpu_handle, CbvDescriptorInfo& info) {
     return load_cbv_descriptor_fallback(cpu_handle, info);
 }
 
-bool load_cbv_descriptor_smoke_nonblocking(
+bool load_cbv_descriptor_smoke_nonblocking_legacy(
     SIZE_T cpu_handle, CbvDescriptorInfo& info) {
     const auto base = cbv_descriptor_slot_index(cpu_handle);
     for (size_t probe = 0; probe < kCbvDescriptorProbeCount; ++probe) {
@@ -4543,7 +4876,7 @@ size_t resource_descriptor_slot_index(SIZE_T cpu_handle) {
         (kResourceDescriptorSlotCount - 1);
 }
 
-void store_resource_descriptor_fast(
+void store_resource_descriptor_fast_legacy(
     SIZE_T cpu_handle,
     ID3D12Resource* resource,
     DXGI_FORMAT format) {
@@ -4584,7 +4917,7 @@ void store_resource_descriptor_fast(
     }
 }
 
-bool load_resource_descriptor_fast(
+bool load_resource_descriptor_fast_legacy(
     SIZE_T cpu_handle,
     ID3D12Resource*& resource_out,
     DXGI_FORMAT& format_out) {
@@ -4716,7 +5049,7 @@ void write_witcher_sense_descriptor_slot(
     slot.sequence.store(sequence + 2, std::memory_order_release);
 }
 
-void store_witcher_sense_descriptor_target(
+void store_witcher_sense_descriptor_target_legacy(
     SIZE_T cpu_handle,
     const WitcherSenseDescriptorInfo& info) {
     if (cpu_handle == 0 || info.resource == nullptr ||
@@ -4767,7 +5100,7 @@ void store_witcher_sense_descriptor_target(
     set.writer.clear(std::memory_order_release);
 }
 
-void invalidate_witcher_sense_descriptor_target(SIZE_T cpu_handle) {
+void invalidate_witcher_sense_descriptor_target_legacy(SIZE_T cpu_handle) {
     if (cpu_handle == 0) {
         return;
     }
@@ -4794,7 +5127,7 @@ void invalidate_witcher_sense_descriptor_target(SIZE_T cpu_handle) {
     set.writer.clear(std::memory_order_release);
 }
 
-bool load_witcher_sense_descriptor_target(
+bool load_witcher_sense_descriptor_target_legacy(
     SIZE_T cpu_handle,
     WitcherSenseDescriptorInfo& info_out,
     WitcherSenseDescriptorKind expected_kind =
@@ -4848,14 +5181,1045 @@ bool load_witcher_sense_descriptor_target(
     return false;
 }
 
+// Legacy-store copy, used only by the per-descriptor loop of the copy hooks.
 void copy_witcher_sense_descriptor_target(
     SIZE_T dest_cpu, SIZE_T src_cpu) {
     WitcherSenseDescriptorInfo source{};
-    if (load_witcher_sense_descriptor_target(src_cpu, source)) {
-        store_witcher_sense_descriptor_target(dest_cpu, source);
+    if (load_witcher_sense_descriptor_target_legacy(src_cpu, source)) {
+        store_witcher_sense_descriptor_target_legacy(dest_cpu, source);
     } else {
-        invalidate_witcher_sense_descriptor_target(dest_cpu);
+        invalidate_witcher_sense_descriptor_target_legacy(dest_cpu);
     }
+}
+
+// [PERF:DESCRIPTOR-SHADOW-STORE 3/14] Address-ordered descriptor shadow
+// store. The copy hooks run for every dynamic table REDengine builds on the
+// render thread and both RenderDispatcher threads; the hashed tables above
+// cost several random cache misses per copied descriptor, plus the CBV shard
+// mutex on every miss. Here one 48-byte entry holds every metadata kind of
+// one descriptor, entries follow the CPU handle address, and a copied range
+// is a sequential walk with no hashing, lock or syscall.
+//
+// Granule = the largest power of two (8 to 256 bytes) dividing the
+// CBV_SRV_UAV increment. The increment is 32 on NVIDIA and on vkd3d-proton's
+// default path; its embedded and descriptor-heap paths report the native
+// descriptor size (64 on RDNA2/Steam Deck, 128 on Intel). Each of those is
+// one entry per descriptor. A page covers 2048 granules (64 KiB of handle
+// space at 32), is VirtualAlloc'd zeroed on first store and is never freed.
+// Handle bits below the granule (vkd3d-proton keeps log2 of the heap size
+// there) are part of the page key: a vkd3d-proton heap's handle window is 32
+// bytes per descriptor but its allocation only 24, so another heap can sit
+// inside that window, always with a different tag, and must not share its
+// entries. The entry keeps the same bits as its owner, checked as a guard.
+// Each entry is a seqlock: writers take the odd sequence with a CAS
+// (REDengine writes one descriptor from several workers), readers retry until
+// both sides see one even sequence.
+constexpr uint32_t kDescriptorShadowPageEntryBits = 11;
+constexpr size_t kDescriptorShadowPageEntries =
+    size_t{1} << kDescriptorShadowPageEntryBits;
+constexpr uint32_t kDescriptorShadowMinGranuleShift = 3;
+constexpr uint32_t kDescriptorShadowMaxGranuleShift = 8;
+constexpr uint32_t kDescriptorShadowOwnerTagBits =
+    kDescriptorShadowMaxGranuleShift;
+constexpr UINT kDescriptorShadowMaxIncrement = 4096;
+constexpr size_t kDescriptorShadowDirectorySlots = 1u << 16;
+constexpr size_t kDescriptorShadowDirectoryProbeCount = 256;
+constexpr size_t kDescriptorShadowPageCacheSlots = 8;
+constexpr uint32_t kDescriptorShadowNonblockingAttempts = 8;
+constexpr uint32_t kDescriptorShadowSpinsBeforeYield = 64;
+// 384 MiB at 96 KiB per page; a fully used 1M-descriptor heap is 512 pages.
+constexpr uint64_t kDescriptorShadowPageBudget = 4096;
+static_assert((kDescriptorShadowDirectorySlots &
+    (kDescriptorShadowDirectorySlots - 1)) == 0);
+static_assert((kDescriptorShadowPageCacheSlots &
+    (kDescriptorShadowPageCacheSlots - 1)) == 0);
+
+void log_descriptor_store_line(const char* fmt, ...);
+
+// Entry header: owner tag | owned | metadata kinds | verification markers.
+constexpr uint32_t kDescriptorShadowOwnerTagMask =
+    (1u << kDescriptorShadowOwnerTagBits) - 1;
+constexpr uint32_t kDescriptorShadowOwned = 1u << 8;
+constexpr uint32_t kDescriptorShadowOwnerMask =
+    kDescriptorShadowOwned | kDescriptorShadowOwnerTagMask;
+constexpr uint32_t kDescriptorShadowHasCbv = 1u << 9;
+constexpr uint32_t kDescriptorShadowHasFastResource = 1u << 10;
+constexpr uint32_t kDescriptorShadowWitcherKindShift = 11;
+constexpr uint32_t kDescriptorShadowWitcherKindMask =
+    3u << kDescriptorShadowWitcherKindShift;
+constexpr uint32_t kDescriptorShadowMetadataMask =
+    kDescriptorShadowHasCbv | kDescriptorShadowHasFastResource |
+    kDescriptorShadowWitcherKindMask;
+// Verification only: a copy from a source without this kind emptied it while
+// the legacy store could keep the destination's stale CBV/resource data
+// (see descriptor_shadow_verify_copied_empty). Witcher Senses targets have no
+// marker: the legacy copy empties them too.
+constexpr uint32_t kDescriptorShadowCopiedEmptyCbv = 1u << 13;
+constexpr uint32_t kDescriptorShadowCopiedEmptyFastResource = 1u << 14;
+// Header bits a consumer can observe. An entry without any of them reads as
+// empty whatever its owner bits say (the markers exist only under
+// verification).
+constexpr uint32_t kDescriptorShadowContentMask =
+    kDescriptorShadowMetadataMask | kDescriptorShadowCopiedEmptyCbv |
+    kDescriptorShadowCopiedEmptyFastResource;
+static_assert(static_cast<uint32_t>(WitcherSenseDescriptorKind::Auxiliary) ==
+    (kDescriptorShadowWitcherKindMask >> kDescriptorShadowWitcherKindShift));
+
+// The legacy Witcher Senses cache holds a handle in at most one way: a store
+// clears the handle from the other partition under the set lock. One target
+// per entry therefore represents it completely.
+struct DescriptorShadowEntry {
+    std::atomic<uint32_t> sequence{};
+    std::atomic<uint32_t> header{};
+    std::atomic<uint64_t> cbv_gpu_va{};
+    std::atomic<uint32_t> cbv_size_in_bytes{};
+    std::atomic<uint32_t> fast_format{};
+    std::atomic<ID3D12Resource*> fast_resource{};
+    std::atomic<ID3D12Resource*> witcher_resource{};
+    // Witcher targets are Texture2D (at most 16384 wide), so 32 bits hold
+    // the UINT64 width exactly.
+    std::atomic<uint32_t> witcher_width{};
+    std::atomic<uint32_t> witcher_height{};
+};
+static_assert(sizeof(DescriptorShadowEntry) == 48);
+
+struct DescriptorShadowPage {
+    std::array<DescriptorShadowEntry, kDescriptorShadowPageEntries> entries;
+};
+
+struct DescriptorShadowRecord {
+    uint32_t header{};
+    uint64_t cbv_gpu_va{};
+    uint32_t cbv_size_in_bytes{};
+    uint32_t fast_format{};
+    ID3D12Resource* fast_resource{};
+    ID3D12Resource* witcher_resource{};
+    uint32_t witcher_width{};
+    uint32_t witcher_height{};
+    bool operator==(const DescriptorShadowRecord&) const = default;
+};
+
+// Lock-free page directory: key = page key + 1, claimed once by CAS and never
+// cleared. The page pointer is published after the allocation.
+struct DescriptorShadowDirectorySlot {
+    std::atomic<uintptr_t> key{};
+    std::atomic<DescriptorShadowPage*> page{};
+};
+DescriptorShadowPage* const kDescriptorShadowPageFailed =
+    reinterpret_cast<DescriptorShadowPage*>(static_cast<uintptr_t>(1));
+
+// Written once by initialize_descriptor_shadow_store before the descriptor
+// detours are installed and published by ready; read-only afterwards.
+struct DescriptorShadowLayout {
+    UINT increment{};
+    uint32_t granule_shift{};
+    uint32_t page_shift{};
+    uint32_t entry_stride{};
+    // One entry per descriptor (increment == granule): run limits need no
+    // division.
+    bool stride_is_one{};
+    SIZE_T owner_tag_mask{};
+    std::atomic<bool> ready{};
+};
+DescriptorShadowLayout g_descriptor_shadow_layout{};
+std::array<DescriptorShadowDirectorySlot, kDescriptorShadowDirectorySlots>
+    g_descriptor_shadow_directory{};
+std::atomic<uint64_t> g_descriptor_shadow_pages{};
+std::atomic<uint64_t> g_descriptor_shadow_directory_overflows{};
+std::atomic<uint64_t> g_descriptor_shadow_alloc_failures{};
+std::atomic<uint64_t> g_descriptor_shadow_owner_collisions{};
+std::atomic<uint64_t> g_descriptor_shadow_increment_mismatches{};
+std::atomic<uint64_t> g_descriptor_shadow_long_waits{};
+// Bumped after every directory claim; a cached miss is valid only while it
+// is unchanged.
+std::atomic<uint64_t> g_descriptor_shadow_directory_generation{};
+
+// This thread's recent pages, direct-mapped by page number, so a copy that
+// gathers from several staging pages into one table keeps all of them. A
+// cached miss (page nullptr) answers loads and copy sources until the
+// directory claims another page; stores never use it.
+struct DescriptorShadowPageCache {
+    std::array<uintptr_t, kDescriptorShadowPageCacheSlots> key{};
+    std::array<DescriptorShadowPage*, kDescriptorShadowPageCacheSlots> page{};
+    std::array<uint64_t, kDescriptorShadowPageCacheSlots> generation{};
+};
+thread_local DescriptorShadowPageCache g_descriptor_shadow_page_cache{};
+
+bool descriptor_shadow_store_selected() {
+    return g_config.descriptor_metadata_store ==
+        DescriptorMetadataStore::Shadow;
+}
+
+bool descriptor_shadow_store_maintained() {
+    return descriptor_shadow_store_selected() ||
+        g_config.perf_descriptor_shadow_verify;
+}
+
+bool descriptor_legacy_store_maintained() {
+    return !descriptor_shadow_store_selected() ||
+        g_config.perf_descriptor_shadow_verify;
+}
+
+// [PERF:DESCRIPTOR-COPY-ROUTE 1/4] The descriptor copy hooks run for every
+// dynamic table REDengine builds and used to evaluate about eight route
+// predicate chains per call. These bits read only g_config and build
+// constants, which are final after load_config and
+// initialize_descriptor_shadow_store (both refresh the mask), so the hooks
+// load one atomic instead. The runtime-variable terms of
+// descriptor_metadata_hooks_needed (native-asymmetric runtime state, cinema
+// panel, AFW route) stay out: the hooks evaluate it in full whenever the
+// configured terms alone do not decide it.
+constexpr uint32_t kDescriptorCopyRouteValid = 1u << 0;
+constexpr uint32_t kDescriptorCopyRouteMetadataConfigured = 1u << 1;
+constexpr uint32_t kDescriptorCopyRouteWitcherSense = 1u << 2;
+constexpr uint32_t kDescriptorCopyRouteCbv = 1u << 3;
+constexpr uint32_t kDescriptorCopyRouteLegacyResource = 1u << 4;
+constexpr uint32_t kDescriptorCopyRouteShadowStore = 1u << 5;
+constexpr uint32_t kDescriptorCopyRouteLegacyStore = 1u << 6;
+constexpr uint32_t kDescriptorCopyRouteVerify = 1u << 7;
+constexpr uint32_t kDescriptorCopyRouteLogCopies = 1u << 8;
+std::atomic<uint32_t> g_descriptor_copy_route_mask{};
+
+uint32_t compute_descriptor_copy_route_mask() {
+    // [PERF:WITCHER-SENSE-BOUNDED-DESCRIPTORS V1499 3/5] Witcher Senses owns
+    // only its bounded target cache here. It no longer enables the generic
+    // CBV mirror, legacy resource propagation, or global reverse mutex.
+    const bool cbv_metadata = taau_metadata_hooks_needed() ||
+        real_smoke_world_up_binding_route_active() ||
+        foliage_bound_basis_route_active() ||
+        focus_projection_metadata_hooks_needed() ||
+        rt_symmetric_dlss_per_eye_ao_history_active();
+    const bool legacy_resource_metadata = taau_metadata_hooks_needed() ||
+        rt_symmetric_dlss_per_eye_ao_history_active();
+    uint32_t mask = kDescriptorCopyRouteValid;
+    if (descriptor_metadata_hooks_configured()) {
+        mask |= kDescriptorCopyRouteMetadataConfigured;
+    }
+    if (witcher_sense_history_suppression_route_configured()) {
+        mask |= kDescriptorCopyRouteWitcherSense;
+    }
+    if (cbv_metadata) {
+        mask |= kDescriptorCopyRouteCbv;
+    }
+    if (legacy_resource_metadata) {
+        mask |= kDescriptorCopyRouteLegacyResource;
+    }
+    if (descriptor_shadow_store_maintained()) {
+        mask |= kDescriptorCopyRouteShadowStore;
+    }
+    if (descriptor_legacy_store_maintained()) {
+        mask |= kDescriptorCopyRouteLegacyStore;
+    }
+    if (g_config.perf_descriptor_shadow_verify) {
+        mask |= kDescriptorCopyRouteVerify;
+    }
+    if (g_config.runtime_diagnostics &&
+        !descriptor_legacy_store_maintained()) {
+        mask |= kDescriptorCopyRouteLogCopies;
+    }
+    return mask;
+}
+
+void refresh_descriptor_copy_route_mask() {
+    const uint32_t mask = compute_descriptor_copy_route_mask();
+    g_descriptor_copy_route_mask.store(mask, std::memory_order_release);
+    log_descriptor_store_line(
+        "Descriptor copy routes=0x%X metadata_configured=%d witcher=%d "
+        "cbv=%d legacy_resource=%d shadow=%d legacy=%d verify=%d",
+        mask, (mask & kDescriptorCopyRouteMetadataConfigured) != 0 ? 1 : 0,
+        (mask & kDescriptorCopyRouteWitcherSense) != 0 ? 1 : 0,
+        (mask & kDescriptorCopyRouteCbv) != 0 ? 1 : 0,
+        (mask & kDescriptorCopyRouteLegacyResource) != 0 ? 1 : 0,
+        (mask & kDescriptorCopyRouteShadowStore) != 0 ? 1 : 0,
+        (mask & kDescriptorCopyRouteLegacyStore) != 0 ? 1 : 0,
+        (mask & kDescriptorCopyRouteVerify) != 0 ? 1 : 0);
+}
+
+// Before the first refresh (never expected: load_config runs before any
+// detour) the bits are computed on the spot.
+uint32_t descriptor_copy_route_mask() {
+    const uint32_t mask =
+        g_descriptor_copy_route_mask.load(std::memory_order_acquire);
+    return (mask & kDescriptorCopyRouteValid) != 0
+        ? mask : compute_descriptor_copy_route_mask();
+}
+
+// page_key = (handle >> page_shift) << 8 | handle bits below the granule.
+// The page shift is at least 14, so the key stays below 2^58.
+struct DescriptorShadowLocation {
+    uintptr_t page_key{};
+    size_t index{};
+    uint32_t owner{};
+};
+
+DescriptorShadowLocation locate_descriptor_shadow_entry(SIZE_T cpu_handle) {
+    const auto& layout = g_descriptor_shadow_layout;
+    const auto tag = static_cast<uint32_t>(cpu_handle & layout.owner_tag_mask);
+    return DescriptorShadowLocation{
+        (static_cast<uintptr_t>(cpu_handle >> layout.page_shift) <<
+            kDescriptorShadowOwnerTagBits) | tag,
+        static_cast<size_t>(cpu_handle >> layout.granule_shift) &
+            (kDescriptorShadowPageEntries - 1),
+        kDescriptorShadowOwned | tag};
+}
+
+// Waits on another writer pause first, then give the core away, so a writer
+// preempted inside its window can finish (the Deck has four cores).
+void descriptor_shadow_backoff(uint32_t& spins) {
+    if (spins < kDescriptorShadowSpinsBeforeYield) {
+        ++spins;
+        YieldProcessor();
+        return;
+    }
+    if (spins == kDescriptorShadowSpinsBeforeYield) {
+        ++spins;
+        g_descriptor_shadow_long_waits.fetch_add(1, std::memory_order_relaxed);
+    }
+    SwitchToThread();
+}
+
+DescriptorShadowPage* allocate_descriptor_shadow_page() {
+    void* const memory = VirtualAlloc(nullptr, sizeof(DescriptorShadowPage),
+        MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (memory == nullptr) {
+        g_descriptor_shadow_alloc_failures.fetch_add(
+            1, std::memory_order_relaxed);
+        return kDescriptorShadowPageFailed;
+    }
+    const uint64_t pages =
+        g_descriptor_shadow_pages.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (pages == kDescriptorShadowPageBudget) {
+        log_descriptor_store_line(
+            "Descriptor metadata store: %llu shadow pages (%.0f MiB) exceed "
+            "the expected footprint; pages are never freed",
+            static_cast<unsigned long long>(pages),
+            static_cast<double>(pages * sizeof(DescriptorShadowPage)) /
+                (1024.0 * 1024.0));
+    }
+    // Zero-filled memory is the empty state of every entry atomic.
+    return static_cast<DescriptorShadowPage*>(memory);
+}
+
+DescriptorShadowPage* find_descriptor_shadow_page(
+    uintptr_t page_key, bool create) {
+    auto& cache = g_descriptor_shadow_page_cache;
+    const uintptr_t key = page_key + 1;
+    const size_t cached = static_cast<size_t>(
+        page_key >> kDescriptorShadowOwnerTagBits) &
+        (kDescriptorShadowPageCacheSlots - 1);
+    if (cache.key[cached] == key) {
+        if (cache.page[cached] != nullptr) {
+            return cache.page[cached];
+        }
+        if (!create &&
+            cache.generation[cached] ==
+                g_descriptor_shadow_directory_generation.load(
+                    std::memory_order_acquire)) {
+            return nullptr;
+        }
+    }
+    // Read before probing: a claim this probe misses bumps it afterwards and
+    // so invalidates the miss cached below.
+    const uint64_t generation =
+        g_descriptor_shadow_directory_generation.load(
+            std::memory_order_acquire);
+    const size_t base = static_cast<size_t>(
+        w3vr::cbv_descriptor_cache::mix_handle(page_key));
+    for (size_t probe = 0; probe < kDescriptorShadowDirectoryProbeCount;
+         ++probe) {
+        auto& slot = g_descriptor_shadow_directory[
+            (base + probe) & (kDescriptorShadowDirectorySlots - 1)];
+        uintptr_t slot_key = slot.key.load(std::memory_order_acquire);
+        if (slot_key == 0) {
+            if (!create) {
+                cache.key[cached] = key;
+                cache.page[cached] = nullptr;
+                cache.generation[cached] = generation;
+                return nullptr;
+            }
+            uintptr_t expected{};
+            if (slot.key.compare_exchange_strong(
+                    expected, key, std::memory_order_acq_rel)) {
+                g_descriptor_shadow_directory_generation.fetch_add(
+                    1, std::memory_order_acq_rel);
+                slot.page.store(allocate_descriptor_shadow_page(),
+                    std::memory_order_release);
+                slot_key = key;
+            } else {
+                slot_key = expected;
+            }
+        }
+        if (slot_key != key) {
+            continue;
+        }
+        DescriptorShadowPage* page =
+            slot.page.load(std::memory_order_acquire);
+        if (page == nullptr) {
+            // Another thread is allocating this page. A load sees it empty
+            // (not cached: the generation already counts this claim); a
+            // store waits for the allocation.
+            if (!create) {
+                return nullptr;
+            }
+            uint32_t spins = 0;
+            do {
+                descriptor_shadow_backoff(spins);
+                page = slot.page.load(std::memory_order_acquire);
+            } while (page == nullptr);
+        }
+        if (page == kDescriptorShadowPageFailed) {
+            return nullptr;
+        }
+        cache.key[cached] = key;
+        cache.page[cached] = page;
+        return page;
+    }
+    if (create) {
+        g_descriptor_shadow_directory_overflows.fetch_add(
+            1, std::memory_order_relaxed);
+    }
+    return nullptr;
+}
+
+void load_descriptor_shadow_fields(
+    const DescriptorShadowEntry& entry, DescriptorShadowRecord& record) {
+    record.header = entry.header.load(std::memory_order_relaxed);
+    record.cbv_gpu_va = entry.cbv_gpu_va.load(std::memory_order_relaxed);
+    record.cbv_size_in_bytes =
+        entry.cbv_size_in_bytes.load(std::memory_order_relaxed);
+    record.fast_format = entry.fast_format.load(std::memory_order_relaxed);
+    record.fast_resource = entry.fast_resource.load(std::memory_order_relaxed);
+    record.witcher_resource =
+        entry.witcher_resource.load(std::memory_order_relaxed);
+    record.witcher_width = entry.witcher_width.load(std::memory_order_relaxed);
+    record.witcher_height =
+        entry.witcher_height.load(std::memory_order_relaxed);
+}
+
+void store_descriptor_shadow_fields(
+    DescriptorShadowEntry& entry, const DescriptorShadowRecord& record) {
+    entry.header.store(record.header, std::memory_order_relaxed);
+    entry.cbv_gpu_va.store(record.cbv_gpu_va, std::memory_order_relaxed);
+    entry.cbv_size_in_bytes.store(
+        record.cbv_size_in_bytes, std::memory_order_relaxed);
+    entry.fast_format.store(record.fast_format, std::memory_order_relaxed);
+    entry.fast_resource.store(record.fast_resource, std::memory_order_relaxed);
+    entry.witcher_resource.store(
+        record.witcher_resource, std::memory_order_relaxed);
+    entry.witcher_width.store(record.witcher_width, std::memory_order_relaxed);
+    entry.witcher_height.store(
+        record.witcher_height, std::memory_order_relaxed);
+}
+
+// max_attempts 0 waits for a concurrent writer (with backoff); the smoke draw
+// passes a bound and only pauses.
+bool read_descriptor_shadow_entry(
+    const DescriptorShadowEntry& entry,
+    DescriptorShadowRecord& record,
+    uint32_t max_attempts) {
+    uint32_t spins = 0;
+    for (uint32_t attempt = 0; max_attempts == 0 || attempt < max_attempts;
+         ++attempt) {
+        const uint32_t begin = entry.sequence.load(std::memory_order_acquire);
+        if ((begin & 1u) == 0) {
+            load_descriptor_shadow_fields(entry, record);
+            std::atomic_thread_fence(std::memory_order_acquire);
+            if (entry.sequence.load(std::memory_order_relaxed) == begin) {
+                return true;
+            }
+        }
+        if (max_attempts != 0) {
+            YieldProcessor();
+        } else {
+            descriptor_shadow_backoff(spins);
+        }
+    }
+    return false;
+}
+
+uint32_t lock_descriptor_shadow_entry(DescriptorShadowEntry& entry) {
+    uint32_t spins = 0;
+    uint32_t sequence = entry.sequence.load(std::memory_order_relaxed);
+    for (;;) {
+        if ((sequence & 1u) == 0 &&
+            entry.sequence.compare_exchange_weak(sequence, sequence + 1,
+                std::memory_order_acquire, std::memory_order_relaxed)) {
+            // Readers must see the odd sequence before any field store.
+            std::atomic_thread_fence(std::memory_order_release);
+            return sequence + 1;
+        }
+        if ((sequence & 1u) != 0) {
+            descriptor_shadow_backoff(spins);
+            sequence = entry.sequence.load(std::memory_order_relaxed);
+        }
+    }
+}
+
+void unlock_descriptor_shadow_entry(
+    DescriptorShadowEntry& entry, uint32_t locked_sequence) {
+    entry.sequence.store(locked_sequence + 1, std::memory_order_release);
+}
+
+// Takes ownership for cpu_handle (resetting the entry when another handle
+// owned the granule, which the tagged page key rules out), applies update and
+// publishes the entry.
+template <typename Update>
+void update_descriptor_shadow_entry(SIZE_T cpu_handle, Update&& update) {
+    if (cpu_handle == 0 ||
+        !g_descriptor_shadow_layout.ready.load(std::memory_order_acquire)) {
+        return;
+    }
+    const auto location = locate_descriptor_shadow_entry(cpu_handle);
+    auto* page = find_descriptor_shadow_page(location.page_key, true);
+    if (page == nullptr) {
+        return;
+    }
+    auto& entry = page->entries[location.index];
+    DescriptorShadowRecord record{};
+    // REDengine's workers mostly rewrite a descriptor with the values it
+    // already holds. Leave such an entry alone (no lock, no dirty line), as
+    // the legacy CBV store let those rewrites run without serializing.
+    read_descriptor_shadow_entry(entry, record, 0);
+    if ((record.header & kDescriptorShadowOwnerMask) == location.owner) {
+        DescriptorShadowRecord updated = record;
+        update(updated);
+        if (updated == record) {
+            return;
+        }
+    }
+    const uint32_t locked = lock_descriptor_shadow_entry(entry);
+    load_descriptor_shadow_fields(entry, record);
+    if ((record.header & kDescriptorShadowOwnerMask) != location.owner) {
+        if ((record.header & kDescriptorShadowOwned) != 0) {
+            g_descriptor_shadow_owner_collisions.fetch_add(
+                1, std::memory_order_relaxed);
+        }
+        record = DescriptorShadowRecord{};
+        record.header = location.owner;
+    }
+    update(record);
+    store_descriptor_shadow_fields(entry, record);
+    unlock_descriptor_shadow_entry(entry, locked);
+}
+
+bool load_descriptor_shadow_record(
+    SIZE_T cpu_handle, DescriptorShadowRecord& record, uint32_t max_attempts) {
+    record = DescriptorShadowRecord{};
+    if (cpu_handle == 0 ||
+        !g_descriptor_shadow_layout.ready.load(std::memory_order_acquire)) {
+        return false;
+    }
+    const auto location = locate_descriptor_shadow_entry(cpu_handle);
+    const auto* page = find_descriptor_shadow_page(location.page_key, false);
+    if (page == nullptr ||
+        !read_descriptor_shadow_entry(
+            page->entries[location.index], record, max_attempts) ||
+        (record.header & kDescriptorShadowOwnerMask) != location.owner) {
+        record = DescriptorShadowRecord{};
+        return false;
+    }
+    return true;
+}
+
+void store_cbv_descriptor_shadow(
+    SIZE_T cpu_handle, const CbvDescriptorInfo& info) {
+    update_descriptor_shadow_entry(cpu_handle,
+        [&info](DescriptorShadowRecord& record) {
+            record.header = (record.header | kDescriptorShadowHasCbv) &
+                ~kDescriptorShadowCopiedEmptyCbv;
+            record.cbv_gpu_va = info.gpu_va;
+            record.cbv_size_in_bytes = info.size_in_bytes;
+        });
+}
+
+void store_resource_descriptor_fast_shadow(
+    SIZE_T cpu_handle, ID3D12Resource* resource, DXGI_FORMAT format) {
+    if (resource == nullptr) {
+        return;
+    }
+    update_descriptor_shadow_entry(cpu_handle,
+        [resource, format](DescriptorShadowRecord& record) {
+            record.header =
+                (record.header | kDescriptorShadowHasFastResource) &
+                ~kDescriptorShadowCopiedEmptyFastResource;
+            record.fast_resource = resource;
+            record.fast_format = static_cast<uint32_t>(format);
+        });
+}
+
+void store_witcher_sense_descriptor_target_shadow(
+    SIZE_T cpu_handle, const WitcherSenseDescriptorInfo& info) {
+    if (info.resource == nullptr ||
+        info.kind == WitcherSenseDescriptorKind::None) {
+        return;
+    }
+    update_descriptor_shadow_entry(cpu_handle,
+        [&info](DescriptorShadowRecord& record) {
+            record.header =
+                (record.header & ~kDescriptorShadowWitcherKindMask) |
+                (static_cast<uint32_t>(info.kind) <<
+                    kDescriptorShadowWitcherKindShift);
+            record.witcher_resource = info.resource;
+            record.witcher_width = static_cast<uint32_t>(info.width);
+            record.witcher_height = info.height;
+        });
+}
+
+void invalidate_witcher_sense_descriptor_target_shadow(SIZE_T cpu_handle) {
+    DescriptorShadowRecord current{};
+    if (!load_descriptor_shadow_record(cpu_handle, current, 0) ||
+        (current.header & kDescriptorShadowWitcherKindMask) == 0) {
+        return;
+    }
+    update_descriptor_shadow_entry(cpu_handle,
+        [](DescriptorShadowRecord& record) {
+            record.header &= ~kDescriptorShadowWitcherKindMask;
+            record.witcher_resource = nullptr;
+            record.witcher_width = 0;
+            record.witcher_height = 0;
+        });
+}
+
+bool shadow_record_cbv(
+    const DescriptorShadowRecord& record, CbvDescriptorInfo& info) {
+    if ((record.header & kDescriptorShadowHasCbv) == 0) {
+        return false;
+    }
+    info = CbvDescriptorInfo{record.cbv_gpu_va, record.cbv_size_in_bytes};
+    return true;
+}
+
+bool shadow_record_fast_resource(
+    const DescriptorShadowRecord& record,
+    ID3D12Resource*& resource_out,
+    DXGI_FORMAT& format_out) {
+    if ((record.header & kDescriptorShadowHasFastResource) == 0) {
+        return false;
+    }
+    resource_out = record.fast_resource;
+    format_out = static_cast<DXGI_FORMAT>(record.fast_format);
+    return resource_out != nullptr;
+}
+
+bool shadow_record_witcher_sense(
+    const DescriptorShadowRecord& record,
+    WitcherSenseDescriptorInfo& info_out,
+    WitcherSenseDescriptorKind expected_kind) {
+    const auto kind = static_cast<WitcherSenseDescriptorKind>(
+        (record.header & kDescriptorShadowWitcherKindMask) >>
+            kDescriptorShadowWitcherKindShift);
+    if (kind == WitcherSenseDescriptorKind::None ||
+        record.witcher_resource == nullptr ||
+        (expected_kind != WitcherSenseDescriptorKind::None &&
+            kind != expected_kind)) {
+        return false;
+    }
+    info_out.resource = record.witcher_resource;
+    info_out.width = record.witcher_width;
+    info_out.height = record.witcher_height;
+    info_out.kind = kind;
+    return true;
+}
+
+// [PERF:DESCRIPTOR-SHADOW-STORE 4/14] [perf] descriptor_shadow_verify keeps
+// both stores and compares every consumer load. legacy_only_stale is the
+// expected difference: a copy from a source without that CBV/resource
+// emptied the shadow entry while the legacy store kept the destination's old
+// data. legacy_only (the shadow store lost data), shadow_only and differ list
+// their first examples; transient is a difference that did not repeat.
+enum class DescriptorShadowVerifyKind : uint32_t {
+    Cbv,
+    FastResource,
+    WitcherSense,
+    Count,
+};
+
+enum class DescriptorShadowVerifyResult : uint32_t {
+    Match,
+    Empty,
+    LegacyOnlyStale,
+    LegacyOnly,
+    ShadowOnly,
+    Differ,
+    Transient,
+    Count,
+};
+
+constexpr size_t kDescriptorShadowVerifyKindCount =
+    static_cast<size_t>(DescriptorShadowVerifyKind::Count);
+constexpr size_t kDescriptorShadowVerifyResultCount =
+    static_cast<size_t>(DescriptorShadowVerifyResult::Count);
+constexpr size_t kDescriptorShadowVerifyExampleLimit = 20;
+// Example lists: differ, shadow_only, legacy_only.
+constexpr size_t kDescriptorShadowVerifyExampleLists = 3;
+
+struct DescriptorShadowVerifyExample {
+    std::atomic<bool> ready{};
+    bool logged{};
+    DescriptorShadowVerifyKind kind{};
+    SIZE_T cpu_handle{};
+    std::array<uint64_t, 4> shadow{};
+    std::array<uint64_t, 4> legacy{};
+};
+
+// One comparison of a load: hits, value equality, the destination's
+// copied-empty marker and the values for an example line.
+struct DescriptorShadowVerifySample {
+    bool shadow_hit{};
+    bool legacy_hit{};
+    bool equal{};
+    bool copied_empty{};
+    std::array<uint64_t, 4> shadow{};
+    std::array<uint64_t, 4> legacy{};
+};
+
+std::array<std::array<std::atomic<uint64_t>,
+    kDescriptorShadowVerifyResultCount>,
+    kDescriptorShadowVerifyKindCount> g_descriptor_shadow_verify_counts{};
+std::array<std::array<DescriptorShadowVerifyExample,
+    kDescriptorShadowVerifyExampleLimit>,
+    kDescriptorShadowVerifyExampleLists> g_descriptor_shadow_verify_examples{};
+std::array<std::atomic<uint32_t>, kDescriptorShadowVerifyExampleLists>
+    g_descriptor_shadow_verify_example_claims{};
+// Copies whose legacy source had a CBV/resource that the shadow source
+// lacked with no earlier copy to explain it: the shadow store lost it.
+std::array<std::atomic<uint64_t>, kDescriptorShadowVerifyKindCount>
+    g_descriptor_shadow_verify_copy_source_lost{};
+
+DescriptorShadowVerifyResult classify_descriptor_shadow_verify(
+    const DescriptorShadowVerifySample& sample) {
+    if (sample.shadow_hit && sample.legacy_hit) {
+        return sample.equal ? DescriptorShadowVerifyResult::Match
+                            : DescriptorShadowVerifyResult::Differ;
+    }
+    if (!sample.shadow_hit && !sample.legacy_hit) {
+        return DescriptorShadowVerifyResult::Empty;
+    }
+    if (sample.legacy_hit) {
+        return sample.copied_empty
+            ? DescriptorShadowVerifyResult::LegacyOnlyStale
+            : DescriptorShadowVerifyResult::LegacyOnly;
+    }
+    return DescriptorShadowVerifyResult::ShadowOnly;
+}
+
+void record_descriptor_shadow_verify_example(
+    DescriptorShadowVerifyKind kind,
+    DescriptorShadowVerifyResult result,
+    SIZE_T cpu_handle,
+    const DescriptorShadowVerifySample& sample) {
+    size_t list{};
+    switch (result) {
+    case DescriptorShadowVerifyResult::Differ: list = 0; break;
+    case DescriptorShadowVerifyResult::ShadowOnly: list = 1; break;
+    case DescriptorShadowVerifyResult::LegacyOnly: list = 2; break;
+    default: return;
+    }
+    auto& claims = g_descriptor_shadow_verify_example_claims[list];
+    if (claims.load(std::memory_order_relaxed) >=
+        kDescriptorShadowVerifyExampleLimit) {
+        return;
+    }
+    const uint32_t claim = claims.fetch_add(1, std::memory_order_relaxed);
+    if (claim >= kDescriptorShadowVerifyExampleLimit) {
+        return;
+    }
+    auto& example = g_descriptor_shadow_verify_examples[list][claim];
+    example.kind = kind;
+    example.cpu_handle = cpu_handle;
+    example.shadow = sample.shadow;
+    example.legacy = sample.legacy;
+    example.ready.store(true, std::memory_order_release);
+}
+
+// The two stores are read moments apart, so a write racing the comparison
+// (a Create*View updating shadow then legacy, or a copy hook between its
+// shadow and legacy passes) can look like a difference. An unexpected result
+// is sampled once more and counted only when it repeats, otherwise as
+// transient; a load racing a long copy can still repeat. take_sample
+// refreshes the caller's values, so the load answers from the last sample.
+template <typename TakeSample>
+void verify_descriptor_shadow_load(
+    DescriptorShadowVerifyKind kind,
+    SIZE_T cpu_handle,
+    TakeSample&& take_sample) {
+    DescriptorShadowVerifySample sample = take_sample();
+    auto result = classify_descriptor_shadow_verify(sample);
+    if (result != DescriptorShadowVerifyResult::Match &&
+        result != DescriptorShadowVerifyResult::Empty) {
+        sample = take_sample();
+        if (classify_descriptor_shadow_verify(sample) != result) {
+            result = DescriptorShadowVerifyResult::Transient;
+        }
+    }
+    g_descriptor_shadow_verify_counts[static_cast<size_t>(kind)]
+        [static_cast<size_t>(result)].fetch_add(1, std::memory_order_relaxed);
+    record_descriptor_shadow_verify_example(kind, result, cpu_handle, sample);
+}
+
+// Verification only, from the shadow copy: a kind the shadow source lacks is
+// marked copied-empty at the destination when the legacy store may keep a
+// stale value there, i.e. the legacy source lacks it too or the shadow
+// source was itself emptied by a copy. A legacy source that has it means the
+// shadow store lost it: counted, and the destination gets no marker, so its
+// loads count as legacy_only.
+uint32_t descriptor_shadow_verify_copied_empty(
+    const DescriptorShadowRecord& source, SIZE_T src_cpu) {
+    uint32_t copied_empty{};
+    if ((source.header & kDescriptorShadowHasCbv) == 0) {
+        CbvDescriptorInfo legacy{};
+        if ((source.header & kDescriptorShadowCopiedEmptyCbv) != 0 ||
+            !load_cbv_descriptor_legacy(src_cpu, legacy)) {
+            copied_empty |= kDescriptorShadowCopiedEmptyCbv;
+        } else {
+            g_descriptor_shadow_verify_copy_source_lost[static_cast<size_t>(
+                DescriptorShadowVerifyKind::Cbv)].fetch_add(
+                    1, std::memory_order_relaxed);
+        }
+    }
+    if ((source.header & kDescriptorShadowHasFastResource) == 0) {
+        ID3D12Resource* resource{};
+        DXGI_FORMAT format{DXGI_FORMAT_UNKNOWN};
+        if ((source.header & kDescriptorShadowCopiedEmptyFastResource) != 0 ||
+            !load_resource_descriptor_fast_legacy(src_cpu, resource, format)) {
+            copied_empty |= kDescriptorShadowCopiedEmptyFastResource;
+        } else {
+            g_descriptor_shadow_verify_copy_source_lost[static_cast<size_t>(
+                DescriptorShadowVerifyKind::FastResource)].fetch_add(
+                    1, std::memory_order_relaxed);
+        }
+    }
+    return copied_empty;
+}
+
+// Verification returns the configured store's answer.
+template <typename Value>
+bool select_verified_descriptor_load(
+    bool shadow_hit, const Value& shadow_value,
+    bool legacy_hit, const Value& legacy_value,
+    Value& value_out) {
+    const bool shadow = descriptor_shadow_store_selected();
+    const bool hit = shadow ? shadow_hit : legacy_hit;
+    if (hit) {
+        value_out = shadow ? shadow_value : legacy_value;
+    }
+    return hit;
+}
+
+DescriptorShadowVerifySample descriptor_shadow_cbv_verify_sample(
+    bool shadow_hit, const CbvDescriptorInfo& shadow_info,
+    bool legacy_hit, const CbvDescriptorInfo& legacy_info,
+    const DescriptorShadowRecord& record) {
+    return DescriptorShadowVerifySample{shadow_hit, legacy_hit,
+        shadow_info.gpu_va == legacy_info.gpu_va &&
+            shadow_info.size_in_bytes == legacy_info.size_in_bytes,
+        (record.header & kDescriptorShadowCopiedEmptyCbv) != 0,
+        {shadow_info.gpu_va, shadow_info.size_in_bytes, 0, 0},
+        {legacy_info.gpu_va, legacy_info.size_in_bytes, 0, 0}};
+}
+
+// [PERF:DESCRIPTOR-SHADOW-STORE 5/14] The consumer-facing names route to the
+// configured store (both under verification). Legacy mode calls exactly the
+// former functions, now suffixed _legacy.
+void store_cbv_descriptor(SIZE_T cpu_handle, const CbvDescriptorInfo& info) {
+    if (descriptor_shadow_store_maintained()) {
+        store_cbv_descriptor_shadow(cpu_handle, info);
+    }
+    if (descriptor_legacy_store_maintained()) {
+        store_cbv_descriptor_legacy(cpu_handle, info);
+    }
+}
+
+bool load_cbv_descriptor(SIZE_T cpu_handle, CbvDescriptorInfo& info) {
+    if (!g_config.perf_descriptor_shadow_verify) {
+        if (!descriptor_shadow_store_selected()) {
+            return load_cbv_descriptor_legacy(cpu_handle, info);
+        }
+        DescriptorShadowRecord record{};
+        return load_descriptor_shadow_record(cpu_handle, record, 0) &&
+            shadow_record_cbv(record, info);
+    }
+    CbvDescriptorInfo shadow_info{};
+    CbvDescriptorInfo legacy_info{};
+    bool shadow_hit{};
+    bool legacy_hit{};
+    verify_descriptor_shadow_load(DescriptorShadowVerifyKind::Cbv, cpu_handle,
+        [&]() {
+            DescriptorShadowRecord record{};
+            shadow_info = CbvDescriptorInfo{};
+            legacy_info = CbvDescriptorInfo{};
+            shadow_hit =
+                load_descriptor_shadow_record(cpu_handle, record, 0) &&
+                shadow_record_cbv(record, shadow_info);
+            legacy_hit = load_cbv_descriptor_legacy(cpu_handle, legacy_info);
+            return descriptor_shadow_cbv_verify_sample(
+                shadow_hit, shadow_info, legacy_hit, legacy_info, record);
+        });
+    return select_verified_descriptor_load(
+        shadow_hit, shadow_info, legacy_hit, legacy_info, info);
+}
+
+// Smoke draws never wait: a descriptor that stays mid-write for the bounded
+// attempts reads as missing, as a claimed legacy slot did.
+bool load_cbv_descriptor_smoke_nonblocking(
+    SIZE_T cpu_handle, CbvDescriptorInfo& info) {
+    if (!g_config.perf_descriptor_shadow_verify) {
+        if (!descriptor_shadow_store_selected()) {
+            return load_cbv_descriptor_smoke_nonblocking_legacy(
+                cpu_handle, info);
+        }
+        DescriptorShadowRecord record{};
+        return load_descriptor_shadow_record(cpu_handle, record,
+                   kDescriptorShadowNonblockingAttempts) &&
+            shadow_record_cbv(record, info) && info.gpu_va != 0;
+    }
+    CbvDescriptorInfo shadow_info{};
+    CbvDescriptorInfo legacy_info{};
+    bool shadow_hit{};
+    bool legacy_hit{};
+    verify_descriptor_shadow_load(DescriptorShadowVerifyKind::Cbv, cpu_handle,
+        [&]() {
+            DescriptorShadowRecord record{};
+            shadow_info = CbvDescriptorInfo{};
+            legacy_info = CbvDescriptorInfo{};
+            shadow_hit = load_descriptor_shadow_record(cpu_handle, record,
+                             kDescriptorShadowNonblockingAttempts) &&
+                shadow_record_cbv(record, shadow_info) &&
+                shadow_info.gpu_va != 0;
+            legacy_hit = load_cbv_descriptor_smoke_nonblocking_legacy(
+                cpu_handle, legacy_info);
+            return descriptor_shadow_cbv_verify_sample(
+                shadow_hit, shadow_info, legacy_hit, legacy_info, record);
+        });
+    return select_verified_descriptor_load(
+        shadow_hit, shadow_info, legacy_hit, legacy_info, info);
+}
+
+void store_resource_descriptor_fast(
+    SIZE_T cpu_handle,
+    ID3D12Resource* resource,
+    DXGI_FORMAT format) {
+    if (descriptor_shadow_store_maintained()) {
+        store_resource_descriptor_fast_shadow(cpu_handle, resource, format);
+    }
+    if (descriptor_legacy_store_maintained()) {
+        store_resource_descriptor_fast_legacy(cpu_handle, resource, format);
+    }
+}
+
+bool load_resource_descriptor_fast(
+    SIZE_T cpu_handle,
+    ID3D12Resource*& resource_out,
+    DXGI_FORMAT& format_out) {
+    if (!g_config.perf_descriptor_shadow_verify) {
+        if (!descriptor_shadow_store_selected()) {
+            return load_resource_descriptor_fast_legacy(
+                cpu_handle, resource_out, format_out);
+        }
+        DescriptorShadowRecord record{};
+        return load_descriptor_shadow_record(cpu_handle, record, 0) &&
+            shadow_record_fast_resource(record, resource_out, format_out);
+    }
+    std::pair<ID3D12Resource*, DXGI_FORMAT> shadow_value{};
+    std::pair<ID3D12Resource*, DXGI_FORMAT> legacy_value{};
+    bool shadow_hit{};
+    bool legacy_hit{};
+    verify_descriptor_shadow_load(DescriptorShadowVerifyKind::FastResource,
+        cpu_handle, [&]() {
+            DescriptorShadowRecord record{};
+            shadow_value = {};
+            legacy_value = {};
+            shadow_hit =
+                load_descriptor_shadow_record(cpu_handle, record, 0) &&
+                shadow_record_fast_resource(
+                    record, shadow_value.first, shadow_value.second);
+            legacy_hit = load_resource_descriptor_fast_legacy(
+                cpu_handle, legacy_value.first, legacy_value.second);
+            return DescriptorShadowVerifySample{shadow_hit, legacy_hit,
+                shadow_value == legacy_value,
+                (record.header & kDescriptorShadowCopiedEmptyFastResource) !=
+                    0,
+                {reinterpret_cast<uint64_t>(shadow_value.first),
+                    static_cast<uint64_t>(shadow_value.second), 0, 0},
+                {reinterpret_cast<uint64_t>(legacy_value.first),
+                    static_cast<uint64_t>(legacy_value.second), 0, 0}};
+        });
+    std::pair<ID3D12Resource*, DXGI_FORMAT> selected{};
+    if (!select_verified_descriptor_load(
+            shadow_hit, shadow_value, legacy_hit, legacy_value, selected)) {
+        return false;
+    }
+    resource_out = selected.first;
+    format_out = selected.second;
+    return true;
+}
+
+void store_witcher_sense_descriptor_target(
+    SIZE_T cpu_handle,
+    const WitcherSenseDescriptorInfo& info) {
+    if (descriptor_shadow_store_maintained()) {
+        store_witcher_sense_descriptor_target_shadow(cpu_handle, info);
+    }
+    if (descriptor_legacy_store_maintained()) {
+        store_witcher_sense_descriptor_target_legacy(cpu_handle, info);
+    }
+}
+
+void invalidate_witcher_sense_descriptor_target(SIZE_T cpu_handle) {
+    if (descriptor_shadow_store_maintained()) {
+        invalidate_witcher_sense_descriptor_target_shadow(cpu_handle);
+    }
+    if (descriptor_legacy_store_maintained()) {
+        invalidate_witcher_sense_descriptor_target_legacy(cpu_handle);
+    }
+}
+
+bool load_witcher_sense_descriptor_target(
+    SIZE_T cpu_handle,
+    WitcherSenseDescriptorInfo& info_out,
+    WitcherSenseDescriptorKind expected_kind =
+        WitcherSenseDescriptorKind::None) {
+    if (!g_config.perf_descriptor_shadow_verify) {
+        if (!descriptor_shadow_store_selected()) {
+            return load_witcher_sense_descriptor_target_legacy(
+                cpu_handle, info_out, expected_kind);
+        }
+        DescriptorShadowRecord record{};
+        return load_descriptor_shadow_record(cpu_handle, record, 0) &&
+            shadow_record_witcher_sense(record, info_out, expected_kind);
+    }
+    WitcherSenseDescriptorInfo shadow_info{};
+    WitcherSenseDescriptorInfo legacy_info{};
+    bool shadow_hit{};
+    bool legacy_hit{};
+    // The legacy copy empties a Witcher Senses destination too, so a legacy
+    // hit the shadow store lacks is never expected (no stale class).
+    verify_descriptor_shadow_load(DescriptorShadowVerifyKind::WitcherSense,
+        cpu_handle, [&]() {
+            DescriptorShadowRecord record{};
+            shadow_info = WitcherSenseDescriptorInfo{};
+            legacy_info = WitcherSenseDescriptorInfo{};
+            shadow_hit =
+                load_descriptor_shadow_record(cpu_handle, record, 0) &&
+                shadow_record_witcher_sense(
+                    record, shadow_info, expected_kind);
+            legacy_hit = load_witcher_sense_descriptor_target_legacy(
+                cpu_handle, legacy_info, expected_kind);
+            return DescriptorShadowVerifySample{shadow_hit, legacy_hit,
+                shadow_info.resource == legacy_info.resource &&
+                    shadow_info.width == legacy_info.width &&
+                    shadow_info.height == legacy_info.height &&
+                    shadow_info.kind == legacy_info.kind,
+                false,
+                {reinterpret_cast<uint64_t>(shadow_info.resource),
+                    shadow_info.width, shadow_info.height,
+                    static_cast<uint64_t>(shadow_info.kind)},
+                {reinterpret_cast<uint64_t>(legacy_info.resource),
+                    legacy_info.width, legacy_info.height,
+                    static_cast<uint64_t>(legacy_info.kind)}};
+        });
+    return select_verified_descriptor_load(
+        shadow_hit, shadow_info, legacy_hit, legacy_info, info_out);
 }
 
 struct RootDescriptorRangeInfo {
@@ -4906,7 +6270,77 @@ std::unordered_map<SIZE_T, ResourceDescriptorInfo> g_resource_descriptors{};
 std::unordered_map<SIZE_T, ID3D12Resource*> g_rtv_descriptors{};
 std::unordered_map<SIZE_T, ID3D12Resource*> g_dsv_descriptors{};
 std::unordered_map<ID3D12RootSignature*, RootSignatureInfo> g_root_signature_infos{};
-std::unordered_map<ID3D12PipelineState*, PipelineInfo> g_pipeline_infos{};
+// [PERF:AIM-PROBE-PIPELINES 1/3] The V1035 aim detector asks, for every 6x1
+// non-indexed draw, whether the bound PSO records the AimProbe VS/PS pair.
+// Asking g_pipeline_infos took g_reverse_mutex on the draw path (render
+// thread and both recording lanes). Every record into the map now passes
+// through PipelineInfoMap::Record, which keeps the PSOs recorded with that
+// pair in a small lock-free set: a PSO address recorded again with another
+// pair leaves it, exactly as its map entry changes. Records are made under
+// g_reverse_mutex, so the set has one writer at a time. More AimProbe PSOs
+// than slots send the detector back to the locked map lookup.
+constexpr size_t kAimProbePipelineSlotCount = 4;
+std::array<std::atomic<ID3D12PipelineState*>, kAimProbePipelineSlotCount>
+    g_aim_probe_pipelines{};
+std::atomic<bool> g_aim_probe_pipelines_overflow{};
+
+void record_aim_probe_pipeline(
+    ID3D12PipelineState* pipeline, const PipelineInfo& info) {
+    if (pipeline == nullptr) {
+        return;
+    }
+    const bool aim_probe =
+        shader_fingerprints::matches(
+            ShaderFingerprint::AimProbeVs, info.vs_hash) &&
+        shader_fingerprints::matches(
+            ShaderFingerprint::AimProbePs, info.ps_hash);
+    std::atomic<ID3D12PipelineState*>* free_slot{};
+    for (auto& slot : g_aim_probe_pipelines) {
+        ID3D12PipelineState* const current =
+            slot.load(std::memory_order_relaxed);
+        if (current == pipeline) {
+            if (!aim_probe) {
+                slot.store(nullptr, std::memory_order_release);
+            }
+            return;
+        }
+        if (current == nullptr && free_slot == nullptr) {
+            free_slot = &slot;
+        }
+    }
+    if (!aim_probe) {
+        return;
+    }
+    if (free_slot != nullptr) {
+        free_slot->store(pipeline, std::memory_order_release);
+    } else if (!g_aim_probe_pipelines_overflow.exchange(
+                   true, std::memory_order_acq_rel)) {
+        log_line("Aim probe PSO set full (%zu); the aim detector uses the "
+            "locked pipeline lookup",
+            kAimProbePipelineSlotCount);
+    }
+}
+
+struct PipelineInfoMap {
+    // The target of g_pipeline_infos[pipeline] = info.
+    struct Record {
+        ID3D12PipelineState* pipeline;
+        PipelineInfo& info;
+        Record& operator=(const PipelineInfo& value) {
+            info = value;
+            record_aim_probe_pipeline(pipeline, value);
+            return *this;
+        }
+    };
+    std::unordered_map<ID3D12PipelineState*, PipelineInfo> map{};
+
+    Record operator[](ID3D12PipelineState* pipeline) {
+        return Record{pipeline, map[pipeline]};
+    }
+    auto find(ID3D12PipelineState* pipeline) { return map.find(pipeline); }
+    auto end() { return map.end(); }
+};
+PipelineInfoMap g_pipeline_infos{};
 constexpr size_t kEffectPipelineInfoSlotCount = 1u << 16;
 constexpr size_t kEffectPipelineInfoProbeCount = 32;
 constexpr uintptr_t kEffectPipelineInfoClaimed = ~uintptr_t{};
@@ -6297,6 +7731,7 @@ void STDMETHODCALLTYPE hook_draw_instanced(
     UINT instance_count,
     UINT start_vertex_location,
     UINT start_instance_location);
+void record_shadow_profile_draw();
 void log_line(const char* fmt, ...);
 void log_taau_trace_line(const char* fmt, ...);
 void wait_for_xr_gpu();
@@ -9994,10 +11429,7 @@ bool reverse_enabled();
 // of records paid a periodic cost that the capture then blamed on the
 // renderer. Hold the handle open and flush per line instead: the bytes still
 // reach the OS on every line, so a crashed process keeps its log tail.
-void write_log_line_v(const char* fmt, va_list args) {
-    if (!g_config.runtime_diagnostics) {
-        return;
-    }
+void append_log_file_line_v(const char* fmt, va_list args) {
     std::scoped_lock lock{g_log_mutex};
 
     static FILE* file{};
@@ -10027,6 +11459,13 @@ void write_log_line_v(const char* fmt, va_list args) {
     fflush(file);
 }
 
+void write_log_line_v(const char* fmt, va_list args) {
+    if (!g_config.runtime_diagnostics) {
+        return;
+    }
+    append_log_file_line_v(fmt, args);
+}
+
 void log_line(const char* fmt, ...) {
     if (!g_config.logging_enabled || !g_config.runtime_diagnostics) {
         return;
@@ -10034,6 +11473,35 @@ void log_line(const char* fmt, ...) {
     va_list args{};
     va_start(args, fmt);
     write_log_line_v(fmt, args);
+    va_end(args);
+}
+
+// [FEATURE:VRS-MEASUREMENT 2/8] A VRS measurement has to run with
+// runtime_diagnostics=0, which closes witcher3vr.log for everything else.
+// These few lines (capabilities, a census every 600 Presents, one line per
+// classified PSO) still reach it when [vrs] mode=3 and log=1, whatever the
+// [debug] switches say; no other writer is opened by this exception.
+void log_vrs_line(const char* fmt, ...) {
+    if (!g_config.vrs_log_file) {
+        return;
+    }
+    va_list args{};
+    va_start(args, fmt);
+    append_log_file_line_v(fmt, args);
+    va_end(args);
+}
+
+// [PERF:DESCRIPTOR-SHADOW-STORE 6/14] The descriptor store's startup and
+// warning lines: in the census log during a measurement run (diagnostics
+// off), otherwise through log_line; never twice.
+void log_descriptor_store_line(const char* fmt, ...) {
+    va_list args{};
+    va_start(args, fmt);
+    if (g_config.vrs_log_file) {
+        append_log_file_line_v(fmt, args);
+    } else if (g_config.logging_enabled) {
+        write_log_line_v(fmt, args);
+    }
     va_end(args);
 }
 
@@ -14370,6 +15838,1104 @@ void apply_hud_frame_scale() {
         horizontal_written, vertical_written);
 }
 
+// [FEATURE:VRS-MEASUREMENT 3/8] Phase-0 ceiling test for fixed foveated
+// rendering. [vrs] mode=3 shades the engine's scene passes at one uniform
+// coarse rate (RSSetShadingRate, no rate image, so Tier 1 is enough) to
+// measure the most VRS can save before the foveated rate map is built. A
+// PSO's class comes from its render-target signature at creation, and
+// SetPipelineState sets the class's rate, calling RSSetShadingRate only when
+// the list's rate changes. Both tables use fixed-size open addressing with
+// keys that are never removed, and the recording threads read them without a
+// lock. With mode=0 none of the detours below is installed.
+enum class VrsPipelineClass : uint8_t {
+    Excluded,
+    GBuffer,
+    Decal,
+    SceneHdr,
+    Count
+};
+constexpr size_t kVrsPipelineClassCount =
+    static_cast<size_t>(VrsPipelineClass::Count);
+constexpr int kVrsModeOff = 0;
+constexpr int kVrsModeUniform = 3;
+constexpr uint64_t kVrsCensusPresentInterval = 600;
+constexpr uint32_t kVrsPipelineBindLogLimit = 64;
+
+uint64_t hash_shader_bytecode(const D3D12_SHADER_BYTECODE& bytecode);
+
+const char* vrs_class_name(VrsPipelineClass pipeline_class) {
+    switch (pipeline_class) {
+    case VrsPipelineClass::GBuffer:
+        return "gbuffer";
+    case VrsPipelineClass::Decal:
+        return "decal";
+    case VrsPipelineClass::SceneHdr:
+        return "scene_hdr";
+    default:
+        return "excluded";
+    }
+}
+
+uint32_t vrs_class_bit(VrsPipelineClass pipeline_class) {
+    return 1u << static_cast<uint32_t>(pipeline_class);
+}
+
+struct VrsRateName {
+    const char* name;
+    D3D12_SHADING_RATE rate;
+};
+constexpr VrsRateName kVrsRateNames[]{
+    {"1x1", D3D12_SHADING_RATE_1X1},
+    {"1x2", D3D12_SHADING_RATE_1X2},
+    {"2x1", D3D12_SHADING_RATE_2X1},
+    {"2x2", D3D12_SHADING_RATE_2X2},
+    {"2x4", D3D12_SHADING_RATE_2X4},
+    {"4x2", D3D12_SHADING_RATE_4X2},
+    {"4x4", D3D12_SHADING_RATE_4X4},
+};
+
+const char* vrs_rate_name(D3D12_SHADING_RATE rate) {
+    for (const auto& entry : kVrsRateNames) {
+        if (entry.rate == rate) {
+            return entry.name;
+        }
+    }
+    return "unknown";
+}
+
+bool parse_vrs_rate(const std::string& value, D3D12_SHADING_RATE& rate) {
+    for (const auto& entry : kVrsRateNames) {
+        if (value == entry.name) {
+            rate = entry.rate;
+            return true;
+        }
+    }
+    return false;
+}
+
+// 2x4, 4x2 and 4x4 need AdditionalShadingRatesSupported.
+bool vrs_rate_is_additional(D3D12_SHADING_RATE rate) {
+    return rate == D3D12_SHADING_RATE_2X4 ||
+        rate == D3D12_SHADING_RATE_4X2 ||
+        rate == D3D12_SHADING_RATE_4X4;
+}
+
+// Comma-separated subset of gbuffer, decal and scene_hdr (read_ini_string
+// has already lowered it). Unknown tokens are returned for the log.
+uint32_t parse_vrs_classes(const std::string& value, std::string& unknown) {
+    uint32_t mask{};
+    size_t begin{};
+    while (begin <= value.size()) {
+        size_t end = value.find(',', begin);
+        if (end == std::string::npos) {
+            end = value.size();
+        }
+        std::string token = value.substr(begin, end - begin);
+        token.erase(std::remove_if(token.begin(), token.end(),
+            [](unsigned char ch) { return ch <= ' '; }), token.end());
+        if (token == "gbuffer") {
+            mask |= vrs_class_bit(VrsPipelineClass::GBuffer);
+        } else if (token == "decal") {
+            mask |= vrs_class_bit(VrsPipelineClass::Decal);
+        } else if (token == "scene_hdr") {
+            mask |= vrs_class_bit(VrsPipelineClass::SceneHdr);
+        } else if (!token.empty()) {
+            unknown += unknown.empty() ? "" : ",";
+            unknown += token;
+        }
+        begin = end + 1;
+    }
+    return mask;
+}
+
+std::string vrs_class_list(uint32_t mask) {
+    std::string list;
+    for (size_t index = 1; index < kVrsPipelineClassCount; ++index) {
+        const auto pipeline_class = static_cast<VrsPipelineClass>(index);
+        if ((mask & vrs_class_bit(pipeline_class)) == 0) {
+            continue;
+        }
+        if (!list.empty()) {
+            list += ',';
+        }
+        list += vrs_class_name(pipeline_class);
+    }
+    return list.empty() ? std::string{"none"} : list;
+}
+
+bool vrs_rgba8_format(DXGI_FORMAT format) {
+    return format == DXGI_FORMAT_R8G8B8A8_UNORM ||
+        format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+}
+
+// Signatures from the 5.01 shader census and the G-buffer contract in
+// native_temporal_terrain_pipeline_matches. Every class needs the scene
+// D32_FLOAT_S8X24 depth target and one sample. Shadows (D16), UI (D24S8),
+// passes without depth and the mod's own PSOs stay excluded.
+VrsPipelineClass classify_vrs_pipeline(
+    const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc) {
+    const UINT count = desc.NumRenderTargets;
+    if (desc.DSVFormat != DXGI_FORMAT_D32_FLOAT_S8X24_UINT ||
+        desc.SampleDesc.Count != 1 || count == 0 ||
+        count > D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT) {
+        return VrsPipelineClass::Excluded;
+    }
+    const DXGI_FORMAT* formats = desc.RTVFormats;
+    if (count == 4 && vrs_rgba8_format(formats[0]) &&
+        vrs_rgba8_format(formats[1]) && vrs_rgba8_format(formats[2]) &&
+        formats[3] == DXGI_FORMAT_R16G16B16A16_FLOAT) {
+        return VrsPipelineClass::GBuffer;
+    }
+    if ((count == 1 || count == 3) &&
+        std::all_of(formats, formats + count, vrs_rgba8_format)) {
+        return VrsPipelineClass::Decal;
+    }
+    if (formats[0] == DXGI_FORMAT_R16G16B16A16_FLOAT) {
+        return VrsPipelineClass::SceneHdr;
+    }
+    return VrsPipelineClass::Excluded;
+}
+
+std::atomic<bool> g_vrs_measurement_active{};
+// Which VRS detours were installed (bit per kVrsDetour*), for the log.
+constexpr uint32_t kVrsDetourCreatePipeline = 1u << 0;
+constexpr uint32_t kVrsDetourReset = 1u << 1;
+constexpr uint32_t kVrsDetourSetPipeline = 1u << 2;
+constexpr uint32_t kVrsDetourClearState = 1u << 3;
+constexpr uint32_t kVrsDetourClose = 1u << 4;
+constexpr uint32_t kVrsDetourCreateComputePipeline = 1u << 5;
+std::atomic<uint32_t> g_vrs_detour_mask{};
+
+size_t vrs_slot_index(const void* key, unsigned bits) {
+    const uint64_t value =
+        static_cast<uint64_t>(reinterpret_cast<uintptr_t>(key)) >> 4;
+    return static_cast<size_t>(
+        (value * 0x9E3779B97F4A7C15ull) >> (64u - bits));
+}
+
+// Every graphics PSO created through the detour, including excluded ones, so
+// a reused address never keeps a stale class.
+constexpr unsigned kVrsPipelineSlotBits = 13;
+constexpr size_t kVrsPipelineSlotCount = size_t{1} << kVrsPipelineSlotBits;
+constexpr size_t kVrsPipelineProbeCount = 64;
+constexpr uintptr_t kVrsPipelineClaimed = ~uintptr_t{};
+struct VrsPipelineSlot {
+    std::atomic<uintptr_t> key{};
+    std::atomic<uint8_t> pipeline_class{};
+    std::atomic<bool> bind_logged{};
+    // Render-target count | DSV format << 8 | sample count << 16.
+    std::atomic<uint32_t> layout{};
+    // RTVFormats[0..7], eight bits each.
+    std::atomic<uint64_t> rtv_formats{};
+    std::atomic<uint64_t> vs_hash{};
+    std::atomic<uint64_t> ps_hash{};
+};
+std::array<VrsPipelineSlot, kVrsPipelineSlotCount> g_vrs_pipeline_slots{};
+std::atomic<uint32_t> g_vrs_pipeline_table_misses{};
+std::atomic<uint32_t> g_vrs_pipeline_bind_logs{};
+constexpr uint32_t kVrsUnknownPipelineLogLimit = 8;
+std::atomic<uint32_t> g_vrs_unknown_pipeline_logs{};
+
+void store_vrs_pipeline_slot(
+    ID3D12PipelineState* pipeline, VrsPipelineClass pipeline_class,
+    uint32_t layout, uint64_t rtv_formats, uint64_t vs_hash,
+    uint64_t ps_hash) {
+    const auto key_value = reinterpret_cast<uintptr_t>(pipeline);
+    const size_t base = vrs_slot_index(pipeline, kVrsPipelineSlotBits);
+    for (size_t probe = 0; probe < kVrsPipelineProbeCount; ++probe) {
+        auto& slot = g_vrs_pipeline_slots[
+            (base + probe) & (kVrsPipelineSlotCount - 1)];
+        auto key = slot.key.load(std::memory_order_acquire);
+        bool claimed{};
+        if (key == 0) {
+            claimed = slot.key.compare_exchange_strong(
+                key, kVrsPipelineClaimed, std::memory_order_acq_rel);
+        }
+        if (!claimed && key != key_value) {
+            continue;
+        }
+        slot.pipeline_class.store(
+            static_cast<uint8_t>(pipeline_class), std::memory_order_relaxed);
+        slot.layout.store(layout, std::memory_order_relaxed);
+        slot.rtv_formats.store(rtv_formats, std::memory_order_relaxed);
+        slot.vs_hash.store(vs_hash, std::memory_order_relaxed);
+        slot.ps_hash.store(ps_hash, std::memory_order_relaxed);
+        slot.bind_logged.store(false, std::memory_order_relaxed);
+        if (claimed) {
+            slot.key.store(key_value, std::memory_order_release);
+        }
+        return;
+    }
+    g_vrs_pipeline_table_misses.fetch_add(1, std::memory_order_relaxed);
+}
+
+void note_vrs_graphics_pipeline(
+    ID3D12PipelineState* pipeline,
+    const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc) {
+    const auto pipeline_class = classify_vrs_pipeline(desc);
+    const bool classified = pipeline_class != VrsPipelineClass::Excluded;
+    uint64_t rtv_formats{};
+    for (UINT index = 0; index < D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT;
+         ++index) {
+        rtv_formats |= (static_cast<uint64_t>(desc.RTVFormats[index]) &
+            0xFFu) << (index * 8);
+    }
+    const uint32_t layout = (desc.NumRenderTargets & 0xFFu) |
+        ((static_cast<uint32_t>(desc.DSVFormat) & 0xFFu) << 8) |
+        ((desc.SampleDesc.Count & 0xFFu) << 16);
+    store_vrs_pipeline_slot(pipeline, pipeline_class, layout, rtv_formats,
+        classified ? hash_shader_bytecode(desc.VS) : 0,
+        classified ? hash_shader_bytecode(desc.PS) : 0);
+}
+
+// Compute PSOs are bound with SetPipelineState too. They are recorded as
+// excluded so that unknown_pso_binds counts only PSOs whose creation path
+// no detour saw.
+void note_vrs_compute_pipeline(ID3D12PipelineState* pipeline) {
+    store_vrs_pipeline_slot(pipeline, VrsPipelineClass::Excluded, 0, 0, 0, 0);
+}
+
+VrsPipelineSlot* find_vrs_pipeline_slot(const ID3D12PipelineState* pipeline) {
+    const auto key_value = reinterpret_cast<uintptr_t>(pipeline);
+    const size_t base = vrs_slot_index(pipeline, kVrsPipelineSlotBits);
+    for (size_t probe = 0; probe < kVrsPipelineProbeCount; ++probe) {
+        auto& slot = g_vrs_pipeline_slots[
+            (base + probe) & (kVrsPipelineSlotCount - 1)];
+        const auto key = slot.key.load(std::memory_order_acquire);
+        if (key == key_value) {
+            return &slot;
+        }
+        if (key == 0) {
+            return nullptr;
+        }
+    }
+    return nullptr;
+}
+
+// Class of a bound PSO. A PSO that no creation detour saw is excluded and
+// clears |tracked|; the first kVrsUnknownPipelineLogLimit such binds are
+// logged. The first bind of each classified PSO writes one census line,
+// capped at kVrsPipelineBindLogLimit.
+VrsPipelineClass vrs_pipeline_class_for_bind(
+    ID3D12PipelineState* pipeline_state, bool& tracked) {
+    auto* slot = pipeline_state != nullptr
+        ? find_vrs_pipeline_slot(pipeline_state) : nullptr;
+    tracked = slot != nullptr || pipeline_state == nullptr;
+    if (slot == nullptr) {
+        if (!tracked && g_config.vrs_log_file &&
+            g_vrs_unknown_pipeline_logs.load(std::memory_order_relaxed) <
+                kVrsUnknownPipelineLogLimit &&
+            g_vrs_unknown_pipeline_logs.fetch_add(
+                1, std::memory_order_relaxed) < kVrsUnknownPipelineLogLimit) {
+            log_vrs_line(
+                "VRS bound pso=%p was not seen at creation present=%llu",
+                pipeline_state,
+                static_cast<unsigned long long>(
+                    g_present_count.load(std::memory_order_relaxed)));
+        }
+        return VrsPipelineClass::Excluded;
+    }
+    const auto pipeline_class = static_cast<VrsPipelineClass>(
+        slot->pipeline_class.load(std::memory_order_relaxed));
+    if (pipeline_class != VrsPipelineClass::Excluded &&
+        g_config.vrs_log_file &&
+        !slot->bind_logged.load(std::memory_order_relaxed) &&
+        !slot->bind_logged.exchange(true, std::memory_order_relaxed) &&
+        g_vrs_pipeline_bind_logs.fetch_add(1, std::memory_order_relaxed) <
+            kVrsPipelineBindLogLimit) {
+        const uint32_t layout = slot->layout.load(std::memory_order_relaxed);
+        const uint64_t formats =
+            slot->rtv_formats.load(std::memory_order_relaxed);
+        const UINT count = std::min<UINT>(
+            layout & 0xFFu, D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT);
+        char rtv_list[64]{};
+        size_t offset{};
+        for (UINT index = 0; index < count; ++index) {
+            const int written = snprintf(
+                rtv_list + offset, sizeof(rtv_list) - offset, "%s%u",
+                index == 0 ? "" : ",",
+                static_cast<unsigned>((formats >> (index * 8)) & 0xFFu));
+            if (written <= 0) {
+                break;
+            }
+            offset = std::min(
+                offset + static_cast<size_t>(written), sizeof(rtv_list) - 1);
+        }
+        log_vrs_line(
+            "VRS pso class=%s pso=%p rts=%u rtv=%s dsv=%u samples=%u "
+            "vs=%016llX ps=%016llX present=%llu",
+            vrs_class_name(pipeline_class), pipeline_state, count, rtv_list,
+            static_cast<unsigned>((layout >> 8) & 0xFFu),
+            static_cast<unsigned>((layout >> 16) & 0xFFu),
+            static_cast<unsigned long long>(
+                slot->vs_hash.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(
+                slot->ps_hash.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(
+                g_present_count.load(std::memory_order_relaxed)));
+    }
+    return pipeline_class;
+}
+
+enum class VrsListState : uint8_t {
+    Unknown,
+    Enabled,
+    NoList5,
+    NotDirect,
+    ModOwned,
+    ReShade,
+    Count
+};
+
+// One cache line per command list. Only the thread recording a list writes
+// its slot, so the counters are plain load/store pairs, not shared RMWs.
+constexpr unsigned kVrsCommandListSlotBits = 12;
+constexpr size_t kVrsCommandListSlotCount =
+    size_t{1} << kVrsCommandListSlotBits;
+constexpr size_t kVrsCommandListProbeCount = 32;
+struct alignas(64) VrsCommandListSlot {
+    std::atomic<uintptr_t> key{};
+    // The last classification, kept for the census; |classified| says
+    // whether it belongs to the current recording.
+    std::atomic<VrsListState> state{};
+    std::atomic<bool> classified{};
+    // Last rate set on the list; Reset, ClearState and Close return it to
+    // 1x1.
+    std::atomic<D3D12_SHADING_RATE> rate{};
+    std::array<std::atomic<uint64_t>, kVrsPipelineClassCount> binds{};
+    std::atomic<uint64_t> rate_sets{};
+    std::atomic<uint64_t> unknown_pso_binds{};
+};
+std::array<VrsCommandListSlot, kVrsCommandListSlotCount>
+    g_vrs_command_list_slots{};
+std::atomic<uint64_t> g_vrs_untracked_calls{};
+
+// A new slot is zero: state Unknown, rate 1x1. Its key is claimed directly
+// because no other thread records the same list at the same time.
+VrsCommandListSlot* vrs_command_list_slot(
+    ID3D12GraphicsCommandList* command_list, bool insert) {
+    const auto key_value = reinterpret_cast<uintptr_t>(command_list);
+    const size_t base = vrs_slot_index(command_list, kVrsCommandListSlotBits);
+    for (size_t probe = 0; probe < kVrsCommandListProbeCount; ++probe) {
+        auto& slot = g_vrs_command_list_slots[
+            (base + probe) & (kVrsCommandListSlotCount - 1)];
+        uintptr_t key = slot.key.load(std::memory_order_acquire);
+        if (key == 0 && insert &&
+            slot.key.compare_exchange_strong(
+                key, key_value, std::memory_order_acq_rel)) {
+            return &slot;
+        }
+        if (key == key_value) {
+            return &slot;
+        }
+        if (key == 0) {
+            return nullptr;
+        }
+    }
+    if (insert) {
+        g_vrs_untracked_calls.fetch_add(1, std::memory_order_relaxed);
+    }
+    return nullptr;
+}
+
+// Runs once per recording (Reset, ClearState and Close clear |classified|),
+// which also keeps ReShade's mutex-guarded list check off the per-bind path.
+VrsListState classify_vrs_command_list(
+    ID3D12GraphicsCommandList* command_list) {
+    // The XR list records only the mod's own copies and draws.
+    if (command_list == g_xr_command_list) {
+        return VrsListState::ModOwned;
+    }
+    if (is_reshade_immediate_command_list(command_list)) {
+        return VrsListState::ReShade;
+    }
+    if (command_list->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT) {
+        return VrsListState::NotDirect;
+    }
+    // Rates are set through the list's own pointer, so List5 has to be the
+    // same object; no interface pointer is kept beyond this check.
+    ID3D12GraphicsCommandList5* list5{};
+    if (FAILED(command_list->QueryInterface(IID_PPV_ARGS(&list5))) ||
+        list5 == nullptr) {
+        return VrsListState::NoList5;
+    }
+    const bool same_object =
+        static_cast<void*>(list5) == static_cast<void*>(command_list);
+    list5->Release();
+    return same_object ? VrsListState::Enabled : VrsListState::NoList5;
+}
+
+void set_vrs_list_rate(
+    ID3D12GraphicsCommandList* command_list, VrsCommandListSlot& slot,
+    D3D12_SHADING_RATE rate) {
+    if (slot.rate.load(std::memory_order_relaxed) == rate) {
+        return;
+    }
+    static_cast<ID3D12GraphicsCommandList5*>(command_list)->RSSetShadingRate(
+        rate, nullptr);
+    slot.rate.store(rate, std::memory_order_relaxed);
+    slot.rate_sets.store(
+        slot.rate_sets.load(std::memory_order_relaxed) + 1,
+        std::memory_order_relaxed);
+}
+
+// The busy flag hands the window state from one census writer to the next;
+// a bind that finds it taken returns at once instead of waiting.
+std::atomic<bool> g_vrs_census_busy{};
+std::atomic<uint64_t> g_vrs_census_next_present{};
+uint64_t g_vrs_census_window_present{};
+int64_t g_vrs_census_window_qpc{};
+std::array<uint64_t, kVrsPipelineClassCount> g_vrs_census_previous_binds{};
+uint64_t g_vrs_census_previous_rate_sets{};
+
+void log_vrs_census_locked(uint64_t present);
+void log_job_wait_profile_locked(uint64_t window_presents, int64_t qpc_frequency);
+void log_pair_barrier_census_locked(uint64_t window_presents, int64_t qpc_frequency);
+void log_pair_rate_limit_census_locked(uint64_t window_presents, int64_t qpc_frequency);
+void log_shadow_census_locked(uint64_t window_presents, int64_t qpc_frequency);
+void log_descriptor_shadow_census_locked();
+
+// One line per kVrsCensusPresentInterval Presents, written by the first bind
+// after the boundary; the counters are window deltas.
+void maybe_log_vrs_census() {
+    if (!g_config.vrs_log_file) {
+        return;
+    }
+    const uint64_t present = g_present_count.load(std::memory_order_relaxed);
+    if (present <
+            g_vrs_census_next_present.load(std::memory_order_relaxed) ||
+        g_vrs_census_busy.exchange(true, std::memory_order_acquire)) {
+        return;
+    }
+    if (present >= g_vrs_census_next_present.load(std::memory_order_relaxed)) {
+        log_vrs_census_locked(present);
+        g_vrs_census_next_present.store(
+            present + kVrsCensusPresentInterval, std::memory_order_relaxed);
+    }
+    g_vrs_census_busy.store(false, std::memory_order_release);
+}
+
+void log_vrs_census_locked(uint64_t present) {
+    std::array<uint64_t, kVrsPipelineClassCount> binds{};
+    std::array<uint32_t, static_cast<size_t>(VrsListState::Count)> lists{};
+    uint64_t rate_sets{};
+    uint64_t unknown_pso_binds{};
+    for (const auto& slot : g_vrs_command_list_slots) {
+        if (slot.key.load(std::memory_order_acquire) == 0) {
+            continue;
+        }
+        for (size_t index = 0; index < binds.size(); ++index) {
+            binds[index] += slot.binds[index].load(std::memory_order_relaxed);
+        }
+        rate_sets += slot.rate_sets.load(std::memory_order_relaxed);
+        unknown_pso_binds +=
+            slot.unknown_pso_binds.load(std::memory_order_relaxed);
+        const auto state = static_cast<size_t>(
+            slot.state.load(std::memory_order_relaxed));
+        if (state < lists.size()) {
+            ++lists[state];
+        }
+    }
+    LARGE_INTEGER now{};
+    LARGE_INTEGER frequency{};
+    QueryPerformanceCounter(&now);
+    QueryPerformanceFrequency(&frequency);
+    const double seconds = frequency.QuadPart > 0
+        ? static_cast<double>(now.QuadPart - g_vrs_census_window_qpc) /
+            static_cast<double>(frequency.QuadPart)
+        : 0.0;
+    const uint64_t window_presents = present - g_vrs_census_window_present;
+    const auto delta = [&](size_t index) {
+        return static_cast<unsigned long long>(
+            binds[index] - g_vrs_census_previous_binds[index]);
+    };
+    log_vrs_line(
+        "VRS census present=%llu window_presents=%llu seconds=%.2f "
+        "presents_per_second=%.2f binds excluded=%llu gbuffer=%llu "
+        "decal=%llu scene_hdr=%llu rate_sets=%llu lists enabled=%u "
+        "disabled_no_list5=%u not_direct=%u mod_owned=%u reshade=%u "
+        "unclassified=%u untracked_calls=%llu pso_table_misses=%u "
+        "unknown_pso_binds=%llu mode=%d rate=%s classes=%s",
+        static_cast<unsigned long long>(present),
+        static_cast<unsigned long long>(window_presents), seconds,
+        seconds > 0.0 ? static_cast<double>(window_presents) / seconds : 0.0,
+        delta(static_cast<size_t>(VrsPipelineClass::Excluded)),
+        delta(static_cast<size_t>(VrsPipelineClass::GBuffer)),
+        delta(static_cast<size_t>(VrsPipelineClass::Decal)),
+        delta(static_cast<size_t>(VrsPipelineClass::SceneHdr)),
+        static_cast<unsigned long long>(
+            rate_sets - g_vrs_census_previous_rate_sets),
+        lists[static_cast<size_t>(VrsListState::Enabled)],
+        lists[static_cast<size_t>(VrsListState::NoList5)],
+        lists[static_cast<size_t>(VrsListState::NotDirect)],
+        lists[static_cast<size_t>(VrsListState::ModOwned)],
+        lists[static_cast<size_t>(VrsListState::ReShade)],
+        lists[static_cast<size_t>(VrsListState::Unknown)],
+        static_cast<unsigned long long>(
+            g_vrs_untracked_calls.load(std::memory_order_relaxed)),
+        g_vrs_pipeline_table_misses.load(std::memory_order_relaxed),
+        static_cast<unsigned long long>(unknown_pso_binds),
+        g_config.vrs_mode, vrs_rate_name(g_config.vrs_uniform_rate),
+        vrs_class_list(g_config.vrs_class_mask).c_str());
+    g_vrs_census_window_present = present;
+    g_vrs_census_window_qpc = now.QuadPart;
+    g_vrs_census_previous_binds = binds;
+    g_vrs_census_previous_rate_sets = rate_sets;
+    log_job_wait_profile_locked(window_presents, frequency.QuadPart);
+    log_pair_barrier_census_locked(window_presents, frequency.QuadPart);
+    log_pair_rate_limit_census_locked(window_presents, frequency.QuadPart);
+    log_shadow_census_locked(window_presents, frequency.QuadPart);
+    log_descriptor_shadow_census_locked();
+}
+
+void apply_vrs_pipeline_rate(
+    ID3D12GraphicsCommandList* command_list,
+    ID3D12PipelineState* pipeline_state) {
+    // Any bind can write the census, so a run in which no list is enabled
+    // still reports why.
+    maybe_log_vrs_census();
+    auto* slot = command_list != nullptr
+        ? vrs_command_list_slot(command_list, true) : nullptr;
+    if (slot == nullptr) {
+        return;
+    }
+    auto state = slot->state.load(std::memory_order_relaxed);
+    if (!slot->classified.load(std::memory_order_relaxed)) {
+        state = classify_vrs_command_list(command_list);
+        slot->state.store(state, std::memory_order_relaxed);
+        slot->classified.store(true, std::memory_order_relaxed);
+    }
+    if (state != VrsListState::Enabled) {
+        return;
+    }
+    bool tracked{};
+    const auto pipeline_class =
+        vrs_pipeline_class_for_bind(pipeline_state, tracked);
+    auto& binds = slot->binds[static_cast<size_t>(pipeline_class)];
+    binds.store(
+        binds.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+    if (!tracked) {
+        slot->unknown_pso_binds.store(
+            slot->unknown_pso_binds.load(std::memory_order_relaxed) + 1,
+            std::memory_order_relaxed);
+    }
+    set_vrs_list_rate(command_list, *slot,
+        (g_config.vrs_class_mask & vrs_class_bit(pipeline_class)) != 0
+            ? g_config.vrs_uniform_rate
+            : D3D12_SHADING_RATE_1X1);
+}
+
+// Reset and ClearState return a list to 1x1 with passthrough combiners and
+// bind the optional PSO without a SetPipelineState call. Close clears the
+// record too: CreateCommandList returns a list that is already recording,
+// with no Reset, and it can reuse a released list's address with another
+// type. Lists are closed before they are submitted or reused, so the next
+// recording at an address is classified again and starts at 1x1.
+void reset_vrs_list_rate(
+    ID3D12GraphicsCommandList* command_list,
+    ID3D12PipelineState* pipeline_state) {
+    if (command_list == nullptr) {
+        return;
+    }
+    if (auto* slot = vrs_command_list_slot(command_list, false)) {
+        slot->rate.store(D3D12_SHADING_RATE_1X1, std::memory_order_relaxed);
+        slot->classified.store(false, std::memory_order_relaxed);
+    }
+    if (pipeline_state != nullptr) {
+        apply_vrs_pipeline_rate(command_list, pipeline_state);
+    }
+}
+
+// The mod binds its own PSOs through the original SetPipelineState, so its
+// draws inside an engine command list would inherit the engine's coarse
+// rate. Run them at 1x1 and give the engine its rate back afterwards.
+struct VrsModDrawScope {
+    ID3D12GraphicsCommandList* command_list{};
+    VrsCommandListSlot* slot{};
+    D3D12_SHADING_RATE previous{D3D12_SHADING_RATE_1X1};
+
+    explicit VrsModDrawScope(ID3D12GraphicsCommandList* list) {
+        if (!g_vrs_measurement_active.load(std::memory_order_relaxed) ||
+            list == nullptr) {
+            return;
+        }
+        auto* found = vrs_command_list_slot(list, false);
+        if (found == nullptr ||
+            !found->classified.load(std::memory_order_relaxed) ||
+            found->state.load(std::memory_order_relaxed) !=
+                VrsListState::Enabled) {
+            return;
+        }
+        previous = found->rate.load(std::memory_order_relaxed);
+        if (previous == D3D12_SHADING_RATE_1X1) {
+            return;
+        }
+        command_list = list;
+        slot = found;
+        set_vrs_list_rate(command_list, *slot, D3D12_SHADING_RATE_1X1);
+    }
+
+    ~VrsModDrawScope() {
+        if (slot != nullptr) {
+            set_vrs_list_rate(command_list, *slot, previous);
+        }
+    }
+
+    VrsModDrawScope(const VrsModDrawScope&) = delete;
+    VrsModDrawScope& operator=(const VrsModDrawScope&) = delete;
+};
+
+using ClearStateFn = void(STDMETHODCALLTYPE*)(
+    ID3D12GraphicsCommandList*, ID3D12PipelineState*);
+ClearStateFn g_clear_state{};
+using CloseCommandListFn = HRESULT(STDMETHODCALLTYPE*)(
+    ID3D12GraphicsCommandList*);
+CloseCommandListFn g_close_command_list{};
+
+// The VRS detours wrap the normal ones and exist only while the measurement
+// is on (see install_reverse_hooks and install_command_list_hooks).
+HRESULT STDMETHODCALLTYPE hook_create_graphics_pipeline_state_vrs(
+    ID3D12Device* device,
+    const D3D12_GRAPHICS_PIPELINE_STATE_DESC* desc,
+    REFIID riid,
+    void** pipeline_state) {
+    const HRESULT hr = hook_create_graphics_pipeline_state(
+        device, desc, riid, pipeline_state);
+    if (SUCCEEDED(hr) && desc != nullptr && pipeline_state != nullptr &&
+        *pipeline_state != nullptr) {
+        note_vrs_graphics_pipeline(
+            static_cast<ID3D12PipelineState*>(*pipeline_state), *desc);
+    }
+    return hr;
+}
+
+HRESULT STDMETHODCALLTYPE hook_create_compute_pipeline_state_vrs(
+    ID3D12Device* device,
+    const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc,
+    REFIID riid,
+    void** pipeline_state) {
+    const HRESULT hr = hook_create_compute_pipeline_state(
+        device, desc, riid, pipeline_state);
+    if (SUCCEEDED(hr) && pipeline_state != nullptr &&
+        *pipeline_state != nullptr) {
+        note_vrs_compute_pipeline(
+            static_cast<ID3D12PipelineState*>(*pipeline_state));
+    }
+    return hr;
+}
+
+HRESULT STDMETHODCALLTYPE hook_reset_command_list_vrs(
+    ID3D12GraphicsCommandList* command_list,
+    ID3D12CommandAllocator* allocator,
+    ID3D12PipelineState* initial_state) {
+    const HRESULT result =
+        hook_reset_command_list(command_list, allocator, initial_state);
+    if (SUCCEEDED(result)) {
+        reset_vrs_list_rate(command_list, initial_state);
+    }
+    return result;
+}
+
+void STDMETHODCALLTYPE hook_set_pipeline_state_vrs(
+    ID3D12GraphicsCommandList* command_list,
+    ID3D12PipelineState* pipeline_state) {
+    hook_set_pipeline_state(command_list, pipeline_state);
+    // The engine's PSO decides the class; the bridge's HUD substitutes
+    // replace only excluded HUD-composite PSOs.
+    apply_vrs_pipeline_rate(command_list, pipeline_state);
+}
+
+void STDMETHODCALLTYPE hook_clear_state_vrs(
+    ID3D12GraphicsCommandList* command_list,
+    ID3D12PipelineState* pipeline_state) {
+    g_clear_state(command_list, pipeline_state);
+    reset_vrs_list_rate(command_list, pipeline_state);
+}
+
+HRESULT STDMETHODCALLTYPE hook_close_command_list_vrs(
+    ID3D12GraphicsCommandList* command_list) {
+    // A failed Close also ends the recording; the list needs a Reset.
+    const HRESULT result = g_close_command_list(command_list);
+    reset_vrs_list_rate(command_list, nullptr);
+    return result;
+}
+
+// [PERF:CPU-MEASUREMENT 2/5] REDengine's job wait on 5.01 (0x141D53740):
+// spins with pause backoff, then SwitchToThread, then Sleep(1), until the
+// job counter at (*handle)+0x10 reaches zero. The render thread spends a
+// large share of its time here; timing it per return address shows which
+// render stage waits on which jobs.
+using EngineJobWaitFn = void(__fastcall*)(void*);
+EngineJobWaitFn g_engine_job_wait{};
+constexpr uintptr_t kRemaster501JobWaitRva = 0x1D53740;
+constexpr std::array<uint8_t, 10> kRemaster501JobWaitPrologue{
+    0x48, 0x89, 0x5C, 0x24, 0x08, 0x57, 0x48, 0x83, 0xEC, 0x30};
+
+struct JobWaitSite {
+    std::atomic<uintptr_t> return_address{};
+    std::atomic<uint64_t> calls{};
+    std::atomic<uint64_t> ticks{};
+    std::atomic<uint32_t> thread_id{};
+    uint8_t kind{};
+    uint64_t previous_calls{};
+    uint64_t previous_ticks{};
+};
+
+// The same table also times REDengine's staged-object wait 0x141BF9770
+// (spins with pause until [obj+0x40] passes the requested stage, running the
+// next stage itself when it wins [obj+0x100]) and the command-buffer state
+// poll 0x141C69AE0 ("EXEC"/"REST"); the kind tells them apart in the log.
+enum class EngineWaitKind : uint8_t { Job = 0, Stage = 1, CommandPoll = 2 };
+constexpr const char* kEngineWaitKindNames[] = {"job", "stage", "cmdpoll"};
+
+using EngineStageWaitFn = void(__fastcall*)(void*, int32_t);
+using EngineCommandPollFn = uint8_t(__fastcall*)(void*, void*);
+EngineStageWaitFn g_engine_stage_wait{};
+EngineCommandPollFn g_engine_command_poll{};
+constexpr uintptr_t kRemaster501StageWaitRva = 0x1BF9770;
+constexpr std::array<uint8_t, 10> kRemaster501StageWaitPrologue{
+    0x48, 0x89, 0x5C, 0x24, 0x10, 0x57, 0x48, 0x83, 0xEC, 0x30};
+constexpr uintptr_t kRemaster501CommandPollRva = 0x1C69AE0;
+constexpr std::array<uint8_t, 16> kRemaster501CommandPollPrologue{
+    0x48, 0x89, 0x5C, 0x24, 0x18, 0x55, 0x56, 0x57, 0x41, 0x56, 0x41, 0x57,
+    0x48, 0x83, 0xEC, 0x20};
+
+std::array<JobWaitSite, 64> g_job_wait_sites{};
+std::atomic<uint64_t> g_job_wait_site_overflow{};
+
+void record_engine_wait_site(uintptr_t return_address, EngineWaitKind kind,
+    int64_t ticks) {
+    for (auto& site : g_job_wait_sites) {
+        auto key = site.return_address.load(std::memory_order_acquire);
+        if (key == 0) {
+            uintptr_t expected{};
+            if (site.return_address.compare_exchange_strong(
+                    expected, return_address, std::memory_order_acq_rel)) {
+                site.kind = static_cast<uint8_t>(kind);
+                key = return_address;
+            } else {
+                key = expected;
+            }
+        }
+        if (key == return_address) {
+            site.calls.fetch_add(1, std::memory_order_relaxed);
+            site.ticks.fetch_add(static_cast<uint64_t>(ticks),
+                std::memory_order_relaxed);
+            site.thread_id.store(GetCurrentThreadId(), std::memory_order_relaxed);
+            return;
+        }
+    }
+    g_job_wait_site_overflow.fetch_add(1, std::memory_order_relaxed);
+}
+
+void __fastcall hook_engine_job_wait(void* handle) {
+    const auto return_address = reinterpret_cast<uintptr_t>(_ReturnAddress());
+    LARGE_INTEGER begin{};
+    LARGE_INTEGER end{};
+    QueryPerformanceCounter(&begin);
+    g_engine_job_wait(handle);
+    QueryPerformanceCounter(&end);
+    record_engine_wait_site(return_address, EngineWaitKind::Job,
+        end.QuadPart - begin.QuadPart);
+}
+
+void __fastcall hook_engine_stage_wait(void* object, int32_t stage) {
+    const auto return_address = reinterpret_cast<uintptr_t>(_ReturnAddress());
+    LARGE_INTEGER begin{};
+    LARGE_INTEGER end{};
+    QueryPerformanceCounter(&begin);
+    g_engine_stage_wait(object, stage);
+    QueryPerformanceCounter(&end);
+    record_engine_wait_site(return_address, EngineWaitKind::Stage,
+        end.QuadPart - begin.QuadPart);
+}
+
+uint8_t __fastcall hook_engine_command_poll(void* object, void* state) {
+    const auto return_address = reinterpret_cast<uintptr_t>(_ReturnAddress());
+    LARGE_INTEGER begin{};
+    LARGE_INTEGER end{};
+    QueryPerformanceCounter(&begin);
+    const uint8_t result = g_engine_command_poll(object, state);
+    QueryPerformanceCounter(&end);
+    record_engine_wait_site(return_address, EngineWaitKind::CommandPoll,
+        end.QuadPart - begin.QuadPart);
+    return result;
+}
+
+bool install_engine_wait_hook(uint8_t* module, uintptr_t rva,
+    const uint8_t* prologue, size_t prologue_size, void* detour, void** original,
+    const char* name) {
+    auto* target = module + rva;
+    if (std::memcmp(target, prologue, prologue_size) != 0) {
+        log_vrs_line("PERF %s wait profile off: prologue mismatch", name);
+        return false;
+    }
+    if (MH_CreateHook(target, detour, original) == MH_OK &&
+        MH_EnableHook(target) == MH_OK) {
+        log_vrs_line("PERF %s wait profile on target=%p", name, target);
+        return true;
+    }
+    *original = nullptr;
+    log_vrs_line("PERF %s wait profile hook failed target=%p", name, target);
+    return false;
+}
+
+void install_job_wait_profile_hook() {
+    if (!g_config.perf_job_wait_profile || g_engine_job_wait != nullptr) {
+        return;
+    }
+    auto* module = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
+    if (running_game_build() != w3vr::game_build::Build::Remaster501 ||
+        module == nullptr) {
+        g_config.perf_job_wait_profile = false;
+        log_vrs_line("PERF job wait profile off: build mismatch");
+        return;
+    }
+    if (!install_engine_wait_hook(module, kRemaster501JobWaitRva,
+            kRemaster501JobWaitPrologue.data(), kRemaster501JobWaitPrologue.size(),
+            reinterpret_cast<void*>(&hook_engine_job_wait),
+            reinterpret_cast<void**>(&g_engine_job_wait), "job")) {
+        g_config.perf_job_wait_profile = false;
+        return;
+    }
+    install_engine_wait_hook(module, kRemaster501StageWaitRva,
+        kRemaster501StageWaitPrologue.data(), kRemaster501StageWaitPrologue.size(),
+        reinterpret_cast<void*>(&hook_engine_stage_wait),
+        reinterpret_cast<void**>(&g_engine_stage_wait), "stage");
+    install_engine_wait_hook(module, kRemaster501CommandPollRva,
+        kRemaster501CommandPollPrologue.data(),
+        kRemaster501CommandPollPrologue.size(),
+        reinterpret_cast<void*>(&hook_engine_command_poll),
+        reinterpret_cast<void**>(&g_engine_command_poll), "cmdpoll");
+}
+
+// Called from the census under g_vrs_census_busy. Sites are printed as
+// preferred-base VAs (0x14xxxxxxx) so they match the RE notes.
+void log_job_wait_profile_locked(uint64_t window_presents, int64_t qpc_frequency) {
+    if (!g_config.perf_job_wait_profile || qpc_frequency <= 0 ||
+        window_presents == 0) {
+        return;
+    }
+    const auto module = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    for (auto& site : g_job_wait_sites) {
+        const auto return_address =
+            site.return_address.load(std::memory_order_acquire);
+        if (return_address == 0) {
+            break;
+        }
+        const uint64_t calls = site.calls.load(std::memory_order_relaxed);
+        const uint64_t ticks = site.ticks.load(std::memory_order_relaxed);
+        const uint64_t window_calls = calls - site.previous_calls;
+        const double window_ms = 1000.0 *
+            static_cast<double>(ticks - site.previous_ticks) /
+            static_cast<double>(qpc_frequency);
+        site.previous_calls = calls;
+        site.previous_ticks = ticks;
+        if (window_calls == 0) {
+            continue;
+        }
+        log_vrs_line(
+            "PERF job wait kind=%s site=0x%llX tid=%u calls_per_present=%.2f "
+            "ms_per_present=%.3f window_ms=%.1f",
+            kEngineWaitKindNames[site.kind < 3 ? site.kind : 0],
+            static_cast<unsigned long long>(return_address - module + 0x140000000ull),
+            site.thread_id.load(std::memory_order_relaxed),
+            static_cast<double>(window_calls) / static_cast<double>(window_presents),
+            window_ms / static_cast<double>(window_presents), window_ms);
+    }
+    const auto overflow = g_job_wait_site_overflow.load(std::memory_order_relaxed);
+    if (overflow != 0) {
+        log_vrs_line("PERF job wait site table overflow calls=%llu",
+            static_cast<unsigned long long>(overflow));
+    }
+}
+
+// [PERF:DESCRIPTOR-SHADOW-STORE 7/14] Called from the census under
+// g_vrs_census_busy. The store in use every window (legacy too, so an A/B
+// log shows it); the shadow store's size and guard counters; with
+// verification, per-kind comparison counts as +window/total and each new
+// example once.
+void log_descriptor_shadow_census_locked() {
+    if (!descriptor_shadow_store_maintained()) {
+        log_vrs_line("PERF descriptor store=legacy verify=0");
+        return;
+    }
+    const uint64_t pages =
+        g_descriptor_shadow_pages.load(std::memory_order_relaxed);
+    log_vrs_line(
+        "PERF descriptor store=%s verify=%d pages=%llu shadow_mib=%.1f "
+        "directory_overflows=%llu alloc_failures=%llu owner_collisions=%llu "
+        "increment_mismatches=%llu long_waits=%llu",
+        descriptor_shadow_store_selected() ? "shadow" : "legacy",
+        g_config.perf_descriptor_shadow_verify ? 1 : 0,
+        static_cast<unsigned long long>(pages),
+        static_cast<double>(pages * sizeof(DescriptorShadowPage)) /
+            (1024.0 * 1024.0),
+        static_cast<unsigned long long>(
+            g_descriptor_shadow_directory_overflows.load(
+                std::memory_order_relaxed)),
+        static_cast<unsigned long long>(
+            g_descriptor_shadow_alloc_failures.load(
+                std::memory_order_relaxed)),
+        static_cast<unsigned long long>(
+            g_descriptor_shadow_owner_collisions.load(
+                std::memory_order_relaxed)),
+        static_cast<unsigned long long>(
+            g_descriptor_shadow_increment_mismatches.load(
+                std::memory_order_relaxed)),
+        static_cast<unsigned long long>(
+            g_descriptor_shadow_long_waits.load(std::memory_order_relaxed)));
+    if (!g_config.perf_descriptor_shadow_verify) {
+        return;
+    }
+    static constexpr const char* kKindNames[] = {
+        "cbv", "resource_fast", "witcher_sense"};
+    static constexpr const char* kListNames[] = {
+        "differ", "shadow_only", "legacy_only"};
+    // Previous totals; the census is serialized, so plain statics suffice.
+    // The last column is copy_source_lost.
+    static std::array<std::array<uint64_t,
+        kDescriptorShadowVerifyResultCount + 1>,
+        kDescriptorShadowVerifyKindCount> previous{};
+    for (size_t kind = 0; kind < kDescriptorShadowVerifyKindCount; ++kind) {
+        std::array<unsigned long long,
+            kDescriptorShadowVerifyResultCount + 1> total{};
+        std::array<unsigned long long,
+            kDescriptorShadowVerifyResultCount + 1> window{};
+        for (size_t column = 0; column < total.size(); ++column) {
+            const uint64_t value = column < kDescriptorShadowVerifyResultCount
+                ? g_descriptor_shadow_verify_counts[kind][column].load(
+                    std::memory_order_relaxed)
+                : g_descriptor_shadow_verify_copy_source_lost[kind].load(
+                    std::memory_order_relaxed);
+            total[column] = static_cast<unsigned long long>(value);
+            window[column] =
+                static_cast<unsigned long long>(value - previous[kind][column]);
+            previous[kind][column] = value;
+        }
+        const auto column = [](DescriptorShadowVerifyResult result) {
+            return static_cast<size_t>(result);
+        };
+        const size_t lost = kDescriptorShadowVerifyResultCount;
+        log_vrs_line(
+            "PERF descriptor verify kind=%s match=+%llu/%llu "
+            "empty=+%llu/%llu legacy_only_stale=+%llu/%llu "
+            "legacy_only=+%llu/%llu shadow_only=+%llu/%llu "
+            "differ=+%llu/%llu transient=+%llu/%llu "
+            "copy_source_lost=+%llu/%llu",
+            kKindNames[kind],
+            window[column(DescriptorShadowVerifyResult::Match)],
+            total[column(DescriptorShadowVerifyResult::Match)],
+            window[column(DescriptorShadowVerifyResult::Empty)],
+            total[column(DescriptorShadowVerifyResult::Empty)],
+            window[column(DescriptorShadowVerifyResult::LegacyOnlyStale)],
+            total[column(DescriptorShadowVerifyResult::LegacyOnlyStale)],
+            window[column(DescriptorShadowVerifyResult::LegacyOnly)],
+            total[column(DescriptorShadowVerifyResult::LegacyOnly)],
+            window[column(DescriptorShadowVerifyResult::ShadowOnly)],
+            total[column(DescriptorShadowVerifyResult::ShadowOnly)],
+            window[column(DescriptorShadowVerifyResult::Differ)],
+            total[column(DescriptorShadowVerifyResult::Differ)],
+            window[column(DescriptorShadowVerifyResult::Transient)],
+            total[column(DescriptorShadowVerifyResult::Transient)],
+            window[lost], total[lost]);
+    }
+    for (size_t list = 0; list < kDescriptorShadowVerifyExampleLists; ++list) {
+        for (auto& example : g_descriptor_shadow_verify_examples[list]) {
+            if (example.logged ||
+                !example.ready.load(std::memory_order_acquire)) {
+                continue;
+            }
+            example.logged = true;
+            log_vrs_line(
+                "PERF descriptor verify example result=%s kind=%s "
+                "handle=0x%zX shadow=0x%llX,%llu,%llu,%llu "
+                "legacy=0x%llX,%llu,%llu,%llu",
+                kListNames[list],
+                kKindNames[static_cast<size_t>(example.kind)],
+                example.cpu_handle,
+                static_cast<unsigned long long>(example.shadow[0]),
+                static_cast<unsigned long long>(example.shadow[1]),
+                static_cast<unsigned long long>(example.shadow[2]),
+                static_cast<unsigned long long>(example.shadow[3]),
+                static_cast<unsigned long long>(example.legacy[0]),
+                static_cast<unsigned long long>(example.legacy[1]),
+                static_cast<unsigned long long>(example.legacy[2]),
+                static_cast<unsigned long long>(example.legacy[3]));
+        }
+    }
+}
+
+// Runs once with the game's device, before the renderer detours are
+// installed, so it decides which detours install_reverse_hooks and
+// install_command_list_hooks create.
+void initialize_vrs_measurement(ID3D12Device* device) {
+    static std::once_flag once;
+    std::call_once(once, [device]() {
+        if (g_config.vrs_mode != kVrsModeUniform) {
+            return;
+        }
+        // [PERF:CPU-MEASUREMENT 3/5]
+        install_job_wait_profile_hook();
+        if (device == nullptr || !renderer_hook_installation_needed()) {
+            g_config.vrs_mode = kVrsModeOff;
+            log_vrs_line(
+                "VRS off: renderer detours are not installed (device=%p "
+                "openxr_enabled=%d mode=%d)",
+                device, g_config.openxr_enabled ? 1 : 0,
+                g_config.openxr_mode);
+            return;
+        }
+        D3D12_FEATURE_DATA_D3D12_OPTIONS6 options6{};
+        const HRESULT hr = device->CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS6, &options6, sizeof(options6));
+        log_vrs_line(
+            "VRS caps hr=0x%08X tier=%d tile=%u additional_rates=%d "
+            "per_primitive_viewport_indexing=%d background_processing=%d "
+            "build=%s",
+            static_cast<unsigned>(hr),
+            static_cast<int>(options6.VariableShadingRateTier),
+            options6.ShadingRateImageTileSize,
+            options6.AdditionalShadingRatesSupported ? 1 : 0,
+            options6.PerPrimitiveShadingRateSupportedWithViewportIndexing
+                ? 1 : 0,
+            options6.BackgroundProcessingSupported ? 1 : 0,
+            w3vr::game_build::name(running_game_build()));
+        if (FAILED(hr) || options6.VariableShadingRateTier <
+                D3D12_VARIABLE_SHADING_RATE_TIER_1) {
+            g_config.vrs_mode = kVrsModeOff;
+            log_vrs_line("VRS off: VariableShadingRateTier %d is below 1",
+                FAILED(hr) ? 0 :
+                    static_cast<int>(options6.VariableShadingRateTier));
+            return;
+        }
+        if (vrs_rate_is_additional(g_config.vrs_uniform_rate) &&
+            !options6.AdditionalShadingRatesSupported) {
+            log_vrs_line(
+                "VRS uniform_rate=%s needs AdditionalShadingRatesSupported; "
+                "clamped to 2x2",
+                vrs_rate_name(g_config.vrs_uniform_rate));
+            g_config.vrs_uniform_rate = D3D12_SHADING_RATE_2X2;
+        }
+        LARGE_INTEGER now{};
+        QueryPerformanceCounter(&now);
+        const uint64_t present =
+            g_present_count.load(std::memory_order_relaxed);
+        g_vrs_census_window_present = present;
+        g_vrs_census_window_qpc = now.QuadPart;
+        g_vrs_census_next_present.store(
+            present + kVrsCensusPresentInterval, std::memory_order_relaxed);
+        g_vrs_measurement_active.store(true, std::memory_order_release);
+        log_vrs_line(
+            "VRS measurement on mode=%d rate=%s classes=%s "
+            "census_interval=%llu runtime_diagnostics=%d",
+            g_config.vrs_mode, vrs_rate_name(g_config.vrs_uniform_rate),
+            vrs_class_list(g_config.vrs_class_mask).c_str(),
+            static_cast<unsigned long long>(kVrsCensusPresentInterval),
+            g_config.runtime_diagnostics ? 1 : 0);
+    });
+}
+
 void load_config() {
     std::call_once(g_config_once, []() {
         g_config.renderdoc_capture_enabled = read_ini_bool(
@@ -14431,8 +16997,25 @@ void load_config() {
             read_ini_int("openxr", "hud_stereo_shift_px", -16), -256, 256);
         g_config.hud_size = std::clamp(
             read_ini_float("openxr", "hud_size", 1.0f), 0.5f, 1.5f);
+        g_config.hud_filtered_sampling =
+            read_ini_bool("openxr", "hud_filtered_sampling", true);
+        g_config.hud_anchor_level =
+            read_ini_bool("openxr", "hud_anchor_level", true);
+        g_config.hud_scale_origin_visible = read_ini_string(
+            "openxr", "hud_scale_origin", "visible") != "render";
+        g_config.menu_center_visible = read_ini_string(
+            "openxr", "menu_vertical_center", "visible") != "forward";
         g_config.hud_controller_locked =
             read_ini_bool("openxr", "hud_controller_locked", false);
+        {
+            const auto hud_fade_mode = read_ini_string(
+                "openxr", "hud_fade_mode", "remove");
+            g_config.hud_fade_mode = hud_fade_mode == "native"
+                ? Config::HudFadeMode::Native
+                : hud_fade_mode == "uniform"
+                ? Config::HudFadeMode::Uniform
+                : Config::HudFadeMode::Remove;
+        }
         {
             const auto recenter_key = read_ini_string(
                 "openxr", "recenter_key", "F9");
@@ -14490,6 +17073,10 @@ void load_config() {
             "openxr", "disable_desktop_vsync", true);
         g_config.pipeline_frame_wait = read_ini_bool(
             "openxr", "pipeline_frame_wait", true);
+        g_config.frame_wait_early = read_ini_bool(
+            "openxr", "frame_wait_early", false);
+        g_config.pair_rate_divisor = std::clamp(
+            read_ini_int("openxr", "pair_rate_divisor", 0), 0, 6);
         g_config.hmd_yaw_scale = std::clamp(
             read_ini_float("openxr", "hmd_yaw_scale", 1.0f), -2.0f, 2.0f);
         g_config.hmd_pitch_scale = std::clamp(
@@ -14526,6 +17113,10 @@ void load_config() {
         g_config.world_marker_vertical_offset_ndc = std::clamp(
             read_ini_float("openxr", "world_marker_vertical_offset_ndc", 0.24f),
             -0.5f, 0.5f);
+        g_config.world_marker_exact_projection = read_ini_bool(
+            "openxr", "world_marker_exact_projection", true);
+        g_config.hud_centre_split_aim_only = read_ini_bool(
+            "openxr", "hud_centre_split_aim_only", true);
         apply_hud_frame_scale();
 
         g_config.reverse_enabled = read_ini_bool("reverse", "enabled", false);
@@ -14589,6 +17180,22 @@ void load_config() {
             read_ini_float("engine", "close_camera_offset", 0.75f), -5.0f, 5.0f);
         g_config.engine_camera_mode = std::clamp(
             read_ini_int("engine", "camera_mode", 0), 0, 2);
+        // Verified on 5.01; 4.04 keeps the near view on the game's pitched
+        // axis unless the key is set.
+        g_config.close_camera_level = read_ini_bool(
+            "engine", "close_camera_level",
+            running_game_build() == w3vr::game_build::Build::Remaster501);
+        g_config.camera_center = std::clamp(
+            read_ini_float("engine", "camera_center", 1.0f), 0.0f, 1.0f);
+        g_config.camera_center_smoothing_seconds = std::clamp(
+            read_ini_float("engine", "camera_center_smoothing_seconds", 0.30f),
+            0.0f, 2.0f);
+        g_config.camera_center_max_m = std::clamp(
+            read_ini_float("engine", "camera_center_max_m", 1.5f), 0.0f, 3.0f);
+        g_config.cinema_restore_gameplay_recenter = read_ini_bool(
+            "openxr", "cinema_restore_gameplay_recenter", true);
+        g_config.camera_offset_trace =
+            read_ini_bool("debug", "camera_offset_trace", false);
         g_config.engine_first_person_camera_offset = std::clamp(
             read_ini_float("engine", "first_person_camera_offset", 1.880000257f),
             -5.0f, 5.0f);
@@ -14761,6 +17368,7 @@ void load_config() {
             read_ini_bool("debug", "shader_inventory_dump", false);
         g_config.test_record_input = read_ini_bool("test", "record_input", false);
         g_config.test_input_script = read_ini_string("test", "input_script", "");
+        g_config.test_openxr_loader = read_ini_string("test", "openxr_loader", "");
         g_config.pipeline_flight_recorder = read_ini_bool(
             "debug", "pipeline_flight_recorder", false);
         g_config.route_flight_recorder = read_ini_bool(
@@ -14819,6 +17427,113 @@ void load_config() {
             g_config.taau_drop_diagnostics = false;
         }
 
+        // [FEATURE:VRS-MEASUREMENT 4/8] A measurement runs with
+        // runtime_diagnostics=0, which also clears logging_enabled above, so
+        // its log follows [vrs] log alone. Every configurator writes the two
+        // [debug] switches together, and none of them writes [vrs]: the
+        // "diagnostics off" state they produce is the measurement state.
+        // Modes 1 and 2 are reserved for the foveated rate maps.
+        const int vrs_mode = read_ini_int("vrs", "mode", kVrsModeOff);
+        g_config.vrs_log_file = vrs_mode != kVrsModeOff &&
+            read_ini_bool("vrs", "log", true);
+        g_config.vrs_mode =
+            vrs_mode == kVrsModeUniform ? kVrsModeUniform : kVrsModeOff;
+        if (vrs_mode == 1 || vrs_mode == 2) {
+            log_vrs_line("VRS mode=%d is not in this build; VRS off", vrs_mode);
+        } else if (vrs_mode != kVrsModeOff && vrs_mode != kVrsModeUniform) {
+            log_vrs_line("VRS mode=%d is unknown; VRS off", vrs_mode);
+        }
+        if (g_config.vrs_mode == kVrsModeUniform) {
+            const auto vrs_rate = read_ini_string("vrs", "uniform_rate", "2x2");
+            if (!parse_vrs_rate(vrs_rate, g_config.vrs_uniform_rate)) {
+                g_config.vrs_uniform_rate = D3D12_SHADING_RATE_2X2;
+                log_vrs_line(
+                    "VRS uniform_rate=%s is not 1x1, 1x2, 2x1, 2x2, 2x4, 4x2 "
+                    "or 4x4; using 2x2",
+                    vrs_rate.c_str());
+            }
+            std::string unknown_classes;
+            g_config.vrs_class_mask = parse_vrs_classes(
+                read_ini_string("vrs", "classes", "gbuffer,decal,scene_hdr"),
+                unknown_classes);
+            if (!unknown_classes.empty()) {
+                log_vrs_line("VRS classes: ignored %s", unknown_classes.c_str());
+            }
+        } else {
+            g_config.vrs_log_file = false;
+        }
+        // [PERF:CPU-MEASUREMENT 4/5]
+        g_config.perf_skip_descriptor_tracking = g_config.vrs_log_file &&
+            read_ini_bool("perf", "skip_descriptor_tracking", false);
+        g_config.perf_job_wait_profile = g_config.vrs_log_file &&
+            read_ini_bool("perf", "job_wait_profile", false);
+        if (g_config.perf_skip_descriptor_tracking) {
+            log_vrs_line("PERF skip_descriptor_tracking=1: descriptor-copy metadata off");
+        }
+        // [PERF:PAIR-BARRIER-LAG 3/11] Read whatever the census log says; the
+        // census only reports the waits. Only the 5.01 pipeline has been
+        // audited for a second pair in flight (4.04 TAAU, Streamline DLSS
+        // and the world-marker hook have not), so other builds keep lag 0.
+        {
+            const int pair_barrier_lag =
+                read_ini_int("perf", "pair_barrier_lag", 0);
+            const bool lag_build_supported = running_game_build() ==
+                w3vr::game_build::Build::Remaster501;
+            g_config.perf_pair_barrier_lag = lag_build_supported
+                ? std::clamp(pair_barrier_lag, 0, 1)
+                : 0;
+            g_config.perf_pair_pose_lead_adaptive =
+                read_ini_bool("perf", "pair_pose_lead_adaptive", true);
+            if (pair_barrier_lag != 0) {
+                const char* const format =
+                    "PERF pair_barrier_lag=%d requested=%d build=%s "
+                    "pair_pose_lead_adaptive=%d";
+                const char* const build =
+                    w3vr::game_build::name(running_game_build());
+                if (g_config.vrs_log_file) {
+                    log_vrs_line(format, g_config.perf_pair_barrier_lag,
+                        pair_barrier_lag, build,
+                        g_config.perf_pair_pose_lead_adaptive ? 1 : 0);
+                } else {
+                    log_line(format, g_config.perf_pair_barrier_lag,
+                        pair_barrier_lag, build,
+                        g_config.perf_pair_pose_lead_adaptive ? 1 : 0);
+                }
+            }
+        }
+        // [PERF:DESCRIPTOR-SHADOW-STORE 8/14] Release switch: read whatever
+        // the [debug] switches say. Verification follows the other [perf]
+        // switches and needs the VRS census log.
+        {
+            const auto descriptor_store = read_ini_string(
+                "engine", "descriptor_metadata_store", "shadow");
+            g_config.descriptor_metadata_store = descriptor_store == "legacy"
+                ? DescriptorMetadataStore::Legacy
+                : DescriptorMetadataStore::Shadow;
+            if (descriptor_store != "shadow" && descriptor_store != "legacy") {
+                log_descriptor_store_line(
+                    "Descriptor metadata store %s is unknown; using shadow",
+                    descriptor_store.c_str());
+            }
+        }
+        g_config.perf_descriptor_shadow_verify = g_config.vrs_log_file &&
+            read_ini_bool("perf", "descriptor_shadow_verify", false);
+        if (g_config.perf_descriptor_shadow_verify) {
+            log_vrs_line(
+                "PERF descriptor_shadow_verify=1: shadow and legacy descriptor "
+                "stores both kept, every load compared (store=%s)",
+                descriptor_shadow_store_selected() ? "shadow" : "legacy");
+        }
+        // [PERF:PAIR-BARRIER-SPIN 2/3] Release switch, read whatever the
+        // [debug] switches say.
+        g_config.pair_barrier_spin_pauses = static_cast<uint32_t>(std::clamp(
+            read_ini_int("engine", "pair_barrier_spin_pauses", 4096),
+            0, 1 << 20));
+        log_vrs_line("PERF pair_barrier_spin_pauses=%u%s",
+            g_config.pair_barrier_spin_pauses,
+            g_config.pair_barrier_spin_pauses == 0
+                ? " (QPC-timed 200 us spin)" : "");
+
         const auto temporal_backend = read_ini_string(
             "engine", "temporal_backend", "auto");
         g_config.temporal_backend = parse_temporal_backend(
@@ -14829,11 +17544,56 @@ void load_config() {
         // DLSS backend would wait for submissions that never come: the packed
         // eye pair is then never accepted and both eyes show the alternating
         // backbuffer (flicker). Run the No-AA route there.
+        g_config.remaster_engine_dlss = false;
         if (running_game_build() == w3vr::game_build::Build::Remaster501 &&
             g_config.temporal_backend != TemporalBackend::None) {
-            log_line("Temporal backend %s not available on 5.01; using none",
-                temporal_backend.c_str());
+            // [FEATURE:REMASTER-ENGINE-DLSS 1/6] DLSS stays the game's own:
+            // the transport is No-AA, and per-eye histories come from
+            // per-eye Streamline viewports (see install_remaster_engine_dlss_hooks).
+            g_config.remaster_engine_dlss =
+                g_config.temporal_backend == TemporalBackend::Dlss;
+            g_config.remaster_dlss_per_eye_motion = read_ini_bool(
+                "engine", "remaster_dlss_per_eye_motion", true);
+            log_line("Temporal backend %s on 5.01: transport=none engine_dlss=%d per_eye_motion=%d",
+                temporal_backend.c_str(),
+                g_config.remaster_engine_dlss ? 1 : 0,
+                g_config.remaster_dlss_per_eye_motion ? 1 : 0);
             g_config.temporal_backend = TemporalBackend::None;
+        }
+
+        // [FEATURE:REMASTER-ASYMMETRIC-NDC 1/6] Per-eye asymmetric frusta on
+        // 5.01 through the engine's NDC projection offset; the 4.04 centre
+        // path (native_stereo / projection shift) stays off because 5.01's
+        // temporal writer owns the centre block as DLSS jitter.
+        g_config.remaster_asymmetric_ndc = false;
+        if (running_game_build() == w3vr::game_build::Build::Remaster501) {
+            g_config.remaster_asymmetric_ndc =
+                read_ini_bool("engine", "remaster_asymmetric_ndc", false);
+            g_config.remaster_asymmetric_ndc_reproject =
+                read_ini_bool("engine", "remaster_asymmetric_ndc_reproject", true);
+            g_config.remaster_asymmetric_ndc_cascade_fix =
+                read_ini_bool("engine", "remaster_asymmetric_ndc_cascade_fix", true);
+        }
+        if (g_config.remaster_asymmetric_ndc) {
+            g_config.engine_native_projection_shift = false;
+        }
+        // [FEATURE:REMASTER-SHADOW-PAIR-REUSE 1/7] Sun shadow cascades once
+        // per stereo pair (0 off, 1 reuse, 9 depth-pass skip only). The
+        // profile follows the other [perf] switches and needs the census log.
+        g_config.remaster_shadow_pair_reuse = 0;
+        g_config.perf_shadow_profile = false;
+        if (running_game_build() == w3vr::game_build::Build::Remaster501) {
+            const int shadow_pair_reuse =
+                read_ini_int("engine", "remaster_shadow_pair_reuse", 0);
+            g_config.remaster_shadow_pair_reuse =
+                shadow_pair_reuse == 1 || shadow_pair_reuse == 9
+                    ? shadow_pair_reuse : 0;
+            if (g_config.remaster_shadow_pair_reuse != shadow_pair_reuse) {
+                log_line("Shadow pair reuse mode=%d is unknown; off",
+                    shadow_pair_reuse);
+            }
+            g_config.perf_shadow_profile = g_config.vrs_log_file &&
+                read_ini_bool("perf", "shadow_profile", false);
         }
 
         if (temporal_backend_is_dlss()) {
@@ -14842,6 +17602,28 @@ void load_config() {
         } else {
             g_config.ngx_trace = false;
             g_config.streamline_taau_bridge = false;
+        }
+
+        // Local lights
+        // [FEATURE:REMASTER-LOCAL-LIGHTS 1/2] Every key defaults to the
+        // engine's own behaviour; see install_remaster_local_light_hooks.
+        g_config.remaster_local_light_diag = false;
+        g_config.remaster_local_shadow_slices = 1;
+        g_config.remaster_local_shadow_sort_corrected = false;
+        g_config.remaster_light_flicker_per_pair = false;
+        g_config.remaster_local_light_pair_lock = false;
+        if (running_game_build() == w3vr::game_build::Build::Remaster501) {
+            g_config.remaster_local_light_diag =
+                read_ini_bool("engine", "remaster_local_light_diag", false);
+            // The atlas packs the slice into 2 bits of each tile (4 at most).
+            g_config.remaster_local_shadow_slices = std::clamp(
+                read_ini_int("engine", "remaster_local_shadow_slices", 1), 1, 4);
+            g_config.remaster_local_shadow_sort_corrected = read_ini_bool(
+                "engine", "remaster_local_shadow_sort_corrected", false);
+            g_config.remaster_light_flicker_per_pair = read_ini_bool(
+                "engine", "remaster_light_flicker_per_pair", false);
+            g_config.remaster_local_light_pair_lock = read_ini_bool(
+                "engine", "remaster_local_light_pair_lock", false);
         }
 
         if (clean_mono_transport_active()) {
@@ -14862,6 +17644,7 @@ void load_config() {
             g_config.engine_sync_swap_eyes = false;
             g_config.engine_taau_reverse_eye_order = false;
             g_config.engine_native_projection_shift = false;
+            g_config.remaster_asymmetric_ndc = false;
             g_config.engine_native_stereo_offset = 0.0f;
             g_config.engine_factory_stereo_offset = 0.0f;
             g_config.reverse_geometry_shift = false;
@@ -14895,6 +17678,8 @@ void load_config() {
             !g_config.logging_enabled &&
             !g_config.cinema_camera_diagnostics &&
             !g_config.streamline_trace;
+        // [PERF:DESCRIPTOR-COPY-ROUTE 2/4] Every route input is final here.
+        refresh_descriptor_copy_route_mask();
         if (taau_drop_diagnostics_active()) {
             log_taau_trace_line(
                 "TAAU drop trace enabled mode=%d backend=%s general_logging=%d runtime_diagnostics=%d",
@@ -14928,6 +17713,20 @@ void load_config() {
             g_config.reverse_copy_max_logs,
             g_config.reverse_stereo_probe,
             g_config.reverse_geometry_shift);
+        log_line("Config HUD size=%.3f stereo_shift_px=%d controller_locked=%d filtered_sampling=%d anchor_level=%d scale_origin=%s menu_vertical_center=%s",
+            g_config.hud_size, g_config.hud_stereo_shift_px,
+            g_config.hud_controller_locked ? 1 : 0,
+            g_config.hud_filtered_sampling ? 1 : 0,
+            g_config.hud_anchor_level ? 1 : 0,
+            g_config.hud_scale_origin_visible ? "visible" : "render",
+            g_config.menu_center_visible ? "visible" : "forward");
+        log_line("RANDC config requested=%d reproject=%d cascade_fix=%d offset_index=0x%zX reprojection_index=0x%zX mode=%d native_stereo=%d hmd_freelook=%d",
+            g_config.remaster_asymmetric_ndc ? 1 : 0,
+            g_config.remaster_asymmetric_ndc_reproject ? 1 : 0,
+            g_config.remaster_asymmetric_ndc_cascade_fix ? 1 : 0,
+            engine_view_projection_offset(), engine_view_reprojection_matrix(),
+            g_config.openxr_mode, g_config.native_stereo ? 1 : 0,
+            g_config.hmd_freelook ? 1 : 0);
         log_line("Config engine temporal_backend=%s dlss_dlaa=%d dlss_owner=private_ngx optiscaler=%d view_probe=%d frame_builder_probe=%d gameplay_entry_probe=%d scene_enqueue_probe=%d view_factory_probe=%d frame_factory_probe=%d dual_render_probe=%d native_stereo_offset=%.3f factory_stereo_offset=%.4f streamline_force_reset=%d streamline_viewports=native_single streamline_trace=%d streamline_trace_start_frame=%d native_mvec_passthrough=1",
             temporal_backend_name(),
             g_config.dlss_dlaa,
@@ -15932,6 +18731,8 @@ void replay_native_temporal_terrain_indexed_motion(
         log_native_temporal_terrain_binding_failure(original, alias_stage);
         return;
     }
+    // [FEATURE:VRS-MEASUREMENT 8/8] The replay is the mod's own draw.
+    VrsModDrawScope vrs_mod_draw{command_list};
     g_set_pipeline_state(command_list, replay);
     g_draw_indexed_instanced(
         command_list, index_count_per_instance, instance_count,
@@ -15962,6 +18763,7 @@ void replay_native_temporal_terrain_nonindexed_motion(
         log_native_temporal_terrain_binding_failure(original, alias_stage);
         return;
     }
+    VrsModDrawScope vrs_mod_draw{command_list};
     g_set_pipeline_state(command_list, replay);
     g_draw_instanced(
         command_list, vertex_count_per_instance, instance_count,
@@ -16201,15 +19003,27 @@ bool derive_asymmetric_bootstrap_hud_source_shifts(
     std::array<float, 2>& optical_offsets_x,
     std::array<float, 2>& optical_offsets_y,
     std::array<float, 2>& hud_sizes) {
+    // Runtimes without a usable visibility mask (WiVRn returns an empty one,
+    // the null HMD has none) fall back to the eye FOVs when 5.01 renders
+    // per-eye frusta, whose image is exactly that FOV.
+    const bool runtime_mask =
+        g_xr_visibility_bounds_valid.load(std::memory_order_acquire);
+    const bool eye_fov_fallback = !runtime_mask &&
+        remaster_asymmetric_ndc_configured() && g_xr_views.size() >= 2;
     if (!mode3_stereo_transport_active() ||
         mode3_aer_presentation_active() ||
-        !g_xr_visibility_bounds_valid.load(std::memory_order_acquire) ||
+        (!runtime_mask && !eye_fov_fallback) ||
         g_game_render_width == 0 || g_game_render_height == 0) {
         return false;
     }
 
-    const float symmetric_half_tangent =
-        g_xr_visibility_half_tan_x.load(std::memory_order_acquire);
+    const float symmetric_half_tangent = runtime_mask
+        ? g_xr_visibility_half_tan_x.load(std::memory_order_acquire)
+        : std::max(
+            std::max(fabsf(tanf(g_xr_views[0].fov.angleLeft)),
+                fabsf(tanf(g_xr_views[0].fov.angleRight))),
+            std::max(fabsf(tanf(g_xr_views[1].fov.angleLeft)),
+                fabsf(tanf(g_xr_views[1].fov.angleRight))));
     const float symmetric_horizontal_span =
         2.0f * symmetric_half_tangent;
     if (!std::isfinite(symmetric_horizontal_span) ||
@@ -16217,13 +19031,18 @@ bool derive_asymmetric_bootstrap_hud_source_shifts(
         return false;
     }
     for (uint32_t eye = 0; eye < 2; ++eye) {
-        const auto bounds = g_xr_visibility_bounds[eye];
-        if (!bounds.valid) {
-            return false;
+        XrFovf runtime_fov{};
+        if (runtime_mask) {
+            const auto bounds = g_xr_visibility_bounds[eye];
+            if (!bounds.valid) {
+                return false;
+            }
+            runtime_fov = {
+                atanf(bounds.min_x), atanf(bounds.max_x),
+                atanf(bounds.max_y), atanf(bounds.min_y)};
+        } else {
+            runtime_fov = g_xr_views[eye].fov;
         }
-        const XrFovf runtime_fov{
-            atanf(bounds.min_x), atanf(bounds.max_x),
-            atanf(bounds.max_y), atanf(bounds.min_y)};
         w3vr::openxr_eye_geometry::AsymmetricProjectionDescriptor
             descriptor{};
         if (!w3vr::openxr_eye_geometry::
@@ -19925,45 +22744,63 @@ bool resolve_descriptor_table_resource(
         descriptor_out, cpu_handle_out);
 }
 
+// [PERF:DESCRIPTOR-SHADOW-STORE 9/14] The g_resource_descriptors propagation
+// (TAAU and RT; the caller holds g_reverse_mutex) is shared unchanged by both
+// stores. Only the retained-HUD resource mirror it refreshes differs.
+bool propagate_legacy_resource_descriptor(
+    SIZE_T dest_cpu, SIZE_T src_cpu, bool shadow_resource_mirror) {
+    auto resource_it = g_resource_descriptors.find(src_cpu);
+    if (resource_it == g_resource_descriptors.end()) {
+        return false;
+    }
+    g_resource_descriptors[dest_cpu] = resource_it->second;
+    if (shadow_resource_mirror) {
+        store_resource_descriptor_fast_shadow(
+            dest_cpu, resource_it->second.resource,
+            resource_it->second.format);
+    } else {
+        store_resource_descriptor_fast_legacy(
+            dest_cpu, resource_it->second.resource,
+            resource_it->second.format);
+    }
+    const uint32_t propagated_bit =
+        resource_it->second.format == DXGI_FORMAT_R16G16B16A16_FLOAT ? 1u : 2u;
+    const uint32_t previous_mask =
+        g_taau_descriptor_propagated_mask.fetch_or(propagated_bit);
+    if ((previous_mask & propagated_bit) == 0) {
+        log_line("TAAU bootstrap propagated type=%s src=0x%zX dest=0x%zX",
+            propagated_bit == 1 ? "motion" : "depth", src_cpu, dest_cpu);
+    }
+    return true;
+}
+
+// Legacy-store copy, used only by the per-descriptor loop of the copy hooks.
 void copy_cbv_descriptor_metadata(
     SIZE_T dest_cpu,
     SIZE_T src_cpu,
     UINT increment,
     bool copy_legacy_resource_metadata) {
     CbvDescriptorInfo source_cbv{};
-    const bool cbv_copied = load_cbv_descriptor(src_cpu, source_cbv);
+    const bool cbv_copied = load_cbv_descriptor_legacy(src_cpu, source_cbv);
     if (cbv_copied) {
-        store_cbv_descriptor(dest_cpu, source_cbv);
+        store_cbv_descriptor_legacy(dest_cpu, source_cbv);
     }
     bool copied = cbv_copied;
     ID3D12Resource* fast_resource{};
     DXGI_FORMAT fast_format{DXGI_FORMAT_UNKNOWN};
-    if (load_resource_descriptor_fast(
+    if (load_resource_descriptor_fast_legacy(
             src_cpu, fast_resource, fast_format)) {
-        store_resource_descriptor_fast(dest_cpu, fast_resource, fast_format);
+        store_resource_descriptor_fast_legacy(
+            dest_cpu, fast_resource, fast_format);
         copied = true;
     }
     // [PERF:NOAA-DESCRIPTOR-COPY V1441 1/3] Smoke, foliage and focus consume
     // the lock-free CBV cache; retained HUD consumes the lock-free resource
     // mirror. The legacy map is populated only by TAAU, RT or diagnostics, so
     // do not probe it (under g_reverse_mutex) in a clean No-AA run.
-    if (copy_legacy_resource_metadata) {
-        auto resource_it = g_resource_descriptors.find(src_cpu);
-        if (resource_it != g_resource_descriptors.end()) {
-            g_resource_descriptors[dest_cpu] = resource_it->second;
-            store_resource_descriptor_fast(
-                dest_cpu, resource_it->second.resource,
-                resource_it->second.format);
-            const uint32_t propagated_bit =
-                resource_it->second.format == DXGI_FORMAT_R16G16B16A16_FLOAT ? 1u : 2u;
-            const uint32_t previous_mask =
-                g_taau_descriptor_propagated_mask.fetch_or(propagated_bit);
-            if ((previous_mask & propagated_bit) == 0) {
-                log_line("TAAU bootstrap propagated type=%s src=0x%zX dest=0x%zX",
-                    propagated_bit == 1 ? "motion" : "depth", src_cpu, dest_cpu);
-            }
-            copied = true;
-        }
+    if (copy_legacy_resource_metadata &&
+        propagate_legacy_resource_descriptor(dest_cpu, src_cpu, false)) {
+        copied = true;
     }
     if (!copied) {
         return;
@@ -19979,6 +22816,321 @@ void copy_cbv_descriptor_metadata(
             source_cbv.size_in_bytes,
             increment);
     }
+}
+
+// [PERF:DESCRIPTOR-SHADOW-STORE 10/14] Range-wise shadow copy. A run stays
+// inside one source and one destination page and copies its entries in
+// handle order with seqlock writes: no hashing, lock or syscall per
+// descriptor. Destination := source for every kind, "empty" included. The
+// legacy store left the destination's CBV and retained-HUD resource as they
+// were when the source had none, so an older descriptor's buffer survived
+// there; consumers now see no metadata, which every one of them already
+// handles. Witcher Senses targets were always copied this way.
+std::atomic<uint32_t> g_descriptor_shadow_copy_log_count{};
+
+UINT descriptor_shadow_run_limit(SIZE_T cpu_handle) {
+    const auto& layout = g_descriptor_shadow_layout;
+    const size_t index =
+        static_cast<size_t>(cpu_handle >> layout.granule_shift) &
+        (kDescriptorShadowPageEntries - 1);
+    const size_t remaining = kDescriptorShadowPageEntries - index;
+    if (layout.stride_is_one) {
+        return static_cast<UINT>(remaining);
+    }
+    return static_cast<UINT>(
+        (remaining + layout.entry_stride - 1) / layout.entry_stride);
+}
+
+// The header decides most copied entries. Sequence and header share the
+// entry's first cache line; the value fields can straddle into the next. Both
+// readers below take one seqlock snapshot and wait out a concurrent writer
+// like read_descriptor_shadow_entry, but load the value fields only when the
+// header leaves the answer open.
+//
+// Copy destination: whether the entry must be rewritten to hold record
+// (header included); current_header returns the header it holds. An empty
+// copy onto an entry that already reads as empty changes nothing whatever
+// the owner bits say, so it stamps no owner, takes no lock and dirties no
+// line. Rebuilt tables mostly repeat their previous contents; an equal entry
+// keeps its cache line clean too.
+bool descriptor_shadow_copy_changes_entry(
+    const DescriptorShadowEntry& entry,
+    const DescriptorShadowRecord& record,
+    uint32_t& current_header) {
+    uint32_t spins = 0;
+    for (;;) {
+        const uint32_t begin = entry.sequence.load(std::memory_order_acquire);
+        if ((begin & 1u) == 0) {
+            const uint32_t header =
+                entry.header.load(std::memory_order_relaxed);
+            bool changed = ((record.header | header) &
+                kDescriptorShadowContentMask) != 0;
+            if (changed && header == record.header) {
+                DescriptorShadowRecord current{};
+                load_descriptor_shadow_fields(entry, current);
+                changed = current != record;
+            }
+            std::atomic_thread_fence(std::memory_order_acquire);
+            if (entry.sequence.load(std::memory_order_relaxed) == begin) {
+                current_header = header;
+                return changed;
+            }
+        }
+        descriptor_shadow_backoff(spins);
+    }
+}
+
+// A copy source another owner holds reads as empty. One without metadata
+// kinds is empty too: every store sets a kind with its fields, and the copy
+// and the Witcher Senses invalidation clear them together, so its value
+// fields are not loaded. Its header stays for the copied-empty markers of
+// verification.
+void read_descriptor_shadow_copy_source(
+    const DescriptorShadowEntry& entry,
+    uint32_t owner,
+    DescriptorShadowRecord& record) {
+    uint32_t spins = 0;
+    for (;;) {
+        const uint32_t begin = entry.sequence.load(std::memory_order_acquire);
+        if ((begin & 1u) == 0) {
+            const uint32_t header =
+                entry.header.load(std::memory_order_relaxed);
+            const bool owned = (header & kDescriptorShadowOwnerMask) == owner;
+            if (owned && (header & kDescriptorShadowMetadataMask) != 0) {
+                load_descriptor_shadow_fields(entry, record);
+            } else {
+                record = DescriptorShadowRecord{};
+                record.header = owned ? header : 0u;
+            }
+            std::atomic_thread_fence(std::memory_order_acquire);
+            if (entry.sequence.load(std::memory_order_relaxed) == begin) {
+                return;
+            }
+        }
+        descriptor_shadow_backoff(spins);
+    }
+}
+
+// One copy_descriptor_shadow_ranges call: its switches, read once, and the
+// last source and destination pages, kept across runs (a gather writes one
+// contiguous destination range from many one-descriptor sources). A found
+// page is never freed; a miss is looked up again by the next run.
+struct DescriptorShadowCopyState {
+    UINT increment{};
+    bool copy_entries{};
+    bool copy_legacy_resource_metadata{};
+    bool verify{};
+    bool log_copies{};
+    uintptr_t src_page_key{};
+    DescriptorShadowPage* src_page{};
+    uintptr_t dest_page_key{};
+    DescriptorShadowPage* dest_page{};
+};
+
+void copy_descriptor_shadow_run(
+    DescriptorShadowCopyState& state,
+    SIZE_T dest_cpu,
+    SIZE_T src_cpu,
+    UINT count) {
+    const auto& layout = g_descriptor_shadow_layout;
+    const UINT increment = state.increment;
+    const bool copy_legacy_resource_metadata =
+        state.copy_legacy_resource_metadata;
+    DescriptorShadowLocation src{};
+    DescriptorShadowLocation dest{};
+    DescriptorShadowPage* src_page{};
+    DescriptorShadowPage* dest_page{};
+    if (state.copy_entries) {
+        src = locate_descriptor_shadow_entry(src_cpu);
+        dest = locate_descriptor_shadow_entry(dest_cpu);
+        // An untracked source page only empties destination entries, and an
+        // absent destination page already is empty.
+        if (src_cpu != 0) {
+            if (state.src_page == nullptr ||
+                state.src_page_key != src.page_key) {
+                state.src_page =
+                    find_descriptor_shadow_page(src.page_key, false);
+                state.src_page_key = src.page_key;
+            }
+            src_page = state.src_page;
+        }
+        if (dest_cpu != 0) {
+            if (state.dest_page == nullptr ||
+                state.dest_page_key != dest.page_key) {
+                state.dest_page = find_descriptor_shadow_page(
+                    dest.page_key, src_page != nullptr);
+                state.dest_page_key = dest.page_key;
+            }
+            dest_page = state.dest_page;
+        }
+    }
+    for (UINT offset = 0; offset < count; ++offset) {
+        const size_t step = static_cast<size_t>(offset) * layout.entry_stride;
+        const SIZE_T dest_handle =
+            dest_cpu + static_cast<SIZE_T>(offset) * increment;
+        const SIZE_T src_handle =
+            src_cpu + static_cast<SIZE_T>(offset) * increment;
+        DescriptorShadowRecord record{};
+        if (src_page != nullptr) {
+            read_descriptor_shadow_copy_source(
+                src_page->entries[src.index + step], src.owner, record);
+        }
+        if (dest_page != nullptr) {
+            const uint32_t kinds =
+                record.header & kDescriptorShadowMetadataMask;
+            const uint32_t copied_empty = state.verify
+                ? descriptor_shadow_verify_copied_empty(record, src_handle)
+                : 0u;
+            record.header = dest.owner | kinds | copied_empty;
+            auto& entry = dest_page->entries[dest.index + step];
+            uint32_t current_header{};
+            if (descriptor_shadow_copy_changes_entry(
+                    entry, record, current_header)) {
+                if ((current_header & kDescriptorShadowOwned) != 0 &&
+                    (current_header & kDescriptorShadowOwnerMask) !=
+                        dest.owner) {
+                    g_descriptor_shadow_owner_collisions.fetch_add(
+                        1, std::memory_order_relaxed);
+                }
+                const uint32_t locked = lock_descriptor_shadow_entry(entry);
+                store_descriptor_shadow_fields(entry, record);
+                unlock_descriptor_shadow_entry(entry, locked);
+            }
+        }
+        if (state.log_copies &&
+            (record.header & kDescriptorShadowHasCbv) != 0 &&
+            take_bounded_log_slot(g_descriptor_shadow_copy_log_count, 40)) {
+            log_line("Reverse CBV descriptor copy src=0x%zX dest=0x%zX gpuva=0x%llX size=%u inc=%u",
+                src_handle,
+                dest_handle,
+                static_cast<unsigned long long>(record.cbv_gpu_va),
+                record.cbv_size_in_bytes,
+                increment);
+        }
+        if (copy_legacy_resource_metadata) {
+            propagate_legacy_resource_descriptor(
+                dest_handle, src_handle, true);
+        }
+    }
+}
+
+// route = descriptor_copy_route_mask() of the calling hook.
+void copy_descriptor_shadow_ranges(
+    UINT num_dest_descriptor_ranges,
+    const D3D12_CPU_DESCRIPTOR_HANDLE* dest_descriptor_range_starts,
+    const UINT* dest_descriptor_range_sizes,
+    UINT num_src_descriptor_ranges,
+    const D3D12_CPU_DESCRIPTOR_HANDLE* src_descriptor_range_starts,
+    const UINT* src_descriptor_range_sizes,
+    UINT increment,
+    uint32_t route) {
+    const auto& layout = g_descriptor_shadow_layout;
+    const bool ready = layout.ready.load(std::memory_order_acquire);
+    DescriptorShadowCopyState state{};
+    state.increment = increment;
+    state.copy_entries = ready && increment == layout.increment;
+    state.copy_legacy_resource_metadata =
+        (route & kDescriptorCopyRouteLegacyResource) != 0;
+    state.verify = (route & kDescriptorCopyRouteVerify) != 0;
+    state.log_copies = (route & kDescriptorCopyRouteLogCopies) != 0;
+    if (!state.copy_entries) {
+        if (ready) {
+            g_descriptor_shadow_increment_mismatches.fetch_add(
+                1, std::memory_order_relaxed);
+        }
+        if (!state.copy_legacy_resource_metadata) {
+            return;
+        }
+    }
+    UINT dest_range = 0;
+    UINT src_range = 0;
+    UINT dest_index = 0;
+    UINT src_index = 0;
+    // Same range walk as the legacy loop, advanced a run at a time.
+    while (dest_range < num_dest_descriptor_ranges &&
+           src_range < num_src_descriptor_ranges) {
+        const auto dest_size = dest_descriptor_range_sizes != nullptr
+            ? dest_descriptor_range_sizes[dest_range] : 1u;
+        const auto src_size = src_descriptor_range_sizes != nullptr
+            ? src_descriptor_range_sizes[src_range] : 1u;
+        if (dest_size == 0 || src_size == 0) {
+            break;
+        }
+        const auto dest_cpu = dest_descriptor_range_starts[dest_range].ptr +
+            static_cast<SIZE_T>(dest_index) * increment;
+        const auto src_cpu = src_descriptor_range_starts[src_range].ptr +
+            static_cast<SIZE_T>(src_index) * increment;
+        UINT run = std::min(dest_size - dest_index, src_size - src_index);
+        if (state.copy_entries) {
+            // Nested: the initializer-list form calls the STL's vectorized
+            // minmax dispatcher.
+            run = std::min(std::min(run, descriptor_shadow_run_limit(dest_cpu)),
+                descriptor_shadow_run_limit(src_cpu));
+        }
+        copy_descriptor_shadow_run(state, dest_cpu, src_cpu, run);
+        dest_index += run;
+        src_index += run;
+        if (dest_index >= dest_size) {
+            ++dest_range;
+            dest_index = 0;
+        }
+        if (src_index >= src_size) {
+            ++src_range;
+            src_index = 0;
+        }
+    }
+}
+
+// [PERF:DESCRIPTOR-SHADOW-STORE 11/14] Fix the granule from the device's
+// CBV_SRV_UAV increment before any descriptor detour exists. An increment
+// that is not a multiple of 8, or above 4096, has no compact layout; the run
+// then keeps the legacy store, so no store is ever half populated.
+void initialize_descriptor_shadow_store(UINT increment) {
+    auto& layout = g_descriptor_shadow_layout;
+    if (layout.ready.load(std::memory_order_relaxed)) {
+        return;
+    }
+    if (!descriptor_shadow_store_maintained()) {
+        static std::atomic<bool> legacy_logged{};
+        if (!legacy_logged.exchange(true, std::memory_order_relaxed)) {
+            log_descriptor_store_line(
+                "Descriptor metadata store=legacy increment=%u verify=0",
+                increment);
+        }
+        return;
+    }
+    if (increment == 0 ||
+        increment % (1u << kDescriptorShadowMinGranuleShift) != 0 ||
+        increment > kDescriptorShadowMaxIncrement) {
+        g_config.descriptor_metadata_store = DescriptorMetadataStore::Legacy;
+        g_config.perf_descriptor_shadow_verify = false;
+        // [PERF:DESCRIPTOR-COPY-ROUTE 3/4] No copy hook exists yet.
+        refresh_descriptor_copy_route_mask();
+        log_descriptor_store_line(
+            "Descriptor metadata store: increment %u has no shadow layout; "
+            "using legacy",
+            increment);
+        return;
+    }
+    uint32_t granule_shift = 0;
+    while (granule_shift < kDescriptorShadowMaxGranuleShift &&
+           (increment & (1u << granule_shift)) == 0) {
+        ++granule_shift;
+    }
+    layout.increment = increment;
+    layout.granule_shift = granule_shift;
+    layout.page_shift = granule_shift + kDescriptorShadowPageEntryBits;
+    layout.entry_stride = increment >> granule_shift;
+    layout.stride_is_one = layout.entry_stride == 1;
+    layout.owner_tag_mask = (SIZE_T{1} << granule_shift) - 1;
+    layout.ready.store(true, std::memory_order_release);
+    log_descriptor_store_line(
+        "Descriptor metadata store=%s increment=%u granule=%u stride=%u "
+        "page_bytes=%zu verify=%d",
+        descriptor_shadow_store_selected() ? "shadow" : "legacy", increment,
+        1u << granule_shift, layout.entry_stride,
+        sizeof(DescriptorShadowPage),
+        g_config.perf_descriptor_shadow_verify ? 1 : 0);
 }
 
 // Called only by the device descriptor-copy hooks, never from Draw/Dispatch.
@@ -20019,6 +23171,9 @@ void install_reverse_hooks() {
         g_d3d12_device == nullptr) {
         return;
     }
+    // [PERF:DESCRIPTOR-SHADOW-STORE 12/14]
+    initialize_descriptor_shadow_store(cached_descriptor_increment(
+        g_d3d12_device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV));
 
     const bool metadata_hooks = taau_metadata_hooks_needed() ||
         focus_projection_metadata_hooks_needed() ||
@@ -20126,22 +23281,41 @@ void install_reverse_hooks() {
         }
     }
 
+    // [FEATURE:VRS-MEASUREMENT 5/8] The VRS detours run the normal ones,
+    // then record the new PSO; they exist only while VRS is on, which also
+    // hooks CreateComputePipelineState when nothing else needs it.
+    const bool vrs_detour =
+        g_vrs_measurement_active.load(std::memory_order_acquire);
     if (g_create_graphics_pipeline_state == nullptr) {
         auto target = method<void*>(g_d3d12_device, 10);
-        if (MH_CreateHook(target, reinterpret_cast<void*>(&hook_create_graphics_pipeline_state), reinterpret_cast<void**>(&g_create_graphics_pipeline_state)) == MH_OK &&
+        void* const detour = vrs_detour
+            ? reinterpret_cast<void*>(&hook_create_graphics_pipeline_state_vrs)
+            : reinterpret_cast<void*>(&hook_create_graphics_pipeline_state);
+        if (MH_CreateHook(target, detour, reinterpret_cast<void**>(&g_create_graphics_pipeline_state)) == MH_OK &&
             MH_EnableHook(target) == MH_OK) {
             log_line("Reverse hooked ID3D12Device::CreateGraphicsPipelineState at %p", target);
+            if (vrs_detour) {
+                g_vrs_detour_mask.fetch_or(
+                    kVrsDetourCreatePipeline, std::memory_order_relaxed);
+            }
         }
     }
 
     // DLSS keeps compute-PSO identification so V308's startup serialization
     // retires at the same post-DLSS signatures instead of remaining armed.
-    if (temporal_compute_hooks_needed() &&
+    if ((temporal_compute_hooks_needed() || vrs_detour) &&
         g_create_compute_pipeline_state == nullptr) {
         auto target = method<void*>(g_d3d12_device, 11);
-        if (MH_CreateHook(target, reinterpret_cast<void*>(&hook_create_compute_pipeline_state), reinterpret_cast<void**>(&g_create_compute_pipeline_state)) == MH_OK &&
+        void* const detour = vrs_detour
+            ? reinterpret_cast<void*>(&hook_create_compute_pipeline_state_vrs)
+            : reinterpret_cast<void*>(&hook_create_compute_pipeline_state);
+        if (MH_CreateHook(target, detour, reinterpret_cast<void**>(&g_create_compute_pipeline_state)) == MH_OK &&
             MH_EnableHook(target) == MH_OK) {
             log_line("Reverse hooked ID3D12Device::CreateComputePipelineState at %p", target);
+            if (vrs_detour) {
+                g_vrs_detour_mask.fetch_or(
+                    kVrsDetourCreateComputePipeline, std::memory_order_relaxed);
+            }
         }
     }
 
@@ -20441,18 +23615,57 @@ void install_command_list_hooks() {
         (reverse_enabled() && g_config.reverse_cbv_probe);
     const bool compute_hooks = taau_compute_hooks_needed() ||
         rt_symmetric_dlss_per_eye_ao_history_active();
+    // [FEATURE:VRS-MEASUREMENT 6/8] Reset and SetPipelineState get the VRS
+    // detour, which wraps the normal one, and ClearState and Close are hooked
+    // at all, only while VRS is on.
+    const bool vrs_detours =
+        g_vrs_measurement_active.load(std::memory_order_acquire);
 
     if (g_reset_command_list == nullptr) {
         auto target = method<void*>(command_list, 10);
-        if (MH_CreateHook(target,
-                reinterpret_cast<void*>(&hook_reset_command_list),
+        void* const reset_detour = vrs_detours
+            ? reinterpret_cast<void*>(&hook_reset_command_list_vrs)
+            : reinterpret_cast<void*>(&hook_reset_command_list);
+        if (MH_CreateHook(target, reset_detour,
                 reinterpret_cast<void**>(&g_reset_command_list)) == MH_OK &&
             MH_EnableHook(target) == MH_OK) {
             log_line(
                 "Renderer hooked ID3D12GraphicsCommandList::Reset at %p",
                 target);
             register_embedded_command_list_slot<10>(target,
-                reinterpret_cast<void*>(&hook_reset_command_list), &g_reset_command_list, true);
+                reset_detour, &g_reset_command_list, true);
+            if (vrs_detours) {
+                g_vrs_detour_mask.fetch_or(
+                    kVrsDetourReset, std::memory_order_relaxed);
+            }
+        }
+    }
+
+    if (vrs_detours && g_clear_state == nullptr) {
+        auto target = method<void*>(command_list, 11);
+        if (MH_CreateHook(target,
+                reinterpret_cast<void*>(&hook_clear_state_vrs),
+                reinterpret_cast<void**>(&g_clear_state)) == MH_OK &&
+            MH_EnableHook(target) == MH_OK) {
+            register_embedded_command_list_slot<11>(target,
+                reinterpret_cast<void*>(&hook_clear_state_vrs),
+                &g_clear_state, true);
+            g_vrs_detour_mask.fetch_or(
+                kVrsDetourClearState, std::memory_order_relaxed);
+        }
+    }
+
+    if (vrs_detours && g_close_command_list == nullptr) {
+        auto target = method<void*>(command_list, 9);
+        if (MH_CreateHook(target,
+                reinterpret_cast<void*>(&hook_close_command_list_vrs),
+                reinterpret_cast<void**>(&g_close_command_list)) == MH_OK &&
+            MH_EnableHook(target) == MH_OK) {
+            register_embedded_command_list_slot<9>(target,
+                reinterpret_cast<void*>(&hook_close_command_list_vrs),
+                &g_close_command_list, true);
+            g_vrs_detour_mask.fetch_or(
+                kVrsDetourClose, std::memory_order_relaxed);
         }
     }
 
@@ -20590,11 +23803,18 @@ void install_command_list_hooks() {
 
     if (g_set_pipeline_state == nullptr) {
         auto target = method<void*>(command_list, 25);
-        if (MH_CreateHook(target, reinterpret_cast<void*>(&hook_set_pipeline_state), reinterpret_cast<void**>(&g_set_pipeline_state)) == MH_OK &&
+        void* const set_pipeline_detour = vrs_detours
+            ? reinterpret_cast<void*>(&hook_set_pipeline_state_vrs)
+            : reinterpret_cast<void*>(&hook_set_pipeline_state);
+        if (MH_CreateHook(target, set_pipeline_detour, reinterpret_cast<void**>(&g_set_pipeline_state)) == MH_OK &&
             MH_EnableHook(target) == MH_OK) {
             log_line("Reverse hooked ID3D12GraphicsCommandList::SetPipelineState at %p", target);
             register_embedded_command_list_slot<25>(target,
-                reinterpret_cast<void*>(&hook_set_pipeline_state), &g_set_pipeline_state, true);
+                set_pipeline_detour, &g_set_pipeline_state, true);
+            if (vrs_detours) {
+                g_vrs_detour_mask.fetch_or(
+                    kVrsDetourSetPipeline, std::memory_order_relaxed);
+            }
         }
     }
 
@@ -20617,6 +23837,22 @@ void install_command_list_hooks() {
             register_embedded_command_list_slot<29>(target,
                 reinterpret_cast<void*>(&hook_set_compute_root_signature), &g_set_compute_root_signature, false);
         }
+    }
+
+    if (vrs_detours) {
+        const uint32_t detours =
+            g_vrs_detour_mask.load(std::memory_order_relaxed);
+        log_vrs_line(
+            "VRS detours create_pso=%d create_compute_pso=%d "
+            "set_pipeline_state=%d reset=%d clear_state=%d close=%d "
+            "embedded=%d",
+            (detours & kVrsDetourCreatePipeline) != 0 ? 1 : 0,
+            (detours & kVrsDetourCreateComputePipeline) != 0 ? 1 : 0,
+            (detours & kVrsDetourSetPipeline) != 0 ? 1 : 0,
+            (detours & kVrsDetourReset) != 0 ? 1 : 0,
+            (detours & kVrsDetourClearState) != 0 ? 1 : 0,
+            (detours & kVrsDetourClose) != 0 ? 1 : 0,
+            embedded_command_list_table(command_list) != nullptr ? 1 : 0);
     }
 
     g_command_list_hooks_installed = true;
@@ -22976,9 +26212,20 @@ void STDMETHODCALLTYPE hook_copy_descriptors(
         src_descriptor_range_sizes,
         descriptor_heaps_type);
 
+    // [PERF:CPU-MEASUREMENT 5/5]
+    if (g_config.perf_skip_descriptor_tracking) {
+        return;
+    }
+    // [PERF:DESCRIPTOR-COPY-ROUTE 4/4] One load answers the configured
+    // routes; descriptor_metadata_hooks_needed() runs in full only when its
+    // configured terms are all false.
+    const uint32_t route = descriptor_copy_route_mask();
     const bool witcher_sense_metadata =
-        witcher_sense_history_suppression_route_configured();
-    if ((!descriptor_metadata_hooks_needed() && !witcher_sense_metadata) ||
+        (route & kDescriptorCopyRouteWitcherSense) != 0;
+    const bool metadata_hooks =
+        (route & kDescriptorCopyRouteMetadataConfigured) != 0 ||
+        descriptor_metadata_hooks_needed();
+    if ((!metadata_hooks && !witcher_sense_metadata) ||
         descriptor_heaps_type !=
             D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV ||
         dest_descriptor_range_starts == nullptr || src_descriptor_range_starts == nullptr) {
@@ -22992,23 +26239,30 @@ void STDMETHODCALLTYPE hook_copy_descriptors(
     UINT src_range = 0;
     UINT dest_index = 0;
     UINT src_index = 0;
-    // [PERF:WITCHER-SENSE-BOUNDED-DESCRIPTORS V1499 3/5] Witcher Senses owns
-    // only its bounded target cache here. It no longer enables the generic
-    // CBV mirror, legacy resource propagation, or global reverse mutex.
-    const bool cbv_metadata = taau_metadata_hooks_needed() ||
-        real_smoke_world_up_binding_route_active() ||
-        foliage_bound_basis_route_active() ||
-        focus_projection_metadata_hooks_needed() ||
-        rt_symmetric_dlss_per_eye_ao_history_active();
-    const bool legacy_resource_metadata = taau_metadata_hooks_needed() ||
-        rt_symmetric_dlss_per_eye_ao_history_active();
-    const bool fast_resource_metadata =
-        descriptor_metadata_hooks_needed() && !cbv_metadata;
+    const bool cbv_metadata = (route & kDescriptorCopyRouteCbv) != 0;
+    const bool legacy_resource_metadata =
+        (route & kDescriptorCopyRouteLegacyResource) != 0;
+    const bool fast_resource_metadata = metadata_hooks && !cbv_metadata;
     std::unique_lock<std::mutex> lock{g_reverse_mutex, std::defer_lock};
     if (descriptor_heaps_type ==
             D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV &&
         legacy_resource_metadata) {
         lock.lock();
+    }
+
+    // [PERF:DESCRIPTOR-SHADOW-STORE 13/14] The shadow store copies every
+    // metadata kind run by run. The loop below is the legacy store (and the
+    // reference under verification). g_reverse_mutex stays held for TAAU/RT,
+    // whose readers recheck CBVs under it.
+    if ((route & kDescriptorCopyRouteShadowStore) != 0) {
+        copy_descriptor_shadow_ranges(
+            num_dest_descriptor_ranges, dest_descriptor_range_starts,
+            dest_descriptor_range_sizes, num_src_descriptor_ranges,
+            src_descriptor_range_starts, src_descriptor_range_sizes,
+            increment, route);
+        if ((route & kDescriptorCopyRouteLegacyStore) == 0) {
+            return;
+        }
     }
 
     while (dest_range < num_dest_descriptor_ranges && src_range < num_src_descriptor_ranges) {
@@ -23030,8 +26284,10 @@ void STDMETHODCALLTYPE hook_copy_descriptors(
         } else if (fast_resource_metadata) {
             ID3D12Resource* resource{};
             DXGI_FORMAT format{DXGI_FORMAT_UNKNOWN};
-            if (load_resource_descriptor_fast(src_cpu, resource, format)) {
-                store_resource_descriptor_fast(dest_cpu, resource, format);
+            if (load_resource_descriptor_fast_legacy(
+                    src_cpu, resource, format)) {
+                store_resource_descriptor_fast_legacy(
+                    dest_cpu, resource, format);
             }
         }
 
@@ -23061,9 +26317,16 @@ void STDMETHODCALLTYPE hook_copy_descriptors_simple(
         src_descriptor_range_start,
         descriptor_heaps_type);
 
+    if (g_config.perf_skip_descriptor_tracking) {
+        return;
+    }
+    const uint32_t route = descriptor_copy_route_mask();
     const bool witcher_sense_metadata =
-        witcher_sense_history_suppression_route_configured();
-    if ((!descriptor_metadata_hooks_needed() && !witcher_sense_metadata) ||
+        (route & kDescriptorCopyRouteWitcherSense) != 0;
+    const bool metadata_hooks =
+        (route & kDescriptorCopyRouteMetadataConfigured) != 0 ||
+        descriptor_metadata_hooks_needed();
+    if ((!metadata_hooks && !witcher_sense_metadata) ||
         descriptor_heaps_type !=
             D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV ||
         dest_descriptor_range_start.ptr == 0 || src_descriptor_range_start.ptr == 0) {
@@ -23073,20 +26336,25 @@ void STDMETHODCALLTYPE hook_copy_descriptors_simple(
     // [PERF:DESCRIPTOR-INCREMENT-CACHE 3/3]
     const auto increment =
         cached_descriptor_increment(device, descriptor_heaps_type);
-    const bool cbv_metadata = taau_metadata_hooks_needed() ||
-        real_smoke_world_up_binding_route_active() ||
-        foliage_bound_basis_route_active() ||
-        focus_projection_metadata_hooks_needed() ||
-        rt_symmetric_dlss_per_eye_ao_history_active();
-    const bool legacy_resource_metadata = taau_metadata_hooks_needed() ||
-        rt_symmetric_dlss_per_eye_ao_history_active();
-    const bool fast_resource_metadata =
-        descriptor_metadata_hooks_needed() && !cbv_metadata;
+    const bool cbv_metadata = (route & kDescriptorCopyRouteCbv) != 0;
+    const bool legacy_resource_metadata =
+        (route & kDescriptorCopyRouteLegacyResource) != 0;
+    const bool fast_resource_metadata = metadata_hooks && !cbv_metadata;
     std::unique_lock<std::mutex> lock{g_reverse_mutex, std::defer_lock};
     if (descriptor_heaps_type ==
             D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV &&
         legacy_resource_metadata) {
         lock.lock();
+    }
+    // [PERF:DESCRIPTOR-SHADOW-STORE 14/14]
+    if ((route & kDescriptorCopyRouteShadowStore) != 0) {
+        copy_descriptor_shadow_ranges(
+            1, &dest_descriptor_range_start, &num_descriptors,
+            1, &src_descriptor_range_start, &num_descriptors,
+            increment, route);
+        if ((route & kDescriptorCopyRouteLegacyStore) == 0) {
+            return;
+        }
     }
     for (UINT index = 0; index < num_descriptors; ++index) {
         const auto dest_cpu = dest_descriptor_range_start.ptr + static_cast<SIZE_T>(index) * increment;
@@ -23101,8 +26369,10 @@ void STDMETHODCALLTYPE hook_copy_descriptors_simple(
         } else if (fast_resource_metadata) {
             ID3D12Resource* resource{};
             DXGI_FORMAT format{DXGI_FORMAT_UNKNOWN};
-            if (load_resource_descriptor_fast(src_cpu, resource, format)) {
-                store_resource_descriptor_fast(dest_cpu, resource, format);
+            if (load_resource_descriptor_fast_legacy(
+                    src_cpu, resource, format)) {
+                store_resource_descriptor_fast_legacy(
+                    dest_cpu, resource, format);
             }
         }
     }
@@ -23950,6 +27220,13 @@ void STDMETHODCALLTYPE hook_set_pipeline_state(
                 command_list, hud_eye);
             record_mode3_aer_retained_hud_tag(
                 command_list, hud_eye, hud_pair_id);
+            // 5.01 per-eye frustum: the baked HUD of an eye rendered off-axis
+            // needs the optical-centre variant, exactly when that eye is tagged.
+            const bool randc_hud_eye = remaster_asymmetric_ndc_configured() &&
+                !cinema_active && !automatic_full_vr_hud &&
+                hud_eye >= 0 && hud_eye <= 1 && hud_pair_id != 0 &&
+                native_asymmetric_source_eye_tagged(
+                    hud_pair_id, static_cast<uint32_t>(hud_eye));
             if (hud_eye == 0) {
                 if (automatic_stereo_cinema_hud) {
                     bound_pipeline_state =
@@ -23963,7 +27240,8 @@ void STDMETHODCALLTYPE hook_set_pipeline_state(
                     bound_pipeline_state =
                         g_full_vr_hud_composite_eye0_pso.load(
                             std::memory_order_acquire);
-                } else if (strict_stereo_asymmetric_gameplay_hud) {
+                } else if (strict_stereo_asymmetric_gameplay_hud ||
+                    randc_hud_eye) {
                     bound_pipeline_state =
                         g_asymmetric_hud_composite_eye0_pso.load(
                             std::memory_order_acquire);
@@ -23988,7 +27266,8 @@ void STDMETHODCALLTYPE hook_set_pipeline_state(
                     bound_pipeline_state =
                         g_full_vr_hud_composite_eye1_pso.load(
                             std::memory_order_acquire);
-                } else if (strict_stereo_asymmetric_gameplay_hud) {
+                } else if (strict_stereo_asymmetric_gameplay_hud ||
+                    randc_hud_eye) {
                     bound_pipeline_state =
                         g_asymmetric_hud_composite_eye1_pso.load(
                             std::memory_order_acquire);
@@ -24249,16 +27528,55 @@ void STDMETHODCALLTYPE hook_set_compute_root_signature(
     g_set_compute_root_signature(command_list, root_signature);
 }
 
+// [PERF:AIM-PROBE-PIPELINES 2/3]
+bool aim_probe_pipeline(ID3D12PipelineState* pipeline) {
+    if (g_aim_probe_pipelines_overflow.load(std::memory_order_acquire)) {
+        return pipeline_matches_probe(lookup_pipeline_info(pipeline),
+            ShaderFingerprint::AimProbeVs, ShaderFingerprint::AimProbePs);
+    }
+    for (const auto& slot : g_aim_probe_pipelines) {
+        if (slot.load(std::memory_order_acquire) == pipeline) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Diagnostics only ([debug] first_person_aim_diagnostics): the set has to
+// answer exactly as the locked map lookup it replaced.
+void check_aim_probe_pipeline(
+    ID3D12PipelineState* pipeline, bool aim_probe, uint64_t present) {
+    const bool expected = pipeline_matches_probe(
+        lookup_pipeline_info(pipeline),
+        ShaderFingerprint::AimProbeVs, ShaderFingerprint::AimProbePs);
+    static std::atomic<uint32_t> mismatch_logs{};
+    static std::atomic<uint32_t> hit_logs{};
+    if (expected != aim_probe) {
+        if (mismatch_logs.fetch_add(1, std::memory_order_relaxed) < 16) {
+            log_first_person_aim_diagnostic(
+                "FPAIM probe set mismatch present=%llu pso=%p set=%d lookup=%d",
+                static_cast<unsigned long long>(present), pipeline,
+                aim_probe ? 1 : 0, expected ? 1 : 0);
+        }
+    } else if (aim_probe &&
+        hit_logs.fetch_add(1, std::memory_order_relaxed) < 4) {
+        log_first_person_aim_diagnostic(
+            "FPAIM probe set hit present=%llu pso=%p lookup=1",
+            static_cast<unsigned long long>(present), pipeline);
+    }
+}
+
+// [PERF:AIM-PROBE-PIPELINES 3/3] indexed comes from the caller instead of a
+// strstr over the draw source. No source ever contained "Indexed": the
+// lowercase "draw-indexed-cbv" route counts as non-indexed on purpose (see
+// hook_draw_indexed_instanced), so both callers pass false.
 void sample_aim_pso_probe(
     ID3D12GraphicsCommandList* command_list,
-    const char* source,
+    bool indexed,
     UINT element_count,
     UINT instance_count) {
-    const bool indexed =
-        source != nullptr && strstr(source, "Indexed") != nullptr;
     const bool functional_candidate =
-        source != nullptr && !indexed &&
-        element_count == 6 && instance_count == 1;
+        !indexed && element_count == 6 && instance_count == 1;
     if (!functional_candidate && !g_aim_pso_probe_active.load()) {
         return;
     }
@@ -24266,10 +27584,12 @@ void sample_aim_pso_probe(
     const uint64_t present = g_present_count.load();
     auto* pipeline = load_command_list_pipeline(command_list);
     if (functional_candidate && pipeline != nullptr) {
-        const auto pipeline_info = lookup_pipeline_info(pipeline);
-        if (pipeline_matches_probe(pipeline_info,
-                ShaderFingerprint::AimProbeVs, ShaderFingerprint::AimProbePs)) {
+        const bool aim_probe = aim_probe_pipeline(pipeline);
+        if (aim_probe) {
             g_aim_crosshair_last_present.store(present);
+        }
+        if (g_config.first_person_aim_diagnostics) {
+            check_aim_probe_pipeline(pipeline, aim_probe, present);
         }
     }
     if (!g_aim_pso_probe_active.load()) {
@@ -24314,7 +27634,7 @@ void sample_draw_cbvs(
     const char* source,
     UINT element_count,
     UINT instance_count) {
-    sample_aim_pso_probe(command_list, source, element_count, instance_count);
+    sample_aim_pso_probe(command_list, false, element_count, instance_count);
     if (!reverse_enabled() || !g_config.reverse_cbv_probe) {
         return;
     }
@@ -24790,6 +28110,9 @@ void STDMETHODCALLTYPE hook_draw_indexed_instanced(
             start_instance_location);
         return;
     }
+    if (g_config.perf_shadow_profile) {
+        record_shadow_profile_draw();
+    }
     // [PERF:NOAA-PIPELINE-LOOKUP V1441 1/3] Foliage, smoke and focus inspect
     // the same currently bound PSO. Publish one nonblocking snapshot for the
     // draw instead of probing the command-list table up to three times.
@@ -24974,7 +28297,7 @@ void STDMETHODCALLTYPE hook_draw_indexed_instanced(
     if (clean_mode3_fast_path) {
         if (index_count_per_instance == 6 && instance_count == 1) {
             sample_aim_pso_probe(
-                command_list, "draw-indexed-cbv",
+                command_list, false,
                 index_count_per_instance, instance_count);
         }
         if (focus_fire_selected != nullptr) {
@@ -26165,6 +29488,9 @@ void STDMETHODCALLTYPE hook_draw_instanced(
             command_list, vertex_count_per_instance, instance_count,
             start_vertex_location, start_instance_location);
         return;
+    }
+    if (g_config.perf_shadow_profile) {
+        record_shadow_profile_draw();
     }
     auto* draw_pipeline =
         load_command_list_pipeline_effect_nonblocking(command_list);
@@ -30562,6 +33888,22 @@ size_t engine_view_centre() {
     return index != 0 ? index : 0x100;
 }
 
+// View-array float index of the 5.01 NDC projection offset (x, y), or 0 on
+// builds without that field.
+size_t engine_view_projection_offset() {
+    static const size_t index = static_cast<size_t>(w3vr::engine_addresses::value(
+        running_game_build(), w3vr::engine_addresses::Value::ViewProjectionOffsetIndex));
+    return index;
+}
+
+// View-array float index of the current-to-previous clip reprojection matrix
+// (5.01), or 0 when unknown.
+size_t engine_view_reprojection_matrix() {
+    static const size_t index = static_cast<size_t>(w3vr::engine_addresses::value(
+        running_game_build(), w3vr::engine_addresses::Value::ReprojectionMatrixIndex));
+    return index;
+}
+
 // Frame-data layout value on the running build (0 = unknown there).
 size_t engine_frame_offset(w3vr::engine_addresses::Value which) {
     return static_cast<size_t>(
@@ -31217,8 +34559,12 @@ bool prepare_full_vr_fallback_dlss_temporal_history(
     uint64_t pair_id,
     bool& continued) {
     continued = false;
+    const bool remaster_per_eye = remaster_engine_dlss_stereo_active() &&
+        g_config.remaster_dlss_per_eye_motion &&
+        remaster_engine_dlss_per_eye_running();
     if (view == nullptr || eye < 0 || eye > 1 || pair_id == 0 ||
-        pair_id == UINT64_MAX || !dlss_sequential_mode_active() ||
+        pair_id == UINT64_MAX ||
+        (!dlss_sequential_mode_active() && !remaster_per_eye) ||
         g_engine_temporal_camera_build == nullptr ||
         !g_engine_temporal_camera_build_time_valid.load(
             std::memory_order_acquire)) {
@@ -31260,7 +34606,9 @@ bool prepare_full_vr_fallback_dlss_temporal_history(
         const auto& previous_record = continued
             ? slot.record
             : current_record;
-        memcpy(reinterpret_cast<uint8_t*>(view) + 0x460,
+        memcpy(reinterpret_cast<uint8_t*>(view) +
+                engine_frame_offset(
+                    w3vr::engine_addresses::Value::TemporalCameraRecordOffset),
             previous_record.data(), previous_record.size());
         slot.record = current_record;
         slot.pair_id = pair_id;
@@ -33381,22 +36729,35 @@ bool wait_for_engine_pair_completion(uint64_t pair_id, uint64_t timeout_ms) {
     // (a hitch), and holding a full logical core at boost clock for the rest
     // of the up-to-64ms timeout is what was pinning AMD X3D parts against
     // their PPT/TDC limits every frame.
-    static const long long kQpcFrequency = [] {
-        LARGE_INTEGER frequency{};
-        QueryPerformanceFrequency(&frequency);
-        return frequency.QuadPart;
-    }();
-    const long long spin_budget_ticks = std::max(1LL, kQpcFrequency / 5000); // ~200us
-    LARGE_INTEGER spin_start{};
-    QueryPerformanceCounter(&spin_start);
+    // [PERF:PAIR-BARRIER-SPIN 3/3] The window is a pause budget instead of a
+    // QueryPerformanceCounter deadline: QPC is a syscall under Proton, and
+    // the timed loop made one per pause. The default 4096 pauses last roughly
+    // 60-130 us on current desktop cores at 4-5 GHz.
     bool signaled = false;
-    while (!(signaled = check_pair_signals())) {
-        LARGE_INTEGER now{};
-        QueryPerformanceCounter(&now);
-        if (now.QuadPart - spin_start.QuadPart >= spin_budget_ticks) {
-            break;
+    const uint32_t spin_pauses = g_config.pair_barrier_spin_pauses;
+    if (spin_pauses != 0) {
+        uint32_t pauses = 0;
+        while (!(signaled = check_pair_signals()) && pauses < spin_pauses) {
+            ++pauses;
+            YieldProcessor();
         }
-        YieldProcessor();
+    } else {
+        static const long long kQpcFrequency = [] {
+            LARGE_INTEGER frequency{};
+            QueryPerformanceFrequency(&frequency);
+            return frequency.QuadPart;
+        }();
+        const long long spin_budget_ticks = std::max(1LL, kQpcFrequency / 5000); // ~200us
+        LARGE_INTEGER spin_start{};
+        QueryPerformanceCounter(&spin_start);
+        while (!(signaled = check_pair_signals())) {
+            LARGE_INTEGER now{};
+            QueryPerformanceCounter(&now);
+            if (now.QuadPart - spin_start.QuadPart >= spin_budget_ticks) {
+                break;
+            }
+            YieldProcessor();
+        }
     }
 
     // [FIX:PRODUCER-BARRIER-WAKE 3/8] Past the spin budget, park on the
@@ -33502,6 +36863,418 @@ void mark_engine_pair_output_captured(uint64_t pair_id, uint32_t eye) {
     }
 }
 
+// [PERF:PAIR-BARRIER-LAG 4/11] Producer-thread state of the lagged barrier:
+// the pair the previous tick queued without waiting for it, and the capture
+// generation it was queued in. A route reset clears every mask and signal of
+// the old generation, so such a pair can never complete any more.
+std::atomic<uint64_t> g_engine_pair_barrier_pending{};
+std::atomic<uint32_t> g_engine_pair_barrier_pending_generation{};
+// PERF census counters. The producer thread is the only writer.
+std::atomic<uint64_t> g_engine_pair_barrier_waits{};
+std::atomic<uint64_t> g_engine_pair_barrier_wait_ticks{};
+std::atomic<uint64_t> g_engine_pair_barrier_max_ticks{};
+std::atomic<uint64_t> g_engine_pair_barrier_long_waits{};
+std::atomic<uint64_t> g_engine_pair_barrier_timeouts{};
+std::atomic<uint64_t> g_engine_pair_barrier_drains{};
+std::atomic<uint64_t> g_engine_pair_barrier_stale{};
+
+void count_engine_pair_barrier(std::atomic<uint64_t>& counter) {
+    counter.store(counter.load(std::memory_order_relaxed) + 1,
+        std::memory_order_relaxed);
+}
+
+// Lag 1: returns the pair to wait for now and queues produced_pair for the
+// next tick. The pending pair's masks and floors are then settled one tick
+// later, by the same wait_for_engine_pair_completion() call as with lag 0;
+// the eyes of produced_pair still complete and capture normally meanwhile
+// (its id is above both floors). A tick that queues no pair (menu, loading
+// video, retry window) drains the pending one, so nothing stays in flight
+// across a route change. A pending pair from an older generation, or one
+// left when the barrier stops applying, is dropped without waiting: waiting
+// could only run into the timeout.
+uint64_t take_lagged_engine_pair_barrier(
+    bool strict_pair_barrier,
+    uint64_t produced_pair,
+    bool produced_generation_stable) {
+    const uint32_t generation =
+        g_streamline_capture_generation.load(std::memory_order_acquire);
+    const bool queue_produced = strict_pair_barrier && produced_pair != 0 &&
+        produced_generation_stable;
+    if (strict_pair_barrier && produced_pair != 0 &&
+        !produced_generation_stable) {
+        count_engine_pair_barrier(g_engine_pair_barrier_stale);
+    }
+    const uint64_t pending = g_engine_pair_barrier_pending.exchange(
+        queue_produced ? produced_pair : 0, std::memory_order_relaxed);
+    const uint32_t pending_generation =
+        g_engine_pair_barrier_pending_generation.exchange(
+            generation, std::memory_order_relaxed);
+    if (pending == 0) {
+        return 0;
+    }
+    if (!strict_pair_barrier || pending_generation != generation) {
+        count_engine_pair_barrier(g_engine_pair_barrier_stale);
+        return 0;
+    }
+    if (produced_pair == 0) {
+        count_engine_pair_barrier(g_engine_pair_barrier_drains);
+    }
+    return pending;
+}
+
+// The census times each barrier wait with two QPC reads; without the census
+// log nothing is read or counted.
+int64_t begin_engine_pair_barrier_census() {
+    if (!g_config.vrs_log_file) {
+        return 0;
+    }
+    LARGE_INTEGER now{};
+    QueryPerformanceCounter(&now);
+    return now.QuadPart;
+}
+
+void end_engine_pair_barrier_census(int64_t begin, bool released) {
+    if (!g_config.vrs_log_file) {
+        return;
+    }
+    LARGE_INTEGER end{};
+    QueryPerformanceCounter(&end);
+    static const int64_t qpc_per_ms = [] {
+        LARGE_INTEGER frequency{};
+        QueryPerformanceFrequency(&frequency);
+        return std::max<int64_t>(1, frequency.QuadPart / 1000);
+    }();
+    const uint64_t ticks = static_cast<uint64_t>(
+        std::max<int64_t>(0, end.QuadPart - begin));
+    count_engine_pair_barrier(g_engine_pair_barrier_waits);
+    g_engine_pair_barrier_wait_ticks.store(
+        g_engine_pair_barrier_wait_ticks.load(std::memory_order_relaxed) +
+            ticks,
+        std::memory_order_relaxed);
+    uint64_t max_ticks =
+        g_engine_pair_barrier_max_ticks.load(std::memory_order_relaxed);
+    while (ticks > max_ticks &&
+        !g_engine_pair_barrier_max_ticks.compare_exchange_weak(
+            max_ticks, ticks, std::memory_order_relaxed)) {
+    }
+    if (ticks > static_cast<uint64_t>(qpc_per_ms)) {
+        count_engine_pair_barrier(g_engine_pair_barrier_long_waits);
+    }
+    if (!released) {
+        count_engine_pair_barrier(g_engine_pair_barrier_timeouts);
+    }
+}
+
+// [PERF:PAIR-BARRIER-LAG 5/11] Pair pose lead. locate_openxr_mode3_pair_pose()
+// predicts a pair's display time as the last completed display time plus a
+// whole number of periods (2, which assumes no run-ahead). Each strict-Stereo
+// pair keeps the completed time its pose was located from; its first real
+// publication measures how many periods actually passed. With lag 1 and
+// pair_pose_lead_adaptive the rounded average replaces the fixed lead. The
+// measurement itself always runs, so lag 0 logs the same numbers.
+constexpr int64_t kMode3PairPoseLeadFixedPeriods = 2;
+constexpr int64_t kMode3PairPoseLeadMinPeriods = 1;
+constexpr int64_t kMode3PairPoseLeadMaxPeriods = 6;
+constexpr uint64_t kMode3PairPoseLeadWarmupSamples = 8;
+constexpr size_t kMode3PairPoseLeadSlotCount = 16;
+struct Mode3PairPoseLeadSlot {
+    std::atomic<uint64_t> pair_id{};
+    std::atomic<int64_t> completed_time{};
+};
+std::array<Mode3PairPoseLeadSlot, kMode3PairPoseLeadSlotCount>
+    g_mode3_pair_pose_lead_slots{};
+// Set by locate_openxr_mode3_pair_pose() inside the factory, on the
+// producer thread; 0 when this tick located no pair pose.
+thread_local int64_t t_mode3_pair_pose_completed_time{};
+// Written by the publishing (render) thread only.
+std::atomic<float> g_mode3_pair_pose_observed_lead{};
+std::atomic<uint64_t> g_mode3_pair_pose_lead_samples{};
+
+int64_t mode3_pair_pose_lead_periods() {
+    if (g_config.perf_pair_barrier_lag == 0 ||
+        !g_config.perf_pair_pose_lead_adaptive ||
+        g_mode3_pair_pose_lead_samples.load(std::memory_order_relaxed) <
+            kMode3PairPoseLeadWarmupSamples) {
+        return kMode3PairPoseLeadFixedPeriods;
+    }
+    const float observed =
+        g_mode3_pair_pose_observed_lead.load(std::memory_order_relaxed);
+    return std::clamp<int64_t>(std::lround(observed),
+        kMode3PairPoseLeadMinPeriods, kMode3PairPoseLeadMaxPeriods);
+}
+
+void remember_mode3_pair_pose_origin(uint64_t pair_id, int64_t completed_time) {
+    if (pair_id == 0 || completed_time <= 0) {
+        return;
+    }
+    auto& slot = g_mode3_pair_pose_lead_slots[
+        pair_id % kMode3PairPoseLeadSlotCount];
+    slot.pair_id.store(0, std::memory_order_relaxed);
+    slot.completed_time.store(completed_time, std::memory_order_relaxed);
+    slot.pair_id.store(pair_id, std::memory_order_release);
+}
+
+// Called after a successful xrEndFrame. Only the first real publication of a
+// pair counts; rescues and repeats find the slot already consumed.
+void observe_mode3_pair_pose_publication(
+    PoseTimelineEvent reason,
+    uint64_t pair_id,
+    int64_t display_time,
+    int64_t period) {
+    if (reason != PoseTimelineEvent::SubmitReal || pair_id == 0 ||
+        period <= 0) {
+        return;
+    }
+    auto& slot = g_mode3_pair_pose_lead_slots[
+        pair_id % kMode3PairPoseLeadSlotCount];
+    uint64_t expected = pair_id;
+    if (slot.pair_id.load(std::memory_order_acquire) != pair_id) {
+        return;
+    }
+    const int64_t completed_time =
+        slot.completed_time.load(std::memory_order_relaxed);
+    if (!slot.pair_id.compare_exchange_strong(
+            expected, 0, std::memory_order_acq_rel) ||
+        completed_time <= 0 || display_time <= completed_time) {
+        return;
+    }
+    const float observed = static_cast<float>(display_time - completed_time) /
+        static_cast<float>(period);
+    // A hitch (loading, a timed-out pair) is not a pipeline depth.
+    if (!(observed < 64.0f)) {
+        return;
+    }
+    const uint64_t samples =
+        g_mode3_pair_pose_lead_samples.load(std::memory_order_relaxed);
+    const float average = samples == 0
+        ? observed
+        : g_mode3_pair_pose_observed_lead.load(std::memory_order_relaxed) +
+            (observed -
+                g_mode3_pair_pose_observed_lead.load(
+                    std::memory_order_relaxed)) * 0.125f;
+    g_mode3_pair_pose_observed_lead.store(average, std::memory_order_relaxed);
+    g_mode3_pair_pose_lead_samples.store(samples + 1, std::memory_order_relaxed);
+}
+
+// [PERF:PAIR-BARRIER-LAG 6/11] Called from the census under g_vrs_census_busy.
+// ms_per_wait is how long the producer (main) thread waited per strict-Stereo
+// pair; long waits are those over 1 ms (the wait spins ~0.2 ms, then parks).
+// masks is the completion-mask backlog, which must stay small; ring_full
+// counts eye captures dropped because every ring slot was still in use.
+void log_pair_barrier_census_locked(uint64_t window_presents, int64_t qpc_frequency) {
+    static uint64_t previous_waits{};
+    static uint64_t previous_ticks{};
+    static uint64_t previous_long_waits{};
+    static uint64_t previous_timeouts{};
+    static uint64_t previous_drains{};
+    static uint64_t previous_stale{};
+    static uint64_t previous_ring_full{};
+    const uint64_t waits =
+        g_engine_pair_barrier_waits.load(std::memory_order_relaxed);
+    const uint64_t ticks =
+        g_engine_pair_barrier_wait_ticks.load(std::memory_order_relaxed);
+    const uint64_t long_waits =
+        g_engine_pair_barrier_long_waits.load(std::memory_order_relaxed);
+    const uint64_t timeouts =
+        g_engine_pair_barrier_timeouts.load(std::memory_order_relaxed);
+    const uint64_t drains =
+        g_engine_pair_barrier_drains.load(std::memory_order_relaxed);
+    const uint64_t stale =
+        g_engine_pair_barrier_stale.load(std::memory_order_relaxed);
+    const uint64_t ring_full =
+        g_streamline_capture_ring_full.load(std::memory_order_relaxed);
+    const uint64_t max_ticks =
+        g_engine_pair_barrier_max_ticks.exchange(0, std::memory_order_relaxed);
+    const uint64_t window_waits = waits - previous_waits;
+    const double ticks_per_ms = static_cast<double>(qpc_frequency) / 1000.0;
+    const double window_ms = ticks_per_ms > 0.0
+        ? static_cast<double>(ticks - previous_ticks) / ticks_per_ms : 0.0;
+    if ((window_waits != 0 || g_config.perf_pair_barrier_lag != 0) &&
+        window_presents != 0 && ticks_per_ms > 0.0) {
+        size_t masks{};
+        {
+            std::scoped_lock lock{g_engine_pair_completion_mutex};
+            masks = g_engine_pair_completion_masks.size();
+        }
+        log_vrs_line(
+            "PERF pair barrier lag=%d waits=%llu waits_per_present=%.3f "
+            "ms_per_wait=%.3f ms_per_present=%.3f max_ms=%.2f long_waits=%llu "
+            "timeouts=%llu drains=%llu stale=%llu masks=%zu ring_slots=%u "
+            "ring_full=%llu pose_lead=%lld observed_lead=%.2f lead_samples=%llu",
+            g_config.perf_pair_barrier_lag,
+            static_cast<unsigned long long>(window_waits),
+            static_cast<double>(window_waits) /
+                static_cast<double>(window_presents),
+            window_waits != 0
+                ? window_ms / static_cast<double>(window_waits) : 0.0,
+            window_ms / static_cast<double>(window_presents),
+            static_cast<double>(max_ticks) / ticks_per_ms,
+            static_cast<unsigned long long>(long_waits - previous_long_waits),
+            static_cast<unsigned long long>(timeouts - previous_timeouts),
+            static_cast<unsigned long long>(drains - previous_drains),
+            static_cast<unsigned long long>(stale - previous_stale),
+            masks, streamline_capture_ring_slots(),
+            static_cast<unsigned long long>(ring_full - previous_ring_full),
+            static_cast<long long>(mode3_pair_pose_lead_periods()),
+            static_cast<double>(g_mode3_pair_pose_observed_lead.load(
+                std::memory_order_relaxed)),
+            static_cast<unsigned long long>(
+                g_mode3_pair_pose_lead_samples.load(
+                    std::memory_order_relaxed)));
+    }
+    previous_waits = waits;
+    previous_ticks = ticks;
+    previous_long_waits = long_waits;
+    previous_timeouts = timeouts;
+    previous_drains = drains;
+    previous_stale = stale;
+    previous_ring_full = ring_full;
+}
+
+// [FEATURE:PAIR-RATE-LIMIT 1/2] [openxr] pair_rate_divisor: the game thread
+// leaves each strict-Stereo tick no earlier than divisor display periods after
+// the previous one, so pairs reach the runtime at an even cadence that divides
+// the refresh rate instead of whatever the CPU/GPU allows (WiVRn then shows
+// some pairs for 2 refreshes and others for 3). A tick that is already late
+// restarts the schedule instead of catching up.
+struct PairRateLimitState {
+    int64_t next_qpc{};
+    std::atomic<uint32_t> phase_requests{};
+    std::atomic<uint64_t> phase_shifts{};
+    std::atomic<uint64_t> ticks{};
+    std::atomic<uint64_t> waits{};
+    std::atomic<uint64_t> wait_ticks{};
+    std::atomic<uint64_t> resyncs{};
+};
+PairRateLimitState g_pair_rate_limit{};
+
+// [FEATURE:PAIR-RATE-LIMIT 3/3] Phase. The runtime snaps each frame's
+// predicted display time to its display grid, so (predicted display time -
+// xrWaitFrame call time) stays constant while the capped pairs keep their
+// slot phase and jumps by about one period when a pair lands on the other
+// side of a grid line, which shows on the headset as a 1-then-3 hold. On such
+// a jump the game-thread schedule moves by half a period, away from the grid
+// line. Called on the render thread right after a real pair's inline
+// xrWaitFrame.
+void observe_pair_rate_phase(XrTime predicted_display_time, XrDuration period) {
+    if (g_config.pair_rate_divisor <= 0 || period <= 0) {
+        return;
+    }
+    static const double qpc_ns = [] {
+        LARGE_INTEGER frequency{};
+        QueryPerformanceFrequency(&frequency);
+        return 1e9 / static_cast<double>(frequency.QuadPart);
+    }();
+    static double previous_slack{};
+    static bool previous_valid{};
+    static uint32_t cooldown{};
+    LARGE_INTEGER now{};
+    QueryPerformanceCounter(&now);
+    const double slack = static_cast<double>(predicted_display_time) -
+        static_cast<double>(now.QuadPart) * qpc_ns;
+    if (cooldown != 0) {
+        --cooldown;
+    } else if (previous_valid &&
+        fabs(slack - previous_slack) > 0.5 * static_cast<double>(period)) {
+        g_pair_rate_limit.phase_requests.store(1, std::memory_order_release);
+        cooldown = 16;
+    }
+    previous_slack = slack;
+    previous_valid = true;
+}
+
+void limit_engine_pair_rate() {
+    auto& state = g_pair_rate_limit;
+    const int64_t period_ns =
+        g_xr_last_completed_display_period.load(std::memory_order_relaxed);
+    if (g_config.pair_rate_divisor <= 0 || period_ns <= 0 ||
+        !mode3_stereo_transport_active() || mode3_aer_presentation_active() ||
+        !g_engine_dual_render_active.load(std::memory_order_acquire) ||
+        g_engine_menu_state.load() != 0) {
+        state.next_qpc = 0;
+        return;
+    }
+    static const int64_t qpc_frequency = [] {
+        LARGE_INTEGER frequency{};
+        QueryPerformanceFrequency(&frequency);
+        return frequency.QuadPart;
+    }();
+    const int64_t interval = static_cast<int64_t>(
+        static_cast<double>(period_ns) * g_config.pair_rate_divisor *
+        static_cast<double>(qpc_frequency) / 1e9);
+    LARGE_INTEGER now{};
+    QueryPerformanceCounter(&now);
+    state.ticks.fetch_add(1, std::memory_order_relaxed);
+    if (state.phase_requests.exchange(0, std::memory_order_acq_rel) != 0 &&
+        state.next_qpc != 0) {
+        state.next_qpc += interval / (2 * g_config.pair_rate_divisor);
+        state.phase_shifts.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (state.next_qpc == 0 || now.QuadPart - state.next_qpc > interval / 4) {
+        if (state.next_qpc != 0) {
+            state.resyncs.fetch_add(1, std::memory_order_relaxed);
+        }
+        state.next_qpc = now.QuadPart + interval;
+        return;
+    }
+    if (now.QuadPart < state.next_qpc) {
+        const int64_t begin = now.QuadPart;
+        const int64_t sleep_margin = qpc_frequency / 667;  // 1.5 ms
+        while (state.next_qpc - now.QuadPart > sleep_margin) {
+            Sleep(1);
+            QueryPerformanceCounter(&now);
+        }
+        while (now.QuadPart < state.next_qpc) {
+            YieldProcessor();
+            QueryPerformanceCounter(&now);
+        }
+        state.waits.fetch_add(1, std::memory_order_relaxed);
+        state.wait_ticks.fetch_add(static_cast<uint64_t>(now.QuadPart - begin),
+            std::memory_order_relaxed);
+    }
+    state.next_qpc += interval;
+}
+
+void log_pair_rate_limit_census_locked(uint64_t window_presents, int64_t qpc_frequency) {
+    if (g_config.pair_rate_divisor <= 0 || window_presents == 0 ||
+        qpc_frequency <= 0) {
+        return;
+    }
+    static uint64_t previous_ticks{};
+    static uint64_t previous_waits{};
+    static uint64_t previous_wait_ticks{};
+    static uint64_t previous_resyncs{};
+    static uint64_t previous_phase_shifts{};
+    auto& state = g_pair_rate_limit;
+    const uint64_t ticks = state.ticks.load(std::memory_order_relaxed);
+    const uint64_t waits = state.waits.load(std::memory_order_relaxed);
+    const uint64_t wait_ticks = state.wait_ticks.load(std::memory_order_relaxed);
+    const uint64_t resyncs = state.resyncs.load(std::memory_order_relaxed);
+    const uint64_t phase_shifts =
+        state.phase_shifts.load(std::memory_order_relaxed);
+    const uint64_t window_waits = waits - previous_waits;
+    log_vrs_line(
+        "PERF pair rate limit divisor=%d period_ms=%.3f ticks=%llu waits=%llu "
+        "ms_per_wait=%.3f resyncs=%llu phase_shifts=%llu",
+        g_config.pair_rate_divisor,
+        static_cast<double>(g_xr_last_completed_display_period.load(
+            std::memory_order_relaxed)) / 1e6,
+        static_cast<unsigned long long>(ticks - previous_ticks),
+        static_cast<unsigned long long>(window_waits),
+        window_waits != 0
+            ? 1000.0 * static_cast<double>(wait_ticks - previous_wait_ticks) /
+                static_cast<double>(qpc_frequency) /
+                static_cast<double>(window_waits)
+            : 0.0,
+        static_cast<unsigned long long>(resyncs - previous_resyncs),
+        static_cast<unsigned long long>(phase_shifts - previous_phase_shifts));
+    previous_phase_shifts = phase_shifts;
+    previous_ticks = ticks;
+    previous_waits = waits;
+    previous_wait_ticks = wait_ticks;
+    previous_resyncs = resyncs;
+}
+
 void __fastcall hook_engine_render_scene_setup(void* renderer, float delta_time) {
     const uint64_t flight_hook_frame =
         w3vr::pipeline_flight::current_frame();
@@ -33514,6 +37287,9 @@ void __fastcall hook_engine_render_scene_setup(void* renderer, float delta_time)
     }
     const auto previous_pair = g_engine_producer_pair_id;
     g_engine_producer_pair_id = 0;
+    t_mode3_pair_pose_completed_time = 0;
+    const uint32_t generation_before_setup =
+        g_streamline_capture_generation.load(std::memory_order_acquire);
     const int64_t flight_original_begin =
         w3vr::pipeline_flight::cpu_begin();
     g_engine_render_scene_setup(renderer, delta_time);
@@ -33523,6 +37299,8 @@ void __fastcall hook_engine_render_scene_setup(void* renderer, float delta_time)
         flight_hook_frame);
     const auto produced_pair = g_engine_producer_pair_id;
     g_engine_producer_pair_id = previous_pair;
+    remember_mode3_pair_pose_origin(
+        produced_pair, t_mode3_pair_pose_completed_time);
     if (w3vr::pipeline_flight::enabled() &&
         g_engine_dual_render_active.load(std::memory_order_acquire)) {
         w3vr::pipeline_flight::record_thread_sample(
@@ -33536,14 +37314,51 @@ void __fastcall hook_engine_render_scene_setup(void* renderer, float delta_time)
     if (mode3_stereo_transport_active() &&
         !mode3_aer_presentation_active() &&
         g_engine_dual_render_active.load() &&
-        produced_pair != 0) {
+        produced_pair != 0 &&
+        g_config.perf_pair_barrier_lag == 0) {
         const int64_t flight_pair_wait_begin =
             w3vr::pipeline_flight::cpu_begin();
-        wait_for_engine_pair_completion(produced_pair, 64);
+        const int64_t census_wait_begin = begin_engine_pair_barrier_census();
+        const bool released =
+            wait_for_engine_pair_completion(produced_pair, 64);
+        end_engine_pair_barrier_census(census_wait_begin, released);
         w3vr::pipeline_flight::cpu_end(
             w3vr::pipeline_flight::Phase::EnginePairWait,
             flight_pair_wait_begin,
             flight_hook_frame);
+    }
+    // [PERF:PAIR-BARRIER-LAG 7/11] Lag 1 waits for the pair the previous tick
+    // queued instead (see take_lagged_engine_pair_barrier), under the same
+    // exact strict-Stereo predicate. Never release a pair on its first eye:
+    // the floors and mask erasure in wait_for_engine_pair_completion() would
+    // then drop that pair's second completion, its captures and its 0x3 mask.
+    if (g_config.perf_pair_barrier_lag != 0) {
+        const uint64_t barrier_pair = take_lagged_engine_pair_barrier(
+            mode3_stereo_transport_active() &&
+                !mode3_aer_presentation_active() &&
+                g_engine_dual_render_active.load(),
+            produced_pair,
+            generation_before_setup ==
+                g_streamline_capture_generation.load(
+                    std::memory_order_acquire));
+        if (barrier_pair != 0) {
+            const int64_t flight_pair_wait_begin =
+                w3vr::pipeline_flight::cpu_begin();
+            const int64_t census_wait_begin =
+                begin_engine_pair_barrier_census();
+            const bool released =
+                wait_for_engine_pair_completion(barrier_pair, 64);
+            end_engine_pair_barrier_census(census_wait_begin, released);
+            w3vr::pipeline_flight::cpu_end(
+                w3vr::pipeline_flight::Phase::EnginePairWait,
+                flight_pair_wait_begin,
+                flight_hook_frame);
+        }
+    }
+    // [FEATURE:PAIR-RATE-LIMIT 2/2] After the barrier, so the cap measures
+    // whole ticks.
+    if (produced_pair != 0) {
+        limit_engine_pair_rate();
     }
     w3vr::pipeline_flight::cpu_end(
         w3vr::pipeline_flight::Phase::EngineSceneSetupHook,
@@ -34984,6 +38799,13 @@ bool prepare_full_vr_frame_camera(
                 centered_reused_fallback_fov_ready = true;
             }
         }
+        if (remaster_asymmetric_ndc_configured()) {
+            // The reused fallback camera is a centred (untagged) projection;
+            // drop any per-eye NDC offset its source view carried.
+            const size_t offset_index = engine_view_projection_offset();
+            corrected[offset_index] = 0.0f;
+            corrected[offset_index + 1] = 0.0f;
+        }
         if (native_asymmetric_reused_camera_fallback) {
             if (g_game_render_width == 0 || g_game_render_width > 16384 ||
                 g_game_render_height == 0 || g_game_render_height > 16384) {
@@ -35016,10 +38838,10 @@ bool prepare_full_vr_frame_camera(
             corrected[engine_view_centre() + 1] =
                 asymmetric_projection.redengine_center_offset_px_y;
             memcpy(
-                corrected.data() + 0x102, &g_game_render_width,
+                corrected.data() + engine_view_centre() + 2, &g_game_render_width,
                 sizeof(g_game_render_width));
             memcpy(
-                corrected.data() + 0x103, &g_game_render_height,
+                corrected.data() + engine_view_centre() + 3, &g_game_render_height,
                 sizeof(g_game_render_height));
             native_asymmetric_full_vr_eye_bit = static_cast<uint8_t>(
                 1u << static_cast<uint32_t>(eye));
@@ -35618,9 +39440,100 @@ bool load_mode3_marker_pose_hold(
     return true;
 }
 
+// [FIX:WORLD-MARKER-EXACT-HUD-PLANE 2/9] 5.01 fixed level HUD: markers are
+// projected with the frustum that the HUD plane's stage window subtends from
+// the cyclopean head (openxr_eye_geometry::hud_marker_clip_mapping), so a
+// marker's texel appears in the direction of its world point. Needs the 5.01
+// hook; 4.04 keeps its tuned marker gains.
+bool world_marker_exact_projection_active() {
+    return g_config.world_marker_exact_projection &&
+        g_config.hud_anchor_level &&
+        g_engine_world_vector_to_view_ratio != nullptr &&
+        running_game_build() == w3vr::game_build::Build::Remaster501 &&
+        fixed_gameplay_hud_requested();
+}
+
+// [FIX:WORLD-MARKER-EXACT-HUD-PLANE 3/9] The HUD centre square is redrawn
+// about the render centre so the aim crosshair stays on the aim axis. Outside
+// aiming it only lifts what crosses it by the scale-origin offset (markers of
+// NPCs in front jump about 6.6 degrees on Quest 3 at hud_size 0.5). Keep it
+// to presents whose HUD drew the AimProbe crosshair (the aim override's
+// 4-present window).
+bool hud_centre_split_allowed(uint64_t present) {
+    if (!g_config.hud_centre_split_aim_only ||
+        running_game_build() != w3vr::game_build::Build::Remaster501) {
+        return true;
+    }
+    const uint64_t crosshair_present =
+        g_aim_crosshair_last_present.load(std::memory_order_acquire);
+    return crosshair_present != UINT64_MAX && present >= crosshair_present &&
+        present - crosshair_present <= 4;
+}
+
+// The fixed-HUD composite publishes its plane scale and vertical scale
+// origin, so the marker mapping uses exactly the values the plane is drawn
+// with.
+void publish_world_marker_hud_plane(float hud_size, float origin_tangent_y) {
+    uint32_t size_bits{};
+    uint32_t origin_bits{};
+    memcpy(&size_bits, &hud_size, sizeof(size_bits));
+    memcpy(&origin_bits, &origin_tangent_y, sizeof(origin_bits));
+    if (g_world_marker_hud_plane_valid.load(std::memory_order_relaxed) &&
+        g_world_marker_hud_size_bits.load(std::memory_order_relaxed) == size_bits &&
+        g_world_marker_hud_origin_y_bits.load(std::memory_order_relaxed) == origin_bits) {
+        return;
+    }
+    g_world_marker_hud_size_bits.store(size_bits, std::memory_order_relaxed);
+    g_world_marker_hud_origin_y_bits.store(origin_bits, std::memory_order_relaxed);
+    g_world_marker_hud_plane_valid.store(true, std::memory_order_release);
+}
+
+// Mapping for a rebuilt cyclopean marker view: HUD source envelope and plane
+// as the composite draws them, the stage band from the HUD texture size, and
+// the marker camera's half tangents from its vertical FOV in degrees
+// (view[7]) and aspect (view[10]).
+bool build_world_marker_exact_mapping(
+    const float* marker_view,
+    w3vr::openxr_eye_geometry::HudMarkerClipMapping& mapping) {
+    if (marker_view == nullptr ||
+        !g_hmd_render_fov_valid.load(std::memory_order_acquire) ||
+        !g_world_marker_hud_plane_valid.load(std::memory_order_acquire)) {
+        return false;
+    }
+    const XrFovf source_fov{
+        g_hmd_render_fov_left.load(std::memory_order_relaxed),
+        g_hmd_render_fov_right.load(std::memory_order_relaxed),
+        g_hmd_render_fov_up.load(std::memory_order_relaxed),
+        g_hmd_render_fov_down.load(std::memory_order_relaxed)};
+    float stage_scale_x{};
+    float stage_scale_y{};
+    if (!w3vr::openxr_eye_geometry::scaleform_stage_ratio_scale(
+            g_game_render_width, g_game_render_height,
+            stage_scale_x, stage_scale_y)) {
+        return false;
+    }
+    const uint32_t size_bits =
+        g_world_marker_hud_size_bits.load(std::memory_order_relaxed);
+    const uint32_t origin_bits =
+        g_world_marker_hud_origin_y_bits.load(std::memory_order_relaxed);
+    float hud_size{};
+    float origin_tangent_y{};
+    memcpy(&hud_size, &size_bits, sizeof(hud_size));
+    memcpy(&origin_tangent_y, &origin_bits, sizeof(origin_tangent_y));
+    constexpr float kHalfDegreesToRadians =
+        3.14159265358979323846f / 360.0f;
+    const float half_y = tanf(marker_view[7] * kHalfDegreesToRadians);
+    const float half_x = half_y * marker_view[10];
+    return w3vr::openxr_eye_geometry::hud_marker_clip_mapping(
+        source_fov, half_x, half_y, hud_size, origin_tangent_y,
+        stage_scale_x, stage_scale_y, mapping);
+}
+
 void publish_packed_world_marker_camera(
     const float* view,
-    uint64_t present) {
+    uint64_t present,
+    const float* exact_clip,
+    const w3vr::openxr_eye_geometry::HudMarkerClipMapping* exact_mapping) {
     // [FIX:MODE3-MARKER-COMPLETED-PAIR 1/4] Mode 3's marker callback can run
     // while the factory is already preparing the next stereo pair. Preserve
     // each tagged eye-1 camera by pair so the callback can select the camera
@@ -35658,6 +39571,22 @@ void publish_packed_world_marker_camera(
         slot.hmd_roll_bits.store(roll_bits, std::memory_order_relaxed);
         slot.present.store(present, std::memory_order_relaxed);
         slot.pair_id.store(producer_pair, std::memory_order_relaxed);
+        const bool exact = exact_clip != nullptr && exact_mapping != nullptr;
+        if (exact) {
+            for (size_t index = 0; index < slot.exact_clip_bits.size(); ++index) {
+                uint32_t bits{};
+                memcpy(&bits, exact_clip + index, sizeof(bits));
+                slot.exact_clip_bits[index].store(bits, std::memory_order_relaxed);
+            }
+            std::array<uint32_t,
+                PackedWorldMarkerCameraSlot::kExactMappingFloatCount> mapping_bits{};
+            memcpy(mapping_bits.data(), exact_mapping, sizeof(*exact_mapping));
+            for (size_t index = 0; index < mapping_bits.size(); ++index) {
+                slot.exact_mapping_bits[index].store(
+                    mapping_bits[index], std::memory_order_relaxed);
+            }
+        }
+        slot.exact_clip_valid.store(exact, std::memory_order_relaxed);
         slot.sequence.fetch_add(1, std::memory_order_release);
     };
     publish_slot(g_packed_world_marker_camera);
@@ -35742,6 +39671,49 @@ bool load_mode3_world_marker_camera(
         return false;
     }
     return pair_id == requested_pair;
+}
+
+// [FIX:WORLD-MARKER-EXACT-HUD-PLANE 4/9] Reads only the final marker matrix
+// of a slot (16 floats instead of the 512-float view), from the pair slot of
+// requested_pair, or from the latest eye-1 camera when requested_pair is 0.
+bool load_world_marker_exact_clip(
+    uint64_t requested_pair,
+    std::array<float, 16>& matrix,
+    w3vr::openxr_eye_geometry::HudMarkerClipMapping& mapping,
+    uint64_t& present,
+    uint64_t& pair_id) {
+    auto& slot = requested_pair != 0
+        ? g_mode3_world_marker_camera_pair_slots[
+            requested_pair % kMode3WorldMarkerCameraPairSlotCount]
+        : g_packed_world_marker_camera;
+    const uint64_t sequence_before = slot.sequence.load(std::memory_order_acquire);
+    if (sequence_before == 0 || (sequence_before & 1ull) != 0 ||
+        !slot.exact_clip_valid.load(std::memory_order_relaxed)) {
+        return false;
+    }
+    std::array<float, 16> loaded_matrix{};
+    for (size_t index = 0; index < loaded_matrix.size(); ++index) {
+        const uint32_t bits = slot.exact_clip_bits[index].load(std::memory_order_relaxed);
+        memcpy(loaded_matrix.data() + index, &bits, sizeof(bits));
+    }
+    std::array<uint32_t, PackedWorldMarkerCameraSlot::kExactMappingFloatCount>
+        mapping_bits{};
+    for (size_t index = 0; index < mapping_bits.size(); ++index) {
+        mapping_bits[index] = slot.exact_mapping_bits[index].load(std::memory_order_relaxed);
+    }
+    const uint64_t loaded_present = slot.present.load(std::memory_order_relaxed);
+    const uint64_t loaded_pair = slot.pair_id.load(std::memory_order_relaxed);
+    const uint64_t sequence_after = slot.sequence.load(std::memory_order_acquire);
+    if (sequence_after != sequence_before || loaded_present == UINT64_MAX ||
+        loaded_pair == 0 ||
+        (requested_pair != 0 && loaded_pair != requested_pair)) {
+        return false;
+    }
+    matrix = loaded_matrix;
+    memcpy(&mapping, mapping_bits.data(), sizeof(mapping));
+    present = loaded_present;
+    pair_id = loaded_pair;
+    return true;
 }
 
 void publish_world_marker_projection(const float* projection, uint64_t present) {
@@ -37962,6 +41934,11 @@ bool prepare_engine_per_eye_native_temporal_history(
         return false;
     }
 
+    // 5.01 engine DLSS: only while the game's DLSS really runs per eye.
+    if (!dlss_sequential_mode_active() && !mode3_taau_full_motion &&
+        !remaster_engine_dlss_per_eye_running()) {
+        return false;
+    }
     const int eye = g_engine_factory_eye;
     const uint64_t pair_id = g_engine_producer_pair_id;
     const bool time_valid =
@@ -37998,7 +41975,9 @@ bool prepare_engine_per_eye_native_temporal_history(
         const auto& previous_record = continued
             ? slot.record
             : current_record;
-        memcpy(reinterpret_cast<uint8_t*>(view) + 0x460,
+        memcpy(reinterpret_cast<uint8_t*>(view) +
+                engine_frame_offset(
+                    w3vr::engine_addresses::Value::TemporalCameraRecordOffset),
             previous_record.data(), previous_record.size());
         slot.record = current_record;
         slot.pair_id = pair_id;
@@ -38030,6 +42009,369 @@ bool prepare_engine_per_eye_native_temporal_history(
     return true;
 }
 
+// [FEATURE:REMASTER-ASYMMETRIC-NDC 5/6] After every 5.01 view rebuild:
+// - factory eye views that received a per-eye frustum are verified against
+//   the projection the engine actually built (P[2][0], P[2][1] = offset +
+//   centre/jitter translation) and only then tagged in the pair slot, so the
+//   submit never advertises an eye whose rebuild was altered;
+// - the current-to-previous clip reprojection (view+0x400) is rebuilt by the
+//   engine from the projections before any translation, while the image is
+//   rendered with the offset. For a constant per-eye offset T the matching
+//   matrix is T^-1 * R * T (row vectors), applied to every view carrying the
+//   offset (factory, temporal writer and copy rebuilds alike).
+std::atomic<uint32_t> g_randc_verified_eyes{};
+std::atomic<uint32_t> g_randc_rejected_eyes{};
+std::atomic<uint32_t> g_randc_reprojected{};
+
+void finish_remaster_asymmetric_ndc_rebuild(
+    float* view,
+    uintptr_t caller_rva,
+    bool applied,
+    NativeAsymmetricPairSlot* slot,
+    float expected_fov,
+    float expected_aspect,
+    float expected_x,
+    float expected_y) {
+    const size_t o = engine_view_projection_offset();
+    if (o == 0) {
+        return;
+    }
+    const size_t c = engine_view_centre();
+    const float offset_x = view[o];
+    const float offset_y = view[o + 1];
+    uint32_t extent_w{};
+    uint32_t extent_h{};
+    memcpy(&extent_w, view + c + 2, sizeof(extent_w));
+    memcpy(&extent_h, view + c + 3, sizeof(extent_h));
+    const float jitter_ndc_x =
+        2.0f * view[c] / static_cast<float>(std::max<uint32_t>(extent_w, 1));
+    const float jitter_ndc_y =
+        2.0f * view[c + 1] / static_cast<float>(std::max<uint32_t>(extent_h, 1));
+    if (view[c] != 0.0f || view[c + 1] != 0.0f) {
+        const uint64_t previous = g_randc_last_jitter_present.exchange(
+            g_present_count.load(std::memory_order_relaxed),
+            std::memory_order_release);
+        if (previous == UINT64_MAX && g_config.runtime_diagnostics) {
+            log_line("RANDC temporal jitter seen caller=0x%llX centre=%.4f,%.4f extent=%ux%u",
+                static_cast<unsigned long long>(caller_rva), view[c], view[c + 1],
+                extent_w, extent_h);
+        }
+    }
+    if (applied) {
+        const int eye = g_engine_factory_eye;
+        const float error_x = fabsf(view[0x68] - (expected_x + jitter_ndc_x));
+        const float error_y = fabsf(view[0x69] - (expected_y + jitter_ndc_y));
+        const bool ok = slot != nullptr && eye >= 0 && eye <= 1 &&
+            slot->pair_id.load(std::memory_order_acquire) ==
+                g_engine_producer_pair_id &&
+            fabsf(view[7] - expected_fov) <= 0.0001f &&
+            fabsf(view[10] - expected_aspect) <= 0.000001f &&
+            offset_x == expected_x && offset_y == expected_y &&
+            error_x <= 0.00001f && error_y <= 0.00001f;
+        if (ok) {
+            slot->factory_mask.fetch_or(
+                static_cast<uint8_t>(1u << eye), std::memory_order_release);
+            const uint32_t verified =
+                g_randc_verified_eyes.fetch_add(1, std::memory_order_relaxed);
+            if (g_config.runtime_diagnostics && (verified < 8 || verified % 2000 == 0)) {
+                log_line(
+                    "RANDC verify sample=%u pair=%llu eye=%d p20=%.6f p21=%.6f "
+                    "jitter_ndc=%.6f,%.6f offset=%.6f,%.6f mask=0x%X | "
+                    "pairs asym=%llu sym=%llu rejected_eyes=%u reprojected=%u cascade_fits=%u",
+                    verified, static_cast<unsigned long long>(g_engine_producer_pair_id),
+                    eye, view[0x68], view[0x69], jitter_ndc_x, jitter_ndc_y,
+                    offset_x, offset_y,
+                    slot->factory_mask.load(std::memory_order_relaxed),
+                    static_cast<unsigned long long>(
+                        g_randc_accepted_pairs.load(std::memory_order_relaxed)),
+                    static_cast<unsigned long long>(
+                        g_randc_symmetric_pairs.load(std::memory_order_relaxed)),
+                    g_randc_rejected_eyes.load(std::memory_order_relaxed),
+                    g_randc_reprojected.load(std::memory_order_relaxed),
+                    g_randc_cascade_fits.load(std::memory_order_relaxed));
+            }
+        } else {
+            const uint32_t rejected =
+                g_randc_rejected_eyes.fetch_add(1, std::memory_order_relaxed);
+            if (g_config.runtime_diagnostics && rejected < 32) {
+                log_line(
+                    "RANDC verify REJECT sample=%u pair=%llu eye=%d fov=%.6f/%.6f "
+                    "aspect=%.6f/%.6f offset=%.6f,%.6f/%.6f,%.6f err=%.2e,%.2e slot=%d",
+                    rejected, static_cast<unsigned long long>(g_engine_producer_pair_id),
+                    eye, view[7], expected_fov, view[10], expected_aspect,
+                    offset_x, offset_y, expected_x, expected_y, error_x, error_y,
+                    slot != nullptr ? 1 : 0);
+            }
+        }
+    }
+    if (offset_x == 0.0f && offset_y == 0.0f) {
+        return;
+    }
+    if (!applied && g_config.runtime_diagnostics) {
+        static std::atomic<uint32_t> propagation_logs{};
+        if (propagation_logs.fetch_add(1, std::memory_order_relaxed) < 16) {
+            log_line(
+                "RANDC propagated caller=0x%llX offset=%.6f,%.6f p20-jitter=%.6f p21-jitter=%.6f",
+                static_cast<unsigned long long>(caller_rva), offset_x, offset_y,
+                view[0x68] - jitter_ndc_x, view[0x69] - jitter_ndc_y);
+        }
+    }
+    const size_t r = engine_view_reprojection_matrix();
+    if (!g_config.remaster_asymmetric_ndc_reproject || r == 0) {
+        return;
+    }
+    float* m = view + r;  // row-major 4x4, row vectors: prev = cur * M
+    float before[16];
+    memcpy(before, m, sizeof(before));
+    // A = T^-1 * M: only row 3 changes.
+    for (int j = 0; j < 4; ++j) {
+        m[12 + j] = before[12 + j] - offset_x * before[j] - offset_y * before[4 + j];
+    }
+    // M' = A * T: columns 0 and 1 gain offset * column 3.
+    for (int i = 0; i < 4; ++i) {
+        m[i * 4 + 0] += offset_x * m[i * 4 + 3];
+        m[i * 4 + 1] += offset_y * m[i * 4 + 3];
+    }
+    const uint32_t reprojected =
+        g_randc_reprojected.fetch_add(1, std::memory_order_relaxed);
+    const bool moving = fabsf(before[12]) > 0.0005f || fabsf(before[3]) > 0.0005f;
+    static std::atomic<uint32_t> moving_logs{};
+    if (g_config.runtime_diagnostics &&
+        (reprojected < 4 ||
+            (moving && moving_logs.fetch_add(1, std::memory_order_relaxed) < 12))) {
+        log_line(
+            "RANDC reproject sample=%u caller=0x%llX offset=%.6f,%.6f "
+            "R00=%.6f R03=%.6f R30=%.6f R33=%.6f R20=%.6f R02=%.6f -> R30'=%.6f R31'=%.6f",
+            reprojected, static_cast<unsigned long long>(caller_rva),
+            offset_x, offset_y, before[0], before[3], before[12], before[15],
+            before[8], before[2], m[12], m[13]);
+    }
+}
+
+// [FEATURE:CAMERA-CENTRE 2/6] Geralt centring for the near view. The player
+// is measured against the game camera once per stereo pair (per Present
+// under AER, the same key rule as the first-person head pose), so both eyes
+// of a pair get the same shift. The filter state belongs to the factory
+// thread, like the eye identity it is keyed by.
+struct CameraCentreSample {
+    bool measured{};
+    float player[3]{};
+    float lateral_m{};  // player offset along the camera's level right vector
+    float forward_m{};  // player offset along the camera's level forward vector
+    float shift_m{};    // camera move along the level right vector
+    uint32_t epoch{};
+};
+struct CameraCentreState {
+    uint64_t key{};
+    uint64_t present{};
+    bool key_is_pair{};
+    bool decided{};
+    bool filter_valid{};
+    uint32_t epoch{};
+    int64_t last_qpc{};
+    float filtered_m{};
+    CameraCentreSample sample{};
+};
+thread_local CameraCentreState g_camera_centre_state{};
+// Bumped on the first gameplay camera after any camera without native
+// gameplay authority (cutscene, dialogue, loading, F10 panel).
+std::atomic<uint32_t> g_camera_centre_epoch{};
+std::atomic<bool> g_camera_centre_authority_lost{true};
+std::atomic<uint32_t> g_camera_centre_reset_logs{};
+
+// 5.01 CNode.GetWorldPosition (0x142267E50) reads this+0xA0/A4/A8; its
+// bytes are checked once, so a different exe never trusts the offset. 4.04
+// has the same layout (read_native_player_root_pose). Other builds fail
+// closed.
+bool remaster_node_world_position_signature_matches() {
+    constexpr uintptr_t kNodeGetWorldPositionRva = 0x02267E50;
+    constexpr uint8_t kExpected[] = {
+        0x48, 0xFF, 0x42, 0x30,                          // inc [rdx+30h]
+        0xC5, 0xFA, 0x10, 0x81, 0xA0, 0x00, 0x00, 0x00,  // vmovss xmm0,[rcx+0A0h]
+        0xC5, 0xFA, 0x10, 0x89, 0xA4, 0x00, 0x00, 0x00,  // vmovss xmm1,[rcx+0A4h]
+        0xC5, 0xFA, 0x10, 0x91, 0xA8, 0x00, 0x00, 0x00,  // vmovss xmm2,[rcx+0A8h]
+    };
+    const auto* module =
+        reinterpret_cast<const uint8_t*>(GetModuleHandleW(nullptr));
+    if (module == nullptr) {
+        return false;
+    }
+    __try {
+        return memcmp(module + kNodeGetWorldPositionRva, kExpected,
+            sizeof(kExpected)) == 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+bool native_player_world_position_supported() {
+    static const bool supported = [] {
+        const bool remaster = running_game_build() ==
+            w3vr::game_build::Build::Remaster501;
+        const bool result = remaster
+            ? remaster_node_world_position_signature_matches()
+            : engine_build_supported();
+        if (remaster || !result) {
+            log_line("Camera centre player position %s build=%s",
+                result ? "verified" : "unavailable; centring stays off",
+                w3vr::game_build::name(running_game_build()));
+        }
+        return result;
+    }();
+    return supported;
+}
+
+bool read_native_player_world_position(float* position) {
+    if (position == nullptr || !native_player_world_position_supported()) {
+        return false;
+    }
+    const void* player =
+        g_engine_native_player.load(std::memory_order_acquire);
+    if (player == nullptr) {
+        return false;
+    }
+    __try {
+        memcpy(position, static_cast<const uint8_t*>(player) + 0xA0,
+            3 * sizeof(float));
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+    return std::isfinite(position[0]) && std::isfinite(position[1]) &&
+        std::isfinite(position[2]);
+}
+
+// Player offset from a camera along its level right and forward vectors
+// (camera-space x/y of the factory view basis, view[0xA0] and view[0xA4]).
+bool measure_camera_centre(
+    const float* camera,
+    const float* right,
+    const float* forward,
+    CameraCentreSample& sample) {
+    const float right_length = sqrtf(right[0] * right[0] + right[1] * right[1]);
+    const float forward_length =
+        sqrtf(forward[0] * forward[0] + forward[1] * forward[1]);
+    if (right_length < 0.0001f || forward_length < 0.0001f ||
+        !read_native_player_world_position(sample.player)) {
+        return false;
+    }
+    const float dx = sample.player[0] - camera[0];
+    const float dy = sample.player[1] - camera[1];
+    sample.lateral_m = (dx * right[0] + dy * right[1]) / right_length;
+    sample.forward_m = (dx * forward[0] + dy * forward[1]) / forward_length;
+    sample.measured = std::isfinite(sample.lateral_m) &&
+        std::isfinite(sample.forward_m);
+    return sample.measured;
+}
+
+// F8 stores g_camera_mode on the present thread while the game thread builds
+// the two eye views of a pair back to back; latch the mode once per strict
+// Stereo pair so both eyes of a pair use the same camera.
+int camera_mode_for_factory_view() {
+    thread_local uint64_t latched_pair{};
+    thread_local int latched_mode{};
+    const int mode = g_camera_mode.load(std::memory_order_relaxed);
+    const uint64_t pair = g_engine_producer_pair_id;
+    if (mode3_aer_presentation_active() || pair == 0 || pair == UINT64_MAX) {
+        return mode;
+    }
+    if (pair != latched_pair) {
+        latched_pair = pair;
+        latched_mode = mode;
+    }
+    return latched_mode;
+}
+
+// Filtered camera move along the level right vector for this factory view.
+// An implausible measurement (no third-person camera 1.2-8 m behind the
+// player, or a lateral offset beyond camera_center_max_m) targets 0, i.e. the
+// game's own shoulder camera.
+void update_camera_centre(
+    const float* view,
+    uint64_t present,
+    CameraCentreSample& result) {
+    auto& state = g_camera_centre_state;
+    const bool key_is_pair = !mode3_aer_presentation_active() &&
+        g_engine_producer_pair_id != 0 &&
+        g_engine_producer_pair_id != UINT64_MAX;
+    const uint64_t key = key_is_pair ? g_engine_producer_pair_id : present;
+    if (state.decided && state.key == key &&
+        state.key_is_pair == key_is_pair &&
+        present >= state.present && present - state.present <= 2) {
+        result = state.sample;
+        return;
+    }
+    if (g_camera_centre_authority_lost.load(std::memory_order_relaxed) &&
+        g_camera_centre_authority_lost.exchange(
+            false, std::memory_order_acq_rel)) {
+        g_camera_centre_epoch.fetch_add(1, std::memory_order_acq_rel);
+    }
+    const uint32_t epoch =
+        g_camera_centre_epoch.load(std::memory_order_acquire);
+    CameraCentreSample sample{};
+    // The game aims bolts and bombs from its own (unshifted) camera, so while
+    // aiming the camera glides back onto the game's aim ray and the crosshair
+    // stays on target. Aim cameras sit 0.1-0.9 m behind the player (aimThrow
+    // offsets), exploration and combat cameras 1.8 m or more, so the distance
+    // gate releases the centring even when the AimProbe signal does not fire.
+    const bool aiming =
+        g_first_person_engine_aim_active.load(std::memory_order_acquire);
+    const bool trusted = !aiming &&
+        measure_camera_centre(view, view + 0xA0, view + 0xA4, sample) &&
+        sample.forward_m >= 1.2f && sample.forward_m <= 8.0f &&
+        fabsf(sample.lateral_m) <= g_config.camera_center_max_m &&
+        fabsf(sample.player[2] - view[2]) <= 5.0f;
+    const float target =
+        trusted ? sample.lateral_m * g_config.camera_center : 0.0f;
+
+    static const int64_t qpc_frequency = [] {
+        LARGE_INTEGER frequency{};
+        QueryPerformanceFrequency(&frequency);
+        return frequency.QuadPart;
+    }();
+    LARGE_INTEGER now{};
+    QueryPerformanceCounter(&now);
+    float delta_seconds = 0.0f;
+    if (state.filter_valid && qpc_frequency > 0 &&
+        now.QuadPart > state.last_qpc) {
+        delta_seconds = static_cast<float>(now.QuadPart - state.last_qpc) /
+            static_cast<float>(qpc_frequency);
+    }
+    const char* reset_reason = !state.filter_valid ? "first"
+        : (state.epoch != epoch ? "epoch"
+            : (delta_seconds > 0.25f ? "gap"
+                : (fabsf(target - state.filtered_m) > 1.0f ? "jump"
+                    : nullptr)));
+    const float tau = g_config.camera_center_smoothing_seconds;
+    if (reset_reason != nullptr || tau <= 0.0f) {
+        state.filtered_m = target;
+    } else {
+        state.filtered_m +=
+            (target - state.filtered_m) * (1.0f - expf(-delta_seconds / tau));
+    }
+    if (reset_reason != nullptr && g_config.runtime_diagnostics &&
+        g_camera_centre_reset_logs.fetch_add(
+            1, std::memory_order_relaxed) < 64) {
+        log_line(
+            "Camera centre reset reason=%s epoch=%u present=%llu pair=%llu "
+            "measured=%d trusted=%d lat=%.3f fwd=%.3f target=%.3f",
+            reset_reason, epoch, static_cast<unsigned long long>(present),
+            static_cast<unsigned long long>(g_engine_producer_pair_id),
+            sample.measured ? 1 : 0, trusted ? 1 : 0, sample.lateral_m,
+            sample.forward_m, target);
+    }
+    sample.shift_m = state.filtered_m;
+    sample.epoch = epoch;
+    state.key = key;
+    state.present = present;
+    state.key_is_pair = key_is_pair;
+    state.decided = true;
+    state.filter_valid = true;
+    state.epoch = epoch;
+    state.last_qpc = now.QuadPart;
+    state.sample = sample;
+    result = sample;
+}
+
 void __fastcall hook_engine_view_rebuild(float* view) {
     const uintptr_t kViewFactoryReturnRva = view_factory_return_rva();
     const uintptr_t kViewCopyRebuildReturnRva = view_copy_rebuild_return_rva();
@@ -38037,6 +42379,21 @@ void __fastcall hook_engine_view_rebuild(float* view) {
     const auto module = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
     const auto caller_rva = reinterpret_cast<uintptr_t>(_ReturnAddress()) - module;
     const auto present = g_present_count.load();
+    const bool camera_trace = g_config.camera_offset_trace &&
+        view != nullptr && caller_rva == kViewFactoryReturnRva;
+    float camera_trace_entry[3]{};
+    float camera_trace_entry_right[2]{};
+    float camera_trace_entry_forward[2]{};
+    if (camera_trace) {
+        memcpy(camera_trace_entry, view, sizeof(camera_trace_entry));
+        memcpy(camera_trace_entry_right, view + 0xA0,
+            sizeof(camera_trace_entry_right));
+        memcpy(camera_trace_entry_forward, view + 0xA4,
+            sizeof(camera_trace_entry_forward));
+    }
+    bool camera_trace_near_offset{};
+    bool camera_centre_applied{};
+    CameraCentreSample camera_centre_sample{};
     const bool asymmetric_factory_view_candidate =
         asymmetric_authority_audit_active() && view != nullptr &&
         g_asymmetric_factory_scene_descriptor != nullptr &&
@@ -38249,6 +42606,16 @@ void __fastcall hook_engine_view_rebuild(float* view) {
     const bool native_loading_video =
         g_engine_loading_screen_video_active.load(
             std::memory_order_acquire);
+    // [FEATURE:CAMERA-CENTRE 3/6] A factory camera without native gameplay
+    // authority (cutscene, dialogue, loading, F10 panel) ends the centring
+    // epoch: the first gameplay camera after it is centred at once instead
+    // of sliding over from the last gameplay frame before it.
+    if (factory_perspective_camera &&
+        (!native_gameplay_camera_authority || native_loading_video ||
+            suppress_hmd_camera) &&
+        !g_camera_centre_authority_lost.load(std::memory_order_relaxed)) {
+        g_camera_centre_authority_lost.store(true, std::memory_order_relaxed);
+    }
     const bool native_automatic_cutscene =
         native_camera_authority.player_non_gameplay_cutscene == 1 ||
         native_camera_authority.game_non_gameplay_scene == 1;
@@ -38444,6 +42811,69 @@ void __fastcall hook_engine_view_rebuild(float* view) {
             }
         }
     }
+    // [FEATURE:REMASTER-ASYMMETRIC-NDC 4/6] 5.01: give this eye its own
+    // frustum. The FOV/aspect span the eye's tangent interval and the NDC
+    // offset (written just before the rebuild, below) moves its optical
+    // centre, so the full render target is exactly the eye's field of view.
+    // The centre block stays untouched: on 5.01 it is the DLSS jitter.
+    bool randc_applied{};
+    float randc_fov{};
+    float randc_aspect{};
+    float randc_x{};
+    float randc_y{};
+    NativeAsymmetricPairSlot* randc_slot{};
+    const size_t randc_offset_index = engine_view_projection_offset();
+    const bool randc_configured_factory =
+        remaster_asymmetric_ndc_configured() &&
+        caller_rva == kViewFactoryReturnRva && view != nullptr &&
+        randc_offset_index != 0;
+    const bool randc_candidate = randc_configured_factory &&
+        g_engine_factory_eye >= 0 && g_engine_factory_eye <= 1 &&
+        remaster_asymmetric_ndc_pair_gate(g_engine_producer_pair_id) &&
+        world_camera && hmd_scene_camera && !automatic_full_vr_cutscene &&
+        !normal_stereo_cinema_camera && !suppress_hmd_camera &&
+        native_asymmetric_factory_render_width > 0 &&
+        native_asymmetric_factory_render_width <= 16384 &&
+        native_asymmetric_factory_render_height > 0 &&
+        native_asymmetric_factory_render_height <= 16384 &&
+        g_xr_views.size() > static_cast<size_t>(g_engine_factory_eye);
+    if (randc_candidate) {
+        if (native_asymmetric_pair_slot(g_engine_producer_pair_id) == nullptr) {
+            initialize_remaster_asymmetric_ndc_pair(g_engine_producer_pair_id);
+        }
+        randc_slot = native_asymmetric_pair_slot(g_engine_producer_pair_id);
+        w3vr::openxr_eye_geometry::AsymmetricProjectionDescriptor descriptor{};
+        XrFovf frozen_fov{};
+        if (randc_slot != nullptr &&
+            snapshot_native_asymmetric_pair_fov(
+                g_engine_producer_pair_id,
+                static_cast<uint32_t>(g_engine_factory_eye), frozen_fov) &&
+            w3vr::openxr_eye_geometry::derive_asymmetric_projection_descriptor(
+                frozen_fov, native_asymmetric_factory_render_width,
+                native_asymmetric_factory_render_height, descriptor)) {
+            view[7] = descriptor.vertical_fov_degrees;
+            view[10] = descriptor.aspect;
+            randc_fov = view[7];
+            randc_aspect = view[10];
+            randc_x = descriptor.center_ndc_x;
+            randc_y = descriptor.center_ndc_y;
+            randc_applied = true;
+            static std::atomic<uint32_t> randc_factory_logs{};
+            if (g_config.runtime_diagnostics &&
+                randc_factory_logs.fetch_add(1, std::memory_order_relaxed) < 8) {
+                log_line(
+                    "RANDC factory pair=%llu eye=%d fov=%.6f aspect=%.6f "
+                    "offset=%.6f,%.6f slot_fov=%.6f,%.6f,%.6f,%.6f render=%ux%u",
+                    static_cast<unsigned long long>(g_engine_producer_pair_id),
+                    g_engine_factory_eye, randc_fov, randc_aspect,
+                    randc_x, randc_y, frozen_fov.angleLeft,
+                    frozen_fov.angleRight, frozen_fov.angleUp,
+                    frozen_fov.angleDown,
+                    native_asymmetric_factory_render_width,
+                    native_asymmetric_factory_render_height);
+            }
+        }
+    }
     if (hmd_scene_camera && !suppress_hmd_camera &&
         g_xr_views.size() >= 2) {
         const auto& xr_fov = g_xr_views[0].fov;
@@ -38488,7 +42918,8 @@ void __fastcall hook_engine_view_rebuild(float* view) {
             const float symmetric_fov =
                 vertical_fov * (180.0f / 3.14159265358979323846f);
             const float symmetric_aspect = horizontal_span / vertical_span;
-            if (!native_asymmetric_factory_projection_applied) {
+            if (!native_asymmetric_factory_projection_applied &&
+                !randc_applied) {
                 view[7] = symmetric_fov;
                 view[10] = symmetric_aspect;
             } else {
@@ -38510,6 +42941,15 @@ void __fastcall hook_engine_view_rebuild(float* view) {
     const bool render_right_eye = g_engine_factory_eye >= 0
         ? g_engine_factory_eye == 1
         : (present & 1ull) != 0;
+    // [FIX:MENU-MONO-CAMERA 1/4] Fullscreen menus are single-view: the
+    // duplicate factory is disabled (stereo_render_eligible requires
+    // menu==0), g_engine_factory_eye stays -1 and the menu quad shows the one
+    // live backbuffer to both eyes. Per-eye camera edits must then not fall
+    // back to the Present-parity eye above, which alternated the paused world
+    // by +/- half the IPD (and the optional native projection shift) on
+    // every Present. Snapshot once so both edits below agree.
+    const bool eye_camera_edits_allowed = g_engine_factory_eye >= 0 ||
+        g_engine_menu_state.load(std::memory_order_relaxed) == 0;
     if (!world_camera && caller_rva == kViewFactoryReturnRva && view != nullptr &&
         g_engine_menu_state.load(std::memory_order_relaxed) == 0) {
         static std::atomic<uint32_t> rejected_world_camera_logs{};
@@ -38530,7 +42970,10 @@ void __fastcall hook_engine_view_rebuild(float* view) {
     float native_combat_lock_yaw{};
     if (world_camera && !suppress_hmd_camera &&
         g_engine_menu_state.load() == 0) {
-        const int camera_mode = g_camera_mode.load(std::memory_order_relaxed);
+        if (!g_hmd_center_gameplay_used.load(std::memory_order_relaxed)) {
+            g_hmd_center_gameplay_used.store(true, std::memory_order_relaxed);
+        }
+        const int camera_mode = camera_mode_for_factory_view();
         native_head_pose_owner = camera_mode == 2 &&
             acquire_pair_frozen_native_head_pose(
                 present,
@@ -38656,7 +43099,37 @@ void __fastcall hook_engine_view_rebuild(float* view) {
         float forward_offset{};
         float up_offset{};
         if (camera_mode == 1) {
-            forward_offset = g_config.engine_close_camera_offset;
+            camera_trace_near_offset = true;
+            // [FEATURE:CAMERA-CENTRE 4/6] Measured on the game camera before
+            // the near-view distance move. The shift is along the level
+            // right vector, so it leaves that move and the height unchanged.
+            const float horizontal_right_length = sqrtf(
+                view[0xA0] * view[0xA0] + view[0xA1] * view[0xA1]);
+            if (g_config.camera_center > 0.0f &&
+                horizontal_right_length > 0.0001f) {
+                update_camera_centre(view, present, camera_centre_sample);
+                camera_centre_applied = true;
+                view[0] += view[0xA0] / horizontal_right_length *
+                    camera_centre_sample.shift_m;
+                view[1] += view[0xA1] / horizontal_right_length *
+                    camera_centre_sample.shift_m;
+            }
+            const float horizontal_forward_length = sqrtf(
+                view[0xA4] * view[0xA4] + view[0xA5] * view[0xA5]);
+            if (g_config.close_camera_level && g_config.hmd_lock_game_pitch &&
+                horizontal_forward_length > 0.0001f) {
+                // With the game pitch locked the rendered view is level, so
+                // the near view is a constant horizontal move. Riding the
+                // hidden game pitch turned every game pitch change (the 5.x
+                // exploration camera pulls pitch to -10 degrees every tick)
+                // into extra up/down and in/out camera motion.
+                view[0] += view[0xA4] / horizontal_forward_length *
+                    g_config.engine_close_camera_offset;
+                view[1] += view[0xA5] / horizontal_forward_length *
+                    g_config.engine_close_camera_offset;
+            } else {
+                forward_offset = g_config.engine_close_camera_offset;
+            }
         } else if (camera_mode == 2) {
             // [FIX:FIRST-PERSON-STATIC-ANCHOR 2/2] Apply the validated
             // orbit-cancellation vector unless the rejected legacy dynamic
@@ -38757,9 +43230,11 @@ void __fastcall hook_engine_view_rebuild(float* view) {
     // Build the same game/FOV/camera-mode view without HMD pose. Its vertical
     // column is the factor-1 base; only the later HMD delta is amplified for
     // world markers.
+    // Only the WorldVectorToViewRatio hook consumes it.
     std::array<float, 512> world_marker_camera_view{};
     bool world_marker_camera_valid = world_camera && !suppress_hmd_camera &&
         g_config.hmd_freelook && g_engine_menu_state.load() == 0 &&
+        g_engine_world_vector_to_view_ratio != nullptr &&
         safe_copy_engine_view_snapshot(
             view, world_marker_camera_view.data(),
             sizeof(world_marker_camera_view));
@@ -38768,6 +43243,15 @@ void __fastcall hook_engine_view_rebuild(float* view) {
         world_marker_camera_view[7] = native_asymmetric_marker_fov;
         world_marker_camera_view[10] = native_asymmetric_marker_aspect;
     }
+    // [FIX:WORLD-MARKER-EXACT-HUD-PLANE 5/9] On the 5.01 fixed level HUD the
+    // marker camera is the render camera without the HMD rotation and without
+    // the per-eye offset: cyclopean position (game camera, near view, HMD
+    // position) and the HUD plane's orientation (game yaw, rendered game
+    // pitch). The mapping is applied after its rebuild. Set once the HMD
+    // block has given it that orientation.
+    const bool world_marker_exact_camera = world_marker_camera_valid &&
+        world_marker_exact_projection_active();
+    bool world_marker_exact_orientation{};
     XrQuaternionf applied_hmd_orientation{0.0f, 0.0f, 0.0f, 1.0f};
     XrVector3f applied_hmd_position{};
     bool applied_hmd_pose_valid{};
@@ -38979,7 +43463,11 @@ void __fastcall hook_engine_view_rebuild(float* view) {
                     game_pitch_delta += 360.0f;
                 }
                 game_pitch_delta -= 180.0f;
-                if (g_config.world_marker_game_pitch_depth_enabled) {
+                // The exact marker camera already sits where the orbit put
+                // the render camera and looks along the plane: no gains.
+                const bool marker_game_pitch_gains = !world_marker_exact_camera;
+                if (g_config.world_marker_game_pitch_depth_enabled &&
+                    marker_game_pitch_gains) {
                     // REDengine's mouse-driven vertical orbit is a camera
                     // translation, so reproduce the marker correction in
                     // camera space. Projection then supplies the required
@@ -38988,7 +43476,8 @@ void __fastcall hook_engine_view_rebuild(float* view) {
                         g_config.world_marker_game_pitch_depth_scale;
                 }
                 const float marker_game_pitch = game_pitch +
-                    (g_config.world_marker_game_pitch_depth_enabled
+                    (g_config.world_marker_game_pitch_depth_enabled ||
+                            !marker_game_pitch_gains
                         ? 0.0f
                         : game_pitch_delta *
                             g_config.world_marker_game_pitch_gain);
@@ -39027,6 +43516,8 @@ void __fastcall hook_engine_view_rebuild(float* view) {
                 } else {
                     world_marker_camera_valid = false;
                 }
+                world_marker_exact_orientation =
+                    world_marker_exact_camera && world_marker_camera_valid;
             }
             const w3vr::hmd_camera_orientation::EulerDegrees hmd_rotation{
                 scaled_hmd_roll,
@@ -39096,8 +43587,10 @@ void __fastcall hook_engine_view_rebuild(float* view) {
     const bool native_projection_ready = g_config.engine_native_projection_shift &&
         (!g_engine_dual_render_active.load() ||
             present > g_dual_render_activation_present.load() + 300);
-    if (!native_asymmetric_factory_projection_applied &&
+    // [FIX:MENU-MONO-CAMERA 2/4] Same parity gate as the stereo offset.
+    if (!native_asymmetric_factory_projection_applied && !randc_applied &&
         hmd_scene_camera && !suppress_hmd_camera && native_projection_ready &&
+        eye_camera_edits_allowed &&
         g_game_render_width > 0 && g_game_render_height > 0) {
         view[engine_view_centre()] = render_right_eye
             ? static_cast<float>(g_config.engine_native_projection_shift_px)
@@ -39158,6 +43651,7 @@ void __fastcall hook_engine_view_rebuild(float* view) {
             }
         }
         if (native_canted_applied && world_marker_camera_valid &&
+            !world_marker_exact_camera &&
             !apply_native_canted_eye_transform(
                 world_marker_camera_view.data(), camera_hmd_pose,
                 native_canted_eye)) {
@@ -39168,6 +43662,7 @@ void __fastcall hook_engine_view_rebuild(float* view) {
     }
     if ((world_camera || (view != nullptr && caller_rva == kViewFactoryReturnRva &&
             g_engine_factory_eye >= 0)) &&
+        eye_camera_edits_allowed &&
         geometry_stereo_transport_active() &&
         g_config.engine_factory_stereo_offset != 0.0f &&
         active_stereo_offset != 0.0f && !native_canted_applied) {
@@ -39197,7 +43692,7 @@ void __fastcall hook_engine_view_rebuild(float* view) {
             view[0] += stereo_right[0] * offset;
             view[1] += stereo_right[1] * offset;
             view[2] += stereo_right[2] * offset;
-            if (world_marker_camera_valid) {
+            if (world_marker_camera_valid && !world_marker_exact_camera) {
                 world_marker_camera_view[0] +=
                     stereo_right[0] * offset;
                 world_marker_camera_view[1] +=
@@ -39218,16 +43713,42 @@ void __fastcall hook_engine_view_rebuild(float* view) {
         // exact center/viewport bytes captured before factory injection, then
         // let its private rebuild regenerate the centered matrices.
         memcpy(
-            world_marker_camera_view.data() + 0x100,
+            world_marker_camera_view.data() + engine_view_centre(),
             native_asymmetric_marker_center_viewport.data(),
             native_asymmetric_marker_center_viewport.size());
+    }
+    if (world_marker_camera_valid && randc_offset_index != 0) {
+        // The marker camera projects into the symmetric HUD source.
+        world_marker_camera_view[randc_offset_index] = 0.0f;
+        world_marker_camera_view[randc_offset_index + 1] = 0.0f;
+    }
+    if (world_marker_camera_valid && world_marker_exact_orientation) {
+        // The HUD texture is not jittered; 5.01 keeps the DLSS jitter (and
+        // the optional native projection shift) in the centre block.
+        world_marker_camera_view[engine_view_centre()] = 0.0f;
+        world_marker_camera_view[engine_view_centre() + 1] = 0.0f;
     }
     if (world_marker_camera_valid) {
         world_marker_camera_valid =
             safe_rebuild_shadow_view(world_marker_camera_view.data());
         if (world_marker_camera_valid) {
+            // [FIX:WORLD-MARKER-EXACT-HUD-PLANE 6/9] Publish the final
+            // matrix with the pair; the callback uses it unchanged.
+            std::array<float, 16> exact_clip{};
+            w3vr::openxr_eye_geometry::HudMarkerClipMapping exact_mapping{};
+            const bool exact_clip_valid = world_marker_exact_orientation &&
+                build_world_marker_exact_mapping(
+                    world_marker_camera_view.data(), exact_mapping);
+            if (exact_clip_valid) {
+                memcpy(exact_clip.data(), world_marker_camera_view.data() + 0x80,
+                    sizeof(exact_clip));
+                w3vr::openxr_eye_geometry::apply_hud_marker_clip_mapping(
+                    exact_mapping, exact_clip.data());
+            }
             publish_packed_world_marker_camera(
-                world_marker_camera_view.data(), present);
+                world_marker_camera_view.data(), present,
+                exact_clip_valid ? exact_clip.data() : nullptr,
+                exact_clip_valid ? &exact_mapping : nullptr);
         }
     }
 
@@ -39312,9 +43833,68 @@ void __fastcall hook_engine_view_rebuild(float* view) {
     // camera sent to REDengine and install the previous snapshot belonging to
     // this same eye before the native motion-vector matrix is rebuilt. This is
     // the V9416 DLSS producer correction shared with Mode-3 TAAU.
+    if (randc_configured_factory) {
+        // Every factory view gets a defined offset: this eye's centre when
+        // the per-eye frustum applies, zero for menus, cinema, loading and
+        // fallback cameras (the field is per descriptor and persists).
+        view[randc_offset_index] = randc_applied ? randc_x : 0.0f;
+        view[randc_offset_index + 1] = randc_applied ? randc_y : 0.0f;
+    }
     prepare_engine_per_eye_native_temporal_history(
         view, caller_rva, temporal_scene_camera);
+    if (camera_trace) {
+        static std::atomic<uint32_t> camera_trace_lines{};
+        if (camera_trace_lines.fetch_add(1, std::memory_order_relaxed) < 8000) {
+            const float dx = view[0] - camera_trace_entry[0];
+            const float dy = view[1] - camera_trace_entry[1];
+            const float dz = view[2] - camera_trace_entry[2];
+            // [FEATURE:CAMERA-CENTRE 5/6] Player position and its lateral
+            // offset from the game camera before (lat) and after (lat_after)
+            // the centring shift; measured here too when centring is off.
+            CameraCentreSample trace_centre = camera_centre_sample;
+            if (!camera_centre_applied) {
+                trace_centre = {};
+                measure_camera_centre(camera_trace_entry,
+                    camera_trace_entry_right, camera_trace_entry_forward,
+                    trace_centre);
+            }
+            log_line("CAMTRACE present=%llu eye=%d pair=%llu menu=%d world=%d "
+                "hmd_scene=%d full_vr=%d suppress=%d mode=%d near=%d "
+                "entry=%.3f,%.3f,%.3f moved=%.3f,%.3f,%.3f |%.3f| pitch=%.2f yaw=%.2f fov=%.2f "
+                "player=%.3f,%.3f,%.3f meas=%d lat=%.3f fwd=%.3f shift=%.3f "
+                "lat_after=%.3f centre=%d epoch=%u auth=%d top=%d ncut=%d "
+                "nscene=%d cine=%d",
+                static_cast<unsigned long long>(present), g_engine_factory_eye,
+                static_cast<unsigned long long>(g_engine_producer_pair_id),
+                g_engine_menu_state.load(std::memory_order_relaxed),
+                world_camera ? 1 : 0, hmd_scene_camera ? 1 : 0,
+                automatic_full_vr_cutscene ? 1 : 0, suppress_hmd_camera ? 1 : 0,
+                g_camera_mode.load(std::memory_order_relaxed),
+                camera_trace_near_offset ? 1 : 0, camera_trace_entry[0],
+                camera_trace_entry[1], camera_trace_entry[2], dx, dy, dz,
+                sqrtf(dx * dx + dy * dy + dz * dz), view[5], view[6], view[7],
+                trace_centre.player[0], trace_centre.player[1],
+                trace_centre.player[2], trace_centre.measured ? 1 : 0,
+                trace_centre.lateral_m, trace_centre.forward_m,
+                trace_centre.shift_m,
+                trace_centre.lateral_m - trace_centre.shift_m,
+                camera_centre_applied ? 1 : 0,
+                camera_centre_applied ? trace_centre.epoch
+                    : g_camera_centre_epoch.load(std::memory_order_relaxed),
+                native_gameplay_camera_authority ? 1 : 0,
+                native_camera_authority.top_vtable_rva ==
+                    native_custom_camera_vtable_rva() ? 1 : 0,
+                native_camera_authority.player_non_gameplay_cutscene,
+                native_camera_authority.game_non_gameplay_scene,
+                g_cinema_mode_active.load(std::memory_order_relaxed) ? 1 : 0);
+        }
+    }
     g_engine_view_rebuild(view);
+    if (remaster_asymmetric_ndc_configured() && view != nullptr) {
+        finish_remaster_asymmetric_ndc_rebuild(
+            view, caller_rva, randc_applied, randc_slot, randc_fov,
+            randc_aspect, randc_x, randc_y);
+    }
     if (native_asymmetric_factory_projection_applied) {
         uint32_t native_asymmetric_factory_post_width{};
         uint32_t native_asymmetric_factory_post_height{};
@@ -40761,14 +45341,44 @@ void initialize_engine_player_pose_helpers() {
 // only those coordinates by the inverse HUD zoom. The final composite then
 // restores their original screen alignment while ordinary HUD elements remain
 // enlarged. This is the validated native 4.04 callback arithmetic used by the
-// earlier marker-output trace, without diagnostic recording.
+// earlier marker-output trace, without diagnostic recording; 5.01's native
+// and helper do the same (verified at hook installation).
+struct WorldVectorProjectionValues {
+    uintptr_t decoder_table{};
+    uintptr_t out_parameter{};
+    uintptr_t near_threshold{};
+    uintptr_t numerator{};
+    uintptr_t y_sign_mask{};
+};
+
+// RVAs on the running build; all 0 when one of them is unknown there.
+const WorldVectorProjectionValues& world_vector_projection_values() {
+    static const WorldVectorProjectionValues values = [] {
+        using w3vr::engine_addresses::Value;
+        const auto build = running_game_build();
+        const WorldVectorProjectionValues found{
+            w3vr::engine_addresses::value(build, Value::ScriptArgumentDecoderTable),
+            w3vr::engine_addresses::value(build, Value::ScriptOutParameter),
+            w3vr::engine_addresses::value(build, Value::ProjectionNearThreshold),
+            w3vr::engine_addresses::value(build, Value::ProjectionNumerator),
+            w3vr::engine_addresses::value(build, Value::ProjectionYSignMask)};
+        const bool complete = found.decoder_table != 0 &&
+            found.out_parameter != 0 && found.near_threshold != 0 &&
+            found.numerator != 0 && found.y_sign_mask != 0;
+        return complete ? found : WorldVectorProjectionValues{};
+    }();
+    return values;
+}
+
 bool project_world_vector_to_view_ratio_locally(
     void* camera,
     void* stack,
     uint8_t* result,
     float inverse_zoom,
-    float* captured_world) {
-    if (camera == nullptr || stack == nullptr) {
+    float* captured_world,
+    float* captured_ratio = nullptr) {
+    const auto& values = world_vector_projection_values();
+    if (camera == nullptr || stack == nullptr || values.decoder_table == 0) {
         return false;
     }
     auto* module = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
@@ -40776,21 +45386,20 @@ bool project_world_vector_to_view_ratio_locally(
         return false;
     }
 
-    constexpr uintptr_t kScriptArgumentDecoderTableRva = 0x057ED890;
-    constexpr uintptr_t kScriptOutParameterRva = 0x057F58E0;
-    constexpr uintptr_t kProjectionNearThresholdRva = 0x02D84B2C;
-    constexpr uintptr_t kProjectionNumeratorRva = 0x02D84EA0;
-    constexpr uintptr_t kProjectionYSignMaskRva = 0x02D865B0;
     using ScriptArgumentDecoderFn = void(__fastcall*)(void*, void*, void*);
     auto* decoders = reinterpret_cast<ScriptArgumentDecoderFn*>(
-        module + kScriptArgumentDecoderTableRva);
+        module + values.decoder_table);
     auto* stack_words = static_cast<uint64_t*>(stack);
     auto decode_argument = [&](void* destination) {
         auto* cursor = reinterpret_cast<uint8_t*>(stack_words[6]);
         const uint8_t opcode = *cursor++;
         stack_words[6] = reinterpret_cast<uint64_t>(cursor);
-        decoders[opcode](
-            reinterpret_cast<void*>(stack_words[0]), stack, destination);
+        // 5.01's native skips empty table entries (the argument then stays
+        // zero); 4.04's never meets one.
+        const auto decoder = decoders[opcode];
+        if (decoder != nullptr) {
+            decoder(reinterpret_cast<void*>(stack_words[0]), stack, destination);
+        }
     };
 
     float world[4]{};
@@ -40801,14 +45410,14 @@ bool project_world_vector_to_view_ratio_locally(
     float local_x{};
     decode_argument(&local_x);
     auto* output_x = *reinterpret_cast<float**>(
-        module + kScriptOutParameterRva);
+        module + values.out_parameter);
     if (output_x == nullptr) {
         output_x = &local_x;
     }
     float local_y{};
     decode_argument(&local_y);
     auto* output_y = *reinterpret_cast<float**>(
-        module + kScriptOutParameterRva);
+        module + values.out_parameter);
     if (output_y == nullptr) {
         output_y = &local_y;
     }
@@ -40826,9 +45435,9 @@ bool project_world_vector_to_view_ratio_locally(
         world[2] * matrix[11] + world[3] * matrix[15];
     bool visible{};
     const float near_threshold = *reinterpret_cast<const float*>(
-        module + kProjectionNearThresholdRva);
+        module + values.near_threshold);
     const float numerator = *reinterpret_cast<const float*>(
-        module + kProjectionNumeratorRva);
+        module + values.numerator);
     if (clip_w >= near_threshold) {
         const float reciprocal_w = numerator / clip_w;
         if (reciprocal_w * clip_z >= 0.0f) {
@@ -40838,8 +45447,12 @@ bool project_world_vector_to_view_ratio_locally(
             uint32_t output_y_bits{};
             memcpy(&output_y_bits, &compensated_y, sizeof(output_y_bits));
             output_y_bits ^= *reinterpret_cast<const uint32_t*>(
-                module + kProjectionYSignMaskRva);
+                module + values.y_sign_mask);
             memcpy(output_y, &output_y_bits, sizeof(*output_y));
+            if (captured_ratio != nullptr) {
+                captured_ratio[0] = *output_x;
+                captured_ratio[1] = *output_y;
+            }
             visible = true;
         }
     }
@@ -40859,6 +45472,156 @@ bool project_manual_cinema_world_marker(
         result,
         1.0f / std::max(g_config.manual_cinema_hud_scale, 0.01f),
         nullptr);
+}
+
+// [DIAG:WORLD-MARKER-EXACT-HUD-PLANE] [debug] world_marker_diagnostics: one
+// exact-route marker every 30 presents (400 lines at most) is projected
+// locally with the native helper's arithmetic, so its world point is known.
+// The log compares the direction of that point from the pair's marker camera
+// (expected plane tangent) with the HUD-plane tangent of the returned view
+// ratio through the composite's geometry; the error should stay below
+// 0.01 degrees. Returns false when the script stack was not touched.
+bool sample_world_marker_exact_projection(
+    void* director,
+    void* camera_shadow,
+    void* stack,
+    uint8_t* result,
+    const w3vr::openxr_eye_geometry::HudMarkerClipMapping& mapping,
+    uint64_t camera_pair,
+    uint64_t present) {
+    constexpr uint64_t kSampleIntervalPresents = 30;
+    constexpr uint32_t kSampleLogLimit = 400;
+    static std::atomic<uint64_t> last_sample_present{UINT64_MAX};
+    static std::atomic<uint32_t> sample_logs{};
+    uint64_t last_present = last_sample_present.load(std::memory_order_relaxed);
+    if (!g_config.logging_enabled ||
+        sample_logs.load(std::memory_order_relaxed) >= kSampleLogLimit ||
+        (last_present != UINT64_MAX &&
+            present < last_present + kSampleIntervalPresents) ||
+        !last_sample_present.compare_exchange_strong(
+            last_present, present, std::memory_order_relaxed)) {
+        return false;
+    }
+    sample_logs.fetch_add(1, std::memory_order_relaxed);
+
+    float world[4]{};
+    float ratio[2]{NAN, NAN};
+    bool handled{};
+    bool projection_fault{};
+    __try {
+        handled = project_world_vector_to_view_ratio_locally(
+            camera_shadow, stack, result, 1.0f, world, ratio);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        projection_fault = true;
+    }
+    if (projection_fault) {
+        // The cursor may be partly consumed; never run the native on it.
+        if (result != nullptr) {
+            *result = 0;
+        }
+        log_line("World marker exact sample fault present=%llu",
+            static_cast<unsigned long long>(present));
+        return true;
+    }
+    if (!handled) {
+        return false;
+    }
+
+    float vanilla[2]{NAN, NAN};
+    __try {
+        const auto* matrix = reinterpret_cast<const float*>(
+            static_cast<const uint8_t*>(director) + 0x2E0);
+        const float clip_x = world[0] * matrix[0] + world[1] * matrix[4] +
+            world[2] * matrix[8] + world[3] * matrix[12];
+        const float clip_y = world[0] * matrix[1] + world[1] * matrix[5] +
+            world[2] * matrix[9] + world[3] * matrix[13];
+        const float clip_w = world[0] * matrix[3] + world[1] * matrix[7] +
+            world[2] * matrix[11] + world[3] * matrix[15];
+        if (clip_w >= 0.001f) {
+            vanilla[0] = clip_x / clip_w;
+            vanilla[1] = -clip_y / clip_w;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+
+    constexpr float kRadiansToDegrees = 57.2957795130823208768f;
+    float expected_x{NAN};
+    float expected_y{NAN};
+    float elevation_degrees{NAN};
+    float distance_m{NAN};
+    std::array<float, kWorldMarkerCameraFloatCount> marker_view{};
+    float marker_pitch{};
+    float marker_yaw{};
+    float marker_roll{};
+    uint64_t marker_present{};
+    uint64_t marker_pair{};
+    if (load_mode3_world_marker_camera(camera_pair, marker_view,
+            marker_pitch, marker_yaw, marker_roll,
+            marker_present, marker_pair)) {
+        // Rebuilt basis: right +0xA0, forward +0xA4, up +0xA8.
+        float local[3]{};
+        for (size_t axis = 0; axis < 3; ++axis) {
+            const float delta = world[axis] - marker_view[axis];
+            local[0] += delta * marker_view[0xA0 + axis];
+            local[1] += delta * marker_view[0xA4 + axis];
+            local[2] += delta * marker_view[0xA8 + axis];
+        }
+        if (local[1] > 0.001f) {
+            expected_x = local[0] / local[1];
+            expected_y = local[2] / local[1];
+        }
+        const float horizontal = sqrtf(local[0] * local[0] + local[1] * local[1]);
+        elevation_degrees = atan2f(local[2], horizontal) * kRadiansToDegrees;
+        distance_m = sqrtf(horizontal * horizontal + local[2] * local[2]);
+    }
+    float plane_x{NAN};
+    float plane_y{NAN};
+    w3vr::openxr_eye_geometry::hud_marker_ratio_to_plane_tangent(
+        mapping, ratio[0], ratio[1], plane_x, plane_y);
+    const uint64_t crosshair_present =
+        g_aim_crosshair_last_present.load(std::memory_order_acquire);
+    const long long crosshair_age =
+        crosshair_present != UINT64_MAX && present >= crosshair_present
+        ? static_cast<long long>(present - crosshair_present)
+        : -1;
+    log_line(
+        "World marker exact present=%llu pair=%llu world=%.3f,%.3f,%.3f "
+        "visible=%d ratio=%.5f,%.5f vanilla_ratio=%.5f,%.5f "
+        "expected_tangent=%.5f,%.5f ratio_plane_tangent=%.5f,%.5f "
+        "error_deg=%.4f,%.4f elevation_deg=%.3f distance_m=%.2f "
+        "centre_split=%d crosshair_age=%lld",
+        static_cast<unsigned long long>(present),
+        static_cast<unsigned long long>(camera_pair),
+        world[0], world[1], world[2],
+        result != nullptr ? static_cast<int>(*result) : -1,
+        ratio[0], ratio[1], vanilla[0], vanilla[1],
+        expected_x, expected_y, plane_x, plane_y,
+        (atanf(plane_x) - atanf(expected_x)) * kRadiansToDegrees,
+        (atanf(plane_y) - atanf(expected_y)) * kRadiansToDegrees,
+        elevation_degrees, distance_m,
+        g_hud_centre_split_active.load(std::memory_order_relaxed) ? 1 : 0,
+        crosshair_age);
+    static std::atomic<uint32_t> mapping_logs{};
+    static std::atomic<uint64_t> logged_mapping_hash{};
+    const uint64_t mapping_hash = fnv1a64(&mapping, sizeof(mapping));
+    if (logged_mapping_hash.exchange(mapping_hash, std::memory_order_relaxed) !=
+            mapping_hash &&
+        take_bounded_log_slot(mapping_logs, 16)) {
+        log_line(
+            "World marker exact mapping pair=%llu scale=%.5f,%.5f "
+            "offset=%.5f,%.5f hud_size=%.3f origin=%.5f,%.5f "
+            "stage_scale=%.5f,%.5f source=%.5f,%.5f,%.5f,%.5f "
+            "marker_half=%.5f,%.5f",
+            static_cast<unsigned long long>(camera_pair),
+            mapping.scale_x, mapping.scale_y,
+            mapping.offset_x, mapping.offset_y,
+            mapping.hud_size, mapping.origin_x, mapping.origin_y,
+            mapping.stage_scale_x, mapping.stage_scale_y,
+            mapping.source_left, mapping.source_right,
+            mapping.source_up, mapping.source_down,
+            mapping.marker_half_tangent_x, mapping.marker_half_tangent_y);
+    }
+    return true;
 }
 
 void __fastcall hook_engine_world_vector_to_view_ratio(
@@ -40942,6 +45705,13 @@ void __fastcall hook_engine_world_vector_to_view_ratio(
     // against the temporal snapshot consumed by DLSS/TAAU.
     const bool projection_valid = load_world_marker_projection(
         present, hmd_view_projection, &projection_metadata);
+    // [FIX:WORLD-MARKER-EXACT-HUD-PLANE 7/9] 5.01 fixed level HUD: the pair's
+    // published matrix is final (cyclopean camera plus HUD-plane mapping), so
+    // no HMD delta, per-callback rebuild or NDC lift applies.
+    const bool exact_route_requested =
+        projection_valid && world_marker_exact_projection_active();
+    bool exact_projection{};
+    w3vr::openxr_eye_geometry::HudMarkerClipMapping exact_mapping{};
 
     // [FIX:MODE3-MARKER-COMPLETED-PAIR 2/4] Rebuild marker projection from a
     // tagged eye-1 camera. Mode 3 selects the last pair for which both render
@@ -40967,24 +45737,45 @@ void __fastcall hook_engine_world_vector_to_view_ratio(
             static std::atomic<uint64_t> latched_present{UINT64_MAX};
             static std::atomic<uint64_t> latched_pair{};
             if (latched_present.load(std::memory_order_acquire) != present) {
-                latched_pair.store(
-                    g_engine_pair_completed_signal.load(std::memory_order_acquire),
-                    std::memory_order_relaxed);
+                // [PERF:PAIR-BARRIER-LAG] With run-ahead the completed signal
+                // is one or two pairs old depending on the render thread;
+                // the pair the previous tick queued is the one lag 0 would
+                // see here, and its factory has already published its camera.
+                uint64_t marker_pair = g_config.perf_pair_barrier_lag != 0
+                    ? g_engine_pair_barrier_pending.load(std::memory_order_acquire)
+                    : 0;
+                if (marker_pair == 0) {
+                    marker_pair = g_engine_pair_completed_signal.load(
+                        std::memory_order_acquire);
+                }
+                latched_pair.store(marker_pair, std::memory_order_relaxed);
                 latched_present.store(present, std::memory_order_release);
                 first_marker_for_present = true;
             }
             requested_pair = latched_pair.load(std::memory_order_acquire);
-            camera_valid = load_mode3_world_marker_camera(
-                requested_pair,
-                extrapolated_view,
-                published_pitch,
-                published_yaw,
-                published_roll,
-                camera_present,
-                camera_pair);
-            exact_completed_pair = camera_valid;
+            if (exact_route_requested && requested_pair != 0) {
+                exact_projection = load_world_marker_exact_clip(
+                    requested_pair, hmd_view_projection, exact_mapping,
+                    camera_present, camera_pair);
+            }
+            if (!exact_projection) {
+                camera_valid = load_mode3_world_marker_camera(
+                    requested_pair,
+                    extrapolated_view,
+                    published_pitch,
+                    published_yaw,
+                    published_roll,
+                    camera_present,
+                    camera_pair);
+            }
+            exact_completed_pair = camera_valid || exact_projection;
         }
-        if (!camera_valid) {
+        if (!camera_valid && !exact_projection && exact_route_requested) {
+            exact_projection = load_world_marker_exact_clip(
+                0, hmd_view_projection, exact_mapping,
+                camera_present, camera_pair);
+        }
+        if (!camera_valid && !exact_projection) {
             camera_valid = load_packed_world_marker_camera(
                 extrapolated_view,
                 published_pitch,
@@ -40992,6 +45783,11 @@ void __fastcall hook_engine_world_vector_to_view_ratio(
                 published_roll,
                 camera_present,
                 camera_pair);
+        }
+        if (exact_projection) {
+            projection_metadata.present = camera_present;
+            projection_metadata.pair_id = camera_pair;
+            projection_metadata.eye = 1;
         }
         if (first_marker_for_present) {
             XrView marker_trace{XR_TYPE_VIEW};
@@ -41103,7 +45899,8 @@ void __fastcall hook_engine_world_vector_to_view_ratio(
         }
     }
 
-    if (projection_valid && g_config.world_marker_vertical_offset_ndc != 0.0f) {
+    if (projection_valid && !exact_projection &&
+        g_config.world_marker_vertical_offset_ndc != 0.0f) {
         // REDengine uses row-vector world-to-clip matrices here. Adding a
         // fraction of clip W to the vertical clip column creates a constant
         // post-perspective screen-space lift, independent of marker depth.
@@ -41130,6 +45927,32 @@ void __fastcall hook_engine_world_vector_to_view_ratio(
     // shared CameraDirector immutable and project through a private clone.
     memcpy(camera_shadow + 0x2E0,
         hmd_view_projection.data(), sizeof(hmd_view_projection));
+    if (exact_projection) {
+        static std::atomic<bool> exact_route_logged{};
+        if (!exact_route_logged.load(std::memory_order_relaxed) &&
+            !exact_route_logged.exchange(true, std::memory_order_relaxed)) {
+            log_line(
+                "World marker exact projection active present=%llu pair=%llu "
+                "scale=%.5f,%.5f offset=%.5f,%.5f hud_size=%.3f origin_y=%.5f "
+                "stage_scale=%.5f,%.5f",
+                static_cast<unsigned long long>(present),
+                static_cast<unsigned long long>(projection_metadata.pair_id),
+                exact_mapping.scale_x, exact_mapping.scale_y,
+                exact_mapping.offset_x, exact_mapping.offset_y,
+                exact_mapping.hud_size, exact_mapping.origin_y,
+                exact_mapping.stage_scale_x, exact_mapping.stage_scale_y);
+        }
+        if (g_config.world_marker_diagnostics &&
+            sample_world_marker_exact_projection(
+                camera, camera_shadow, stack, result, exact_mapping,
+                projection_metadata.pair_id, present)) {
+            record_world_marker_diagnostic(
+                1, present, projection_metadata,
+                fnv1a64(hmd_view_projection.data(), sizeof(hmd_view_projection)),
+                camera, stack, result);
+            return;
+        }
+    }
     g_engine_world_vector_to_view_ratio(camera_shadow, stack, result);
     record_world_marker_diagnostic(
         1, present, projection_metadata,
@@ -41137,26 +45960,86 @@ void __fastcall hook_engine_world_vector_to_view_ratio(
         camera, stack, result);
 }
 
+// The local projection (manual cinema, first-person reticle, diagnostics)
+// reads the table values; on 5.01 they must be the ones the verified native
+// uses: the decoder table of its lea r14 (+0x16), the out-parameter global of
+// its first load (+0x8D, mov rdx,[rip+d]) and the helper's constants.
+bool world_vector_to_view_ratio_references_verified(const uint8_t* target) {
+    const auto& values = world_vector_projection_values();
+    const auto* module = reinterpret_cast<const uint8_t*>(GetModuleHandleW(nullptr));
+    if (target == nullptr || module == nullptr || values.decoder_table == 0) {
+        return false;
+    }
+    auto rip_relative_rva = [&](size_t offset, size_t length) {
+        int32_t displacement{};
+        memcpy(&displacement, target + offset + length - sizeof(displacement),
+            sizeof(displacement));
+        return static_cast<uintptr_t>(
+            target + offset + length + displacement - module);
+    };
+    constexpr uint8_t kLoadRdxRipRelative[] = {0x48, 0x8B, 0x15};
+    const bool out_parameter = memcmp(target + 0x8D, kLoadRdxRipRelative,
+            sizeof(kLoadRdxRipRelative)) == 0 &&
+        rip_relative_rva(0x8D, 7) == values.out_parameter;
+    const bool decoder_table = rip_relative_rva(0x16, 7) == values.decoder_table;
+    float near_threshold{};
+    float numerator{};
+    uint32_t sign_mask{};
+    memcpy(&near_threshold, module + values.near_threshold, sizeof(near_threshold));
+    memcpy(&numerator, module + values.numerator, sizeof(numerator));
+    memcpy(&sign_mask, module + values.y_sign_mask, sizeof(sign_mask));
+    return out_parameter && decoder_table && near_threshold == 0.001f &&
+        numerator == 1.0f && sign_mask == 0x80000000u;
+}
+
+// [FIX:WORLD-MARKER-EXACT-HUD-PLANE 8/9] 4.04 as before; 5.01 through the address
+// table (signature) and the reference check above, unless
+// [openxr] world_marker_exact_projection=0 keeps the native untouched.
 void install_engine_world_vector_to_view_ratio_hook() {
-    if (!engine_build_supported()) {
+    const bool remaster =
+        running_game_build() == w3vr::game_build::Build::Remaster501;
+    if (!engine_build_supported() && !remaster) {
         return;
     }
     if (!g_config.hmd_freelook ||
         g_engine_world_vector_to_view_ratio != nullptr) {
         return;
     }
+    if (remaster && !g_config.world_marker_exact_projection) {
+        log_line("CameraDirector.WorldVectorToViewRatio left native "
+            "([openxr] world_marker_exact_projection=0)");
+        return;
+    }
 
-    constexpr uintptr_t kWorldVectorToViewRatioRva = 0x0161BDA0;
-    auto* module = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
-    auto* target = module != nullptr ? module + kWorldVectorToViewRatioRva : nullptr;
-    if (target != nullptr &&
-        MH_CreateHook(target,
+    using w3vr::engine_addresses::Function;
+    auto* target = engine_function_target(Function::WorldVectorToViewRatio);
+    if (target == nullptr) {
+        return;
+    }
+    if (remaster && !world_vector_to_view_ratio_references_verified(target)) {
+        log_line("CameraDirector.WorldVectorToViewRatio script/helper references "
+            "do not match on build %s; hook disabled",
+            w3vr::game_build::name(running_game_build()));
+        return;
+    }
+    const uintptr_t rva = w3vr::engine_addresses::rva(
+        running_game_build(), Function::WorldVectorToViewRatio);
+    if (MH_CreateHook(target,
             reinterpret_cast<void*>(&hook_engine_world_vector_to_view_ratio),
             reinterpret_cast<void**>(&g_engine_world_vector_to_view_ratio)) == MH_OK &&
         MH_EnableHook(target) == MH_OK) {
         log_line("Hooked CameraDirector.WorldVectorToViewRatio RVA=0x%llX target=%p",
-            static_cast<unsigned long long>(kWorldVectorToViewRatioRva), target);
+            static_cast<unsigned long long>(rva), target);
+        if (remaster) {
+            log_line("World marker projection 5.01 fixed_level_hud=exact "
+                "other_routes=legacy_gains anchor_level=%d controller_locked=%d "
+                "hud_centre_split_aim_only=%d",
+                g_config.hud_anchor_level ? 1 : 0,
+                g_config.hud_controller_locked ? 1 : 0,
+                g_config.hud_centre_split_aim_only ? 1 : 0);
+        }
     } else {
+        g_engine_world_vector_to_view_ratio = nullptr;
         log_line("Failed CameraDirector.WorldVectorToViewRatio hook target=%p", target);
     }
 }
@@ -41166,7 +46049,9 @@ void install_engine_world_vector_to_view_ratio_hook() {
 // corrected camera for both the existing DLSS route and Mode-3 TAAU. Logging
 // remains fully dependent on Diagnostic Logging.
 void install_engine_temporal_camera_builder_hook() {
-    if (!engine_build_supported()) {
+    const bool remaster = running_game_build() ==
+        w3vr::game_build::Build::Remaster501;
+    if (!engine_build_supported() && !remaster) {
         return;
     }
     if (!engine_native_per_eye_temporal_history_active() ||
@@ -41174,11 +46059,16 @@ void install_engine_temporal_camera_builder_hook() {
         return;
     }
 
+    // [FEATURE:REMASTER-ENGINE-DLSS 3/6] 5.01 resolves the builder through
+    // the signature-checked address table; 4.04 keeps its fixed RVA.
     constexpr uintptr_t kEngineTemporalCameraBuildRva = 0x015FE010;
     auto* module = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
-    auto* target = module != nullptr
-        ? module + kEngineTemporalCameraBuildRva
-        : nullptr;
+    auto* target = remaster
+        ? engine_function_target(
+            w3vr::engine_addresses::Function::TemporalCameraBuild)
+        : (module != nullptr
+            ? module + kEngineTemporalCameraBuildRva
+            : nullptr);
     const bool installed = target != nullptr &&
         MH_CreateHook(target,
             reinterpret_cast<void*>(&hook_engine_temporal_camera_build),
@@ -41190,11 +46080,2049 @@ void install_engine_temporal_camera_builder_hook() {
             "V14003 REDengine temporal camera builder %s "
             "RVA=0x%llX target=%p backend=%s",
             installed ? "hooked" : "hook failed",
-            static_cast<unsigned long long>(
-                kEngineTemporalCameraBuildRva),
+            static_cast<unsigned long long>(target != nullptr && module != nullptr
+                ? static_cast<uintptr_t>(target - module) : 0),
             target,
-            mode3_taau_native_full_motion_active() ? "taau" : "dlss");
+            mode3_taau_native_full_motion_active() ? "taau"
+                : (remaster ? "remaster_dlss" : "dlss"));
     }
+}
+
+// [FEATURE:REMASTER-ENGINE-DLSS 4/6] Remastered 5.01 evaluates DLSS SR itself
+// through Streamline 2, on the single viewport id at DLSS state +0x180. Strict
+// Stereo renders both eye frames through that one state, so one history would
+// blend the eyes. For the duration of the three engine functions that use the
+// id (constants builder, input prepare, SR apply) each eye gets its own
+// Streamline viewport: the engine's id for the left eye, id + offset for the
+// right. Options, tags, constants and the evaluate then follow per eye.
+// The state also keeps per-frame guards (+0x120/+0x124/+0x128, compared with
+// frame_data +0xC44/+0xC40) that would skip the second eye of a pair as a
+// duplicate; each eye sees its own copy of them, so engine-intended repeats of
+// the same eye are still suppressed.
+using EngineDlssStateFunction =
+    uintptr_t(__fastcall*)(void*, void*, void*, uintptr_t, void*);
+EngineDlssStateFunction g_engine_dlss_constants_builder{};
+EngineDlssStateFunction g_engine_dlss_input_prepare{};
+EngineDlssStateFunction g_engine_dlss_sr_apply{};
+constexpr uint32_t kRemasterDlssRightEyeViewportOffset = 0x100;
+// Frames rendered during dual render without an eye tag (e.g. the fallback of
+// a dropped pair) use a scratch viewport, so they never enter an eye's history.
+constexpr uint32_t kRemasterDlssUntaggedViewportOffset = 0x200;
+constexpr size_t kRemasterDlssUntaggedSlot = 2;
+struct RemasterDlssEyeGuards {
+    uint32_t constants_frame{};
+    uint32_t apply_frame{};
+    uint32_t prepare_frame{};
+    uint32_t last_frame_index{};
+    bool valid{};
+};
+std::recursive_mutex g_remaster_dlss_mutex;
+void* g_remaster_dlss_state{};
+std::array<RemasterDlssEyeGuards, 3> g_remaster_dlss_eye_guards{};
+// One-shot resets requested by the first eye's constants of a pair; the other
+// eye gets the same reset for the same frame index.
+bool g_remaster_dlss_reset_pending{};
+uint32_t g_remaster_dlss_reset_frame{};
+size_t g_remaster_dlss_reset_source{};
+std::array<std::atomic<uint64_t>, 3> g_remaster_dlss_eye_calls{};
+std::atomic<uint64_t> g_remaster_dlss_untagged_calls{};
+std::atomic<uint64_t> g_remaster_dlss_forced_resets{};
+std::atomic<uint64_t> g_remaster_dlss_last_tagged_present{UINT64_MAX};
+std::atomic<uint32_t> g_remaster_dlss_log_count{};
+std::atomic<bool> g_remaster_dlss_rr_logged{};
+
+// The per-eye motion-vector camera record only belongs to frames whose DLSS
+// actually runs per eye (not FSR/XeSS/TAA chosen in game, not a DLSS that
+// failed to initialise).
+bool remaster_engine_dlss_per_eye_running() {
+    const uint64_t last =
+        g_remaster_dlss_last_tagged_present.load(std::memory_order_acquire);
+    const uint64_t now = g_present_count.load(std::memory_order_relaxed);
+    return last != UINT64_MAX && now >= last && now - last <= 8;
+}
+
+int remaster_dlss_eye_for_frame_data(void* frame_data) {
+    if (frame_data == nullptr ||
+        !g_engine_dual_render_active.load(std::memory_order_acquire)) {
+        return -1;
+    }
+    void* frame = static_cast<uint8_t*>(frame_data) -
+        engine_frame_offset(
+            w3vr::engine_addresses::Value::DlssFrameDataFromFrame);
+    int eye = -1;
+    g_engine_dual_frame_mutex.lock();
+    auto found = g_engine_dual_frame_eyes.find(frame);
+    if (found == g_engine_dual_frame_eyes.end()) {
+        found = g_engine_dual_frame_eyes.find(frame_data);
+    }
+    if (found != g_engine_dual_frame_eyes.end() && found->second.eye <= 1) {
+        eye = static_cast<int>(found->second.eye);
+    }
+    g_engine_dual_frame_mutex.unlock();
+    if (eye < 0 && (g_engine_render_eye == 0 || g_engine_render_eye == 1)) {
+        eye = g_engine_render_eye;
+    }
+    return eye;
+}
+
+uintptr_t call_remaster_dlss_per_eye(
+    EngineDlssStateFunction original,
+    const char* name,
+    void* state,
+    void* frame_data,
+    void* third,
+    uintptr_t fourth,
+    void* fifth) {
+    namespace addresses = w3vr::engine_addresses;
+    if (state == nullptr || frame_data == nullptr ||
+        !remaster_engine_dlss_stereo_active() ||
+        !g_engine_dual_render_active.load(std::memory_order_acquire)) {
+        g_remaster_dlss_untagged_calls.fetch_add(1, std::memory_order_relaxed);
+        return original(state, frame_data, third, fourth, fifth);
+    }
+    auto* frame_bytes = static_cast<uint8_t*>(frame_data);
+    if (frame_bytes[engine_frame_offset(
+            addresses::Value::DlssFrameRayReconstructionFlag)] != 0) {
+        // Ray Reconstruction tags and evaluates through further functions on
+        // the engine's single viewport; keep the whole frame on it.
+        if (!g_remaster_dlss_rr_logged.exchange(true)) {
+            log_line("V20001 remaster DLSS: Ray Reconstruction is on; per-eye DLSS "
+                "histories are disabled while it is (turn it off in the game)");
+        }
+        g_remaster_dlss_untagged_calls.fetch_add(1, std::memory_order_relaxed);
+        return original(state, frame_data, third, fourth, fifth);
+    }
+    const int eye = remaster_dlss_eye_for_frame_data(frame_data);
+    const size_t slot = eye == 0 || eye == 1
+        ? static_cast<size_t>(eye)
+        : kRemasterDlssUntaggedSlot;
+    const bool constants_call = original == g_engine_dlss_constants_builder;
+    auto* bytes = static_cast<uint8_t*>(state);
+    const size_t viewport_offset =
+        engine_frame_offset(addresses::Value::DlssStateViewport);
+    const size_t constants_offset =
+        engine_frame_offset(addresses::Value::DlssStateConstantsFrame);
+    const size_t apply_offset =
+        engine_frame_offset(addresses::Value::DlssStateApplyFrame);
+    const size_t prepare_offset =
+        engine_frame_offset(addresses::Value::DlssStatePrepareFrame);
+    const size_t reset_offset =
+        engine_frame_offset(addresses::Value::DlssStateResetFlag);
+    auto read_u32 = [&](size_t offset) {
+        uint32_t value{};
+        memcpy(&value, bytes + offset, sizeof(value));
+        return value;
+    };
+    auto write_u32 = [&](size_t offset, uint32_t value) {
+        memcpy(bytes + offset, &value, sizeof(value));
+    };
+    uint32_t frame_index{};
+    uint32_t render_counter{};
+    memcpy(&frame_index, frame_bytes + 0xC44, sizeof(frame_index));
+    memcpy(&render_counter, frame_bytes + 0xC40, sizeof(render_counter));
+
+    std::scoped_lock lock{g_remaster_dlss_mutex};
+    if (g_remaster_dlss_state != state) {
+        g_remaster_dlss_state = state;
+        g_remaster_dlss_eye_guards = {};
+        g_remaster_dlss_reset_pending = false;
+    }
+    auto& guards = g_remaster_dlss_eye_guards[slot];
+    if (!guards.valid) {
+        // Values that cannot match this frame, so the first call of an eye is
+        // never mistaken for a repeat of the other eye's frame.
+        guards.constants_frame = frame_index - 1;
+        guards.apply_frame = 0xFFFFFFFFu;
+        guards.prepare_frame = render_counter - 1;
+    }
+    bool force_reset = false;
+    if (constants_call && slot != kRemasterDlssUntaggedSlot) {
+        // A fresh or long-interrupted eye history (first use, menus,
+        // cutscenes) starts over. Short gaps keep it: untagged frames go to
+        // the scratch viewport, and the eyes of a pair may or may not share
+        // a frame index (+1 or +2 per pair).
+        force_reset = !guards.valid ||
+            frame_index - guards.last_frame_index > 4;
+        if (g_remaster_dlss_reset_pending &&
+            g_remaster_dlss_reset_frame == frame_index &&
+            g_remaster_dlss_reset_source != slot) {
+            force_reset = true;
+            g_remaster_dlss_reset_pending = false;
+        }
+        // The projection of this eye changed (per-eye frustum on/off).
+        if (slot == 0 || slot == 1) {
+            const uint8_t bit = static_cast<uint8_t>(1u << slot);
+            if ((g_remaster_dlss_external_reset_mask.fetch_and(
+                    static_cast<uint8_t>(~bit), std::memory_order_acq_rel) & bit) != 0) {
+                force_reset = true;
+            }
+        }
+    }
+    const uint32_t base_viewport = read_u32(viewport_offset);
+    const uint32_t engine_guards[3]{read_u32(constants_offset),
+        read_u32(apply_offset), read_u32(prepare_offset)};
+    write_u32(constants_offset, guards.constants_frame);
+    write_u32(apply_offset, guards.apply_frame);
+    write_u32(prepare_offset, guards.prepare_frame);
+    const uint32_t eye_viewport = base_viewport +
+        (slot == 1 ? kRemasterDlssRightEyeViewportOffset
+            : slot == kRemasterDlssUntaggedSlot
+            ? kRemasterDlssUntaggedViewportOffset : 0u);
+    write_u32(viewport_offset, eye_viewport);
+    // The builder's reset argument is a byte in r8.
+    void* const call_third = force_reset
+        ? reinterpret_cast<void*>(
+            (reinterpret_cast<uintptr_t>(third) & ~uintptr_t{0xFF}) | 1u)
+        : third;
+    const uintptr_t result =
+        original(state, frame_data, call_third, fourth, fifth);
+    guards.constants_frame = read_u32(constants_offset);
+    guards.apply_frame = read_u32(apply_offset);
+    guards.prepare_frame = read_u32(prepare_offset);
+    guards.valid = true;
+    write_u32(viewport_offset, base_viewport);
+    bool reset_requested{};
+    if (constants_call && slot != kRemasterDlssUntaggedSlot) {
+        reset_requested = bytes[reset_offset] != 0;
+        const size_t other = slot == 0 ? 1 : 0;
+        const auto& other_guards = g_remaster_dlss_eye_guards[other];
+        const bool first_eye_of_pair = !other_guards.valid ||
+            other_guards.last_frame_index != frame_index;
+        if (reset_requested && first_eye_of_pair) {
+            g_remaster_dlss_reset_pending = true;
+            g_remaster_dlss_reset_frame = frame_index;
+            g_remaster_dlss_reset_source = slot;
+        }
+        guards.last_frame_index = frame_index;
+        if (force_reset) {
+            g_remaster_dlss_forced_resets.fetch_add(
+                1, std::memory_order_relaxed);
+        }
+    }
+    g_remaster_dlss_eye_calls[slot].fetch_add(1, std::memory_order_relaxed);
+    if (slot != kRemasterDlssUntaggedSlot) {
+        g_remaster_dlss_last_tagged_present.store(
+            g_present_count.load(std::memory_order_relaxed),
+            std::memory_order_release);
+    }
+    if (g_config.runtime_diagnostics &&
+        (g_remaster_dlss_log_count.fetch_add(1, std::memory_order_relaxed) < 96 ||
+            force_reset || slot == kRemasterDlssUntaggedSlot) &&
+        g_remaster_dlss_log_count.load(std::memory_order_relaxed) < 2000) {
+        log_line("V20001 remaster DLSS %s eye=%d slot=%zu tid=%lu present=%llu frame_data=%p "
+            "frame_index=%u counter=%u viewport=%u->%u guards_engine=%u,%u,%u "
+            "guards_eye=%u,%u,%u reset=%d/%d calls=%llu/%llu/%llu untagged=%llu",
+            name, eye, slot, GetCurrentThreadId(),
+            static_cast<unsigned long long>(g_present_count.load()),
+            frame_data, frame_index, render_counter, base_viewport,
+            eye_viewport, engine_guards[0], engine_guards[1],
+            engine_guards[2], guards.constants_frame, guards.apply_frame,
+            guards.prepare_frame, force_reset ? 1 : 0,
+            reset_requested ? 1 : 0,
+            static_cast<unsigned long long>(g_remaster_dlss_eye_calls[0].load()),
+            static_cast<unsigned long long>(g_remaster_dlss_eye_calls[1].load()),
+            static_cast<unsigned long long>(g_remaster_dlss_eye_calls[2].load()),
+            static_cast<unsigned long long>(
+                g_remaster_dlss_untagged_calls.load()));
+    }
+    return result;
+}
+
+uintptr_t __fastcall hook_remaster_dlss_constants_builder(
+    void* state, void* frame_data, void* reset, uintptr_t fourth, void* fifth) {
+    return call_remaster_dlss_per_eye(g_engine_dlss_constants_builder,
+        "constants", state, frame_data, reset, fourth, fifth);
+}
+
+uintptr_t __fastcall hook_remaster_dlss_input_prepare(
+    void* state, void* frame_data, void* params, uintptr_t fourth, void* fifth) {
+    return call_remaster_dlss_per_eye(g_engine_dlss_input_prepare,
+        "prepare", state, frame_data, params, fourth, fifth);
+}
+
+uintptr_t __fastcall hook_remaster_dlss_sr_apply(
+    void* state, void* frame_data, void* params, uintptr_t pass, void* fifth) {
+    return call_remaster_dlss_per_eye(g_engine_dlss_sr_apply,
+        "apply", state, frame_data, params, pass, fifth);
+}
+
+// [FEATURE:REMASTER-ASYMMETRIC-NDC 6/6] Shadow cascades: the 5.01 frustum
+// corner helper rebuilds the projection from FOV/aspect plus the centre block
+// only, so with a per-eye frustum it would fit cascades to a centred frustum
+// and leave the outer side of each eye uncovered. Fold the NDC offset into the
+// (private, cascade-builder-owned) centre block for the duration of the call:
+// the helper's own translation 2*centre/extent then equals jitter + offset,
+// i.e. exactly the frustum the eye renders.
+using EngineFrustumCornerHelper = void*(__fastcall*)(float*, float, void*, uint8_t);
+EngineFrustumCornerHelper g_engine_frustum_corner_helper{};
+
+void* __fastcall hook_engine_frustum_corner_helper(
+    float* view, float ndc_z, void* out, uint8_t rebuild) {
+    const size_t o = engine_view_projection_offset();
+    if (rebuild == 0 || view == nullptr || o == 0 ||
+        !g_config.remaster_asymmetric_ndc_cascade_fix ||
+        (view[o] == 0.0f && view[o + 1] == 0.0f)) {
+        return g_engine_frustum_corner_helper(view, ndc_z, out, rebuild);
+    }
+    const size_t c = engine_view_centre();
+    const float saved_x = view[c];
+    const float saved_y = view[c + 1];
+    uint32_t extent_w{};
+    uint32_t extent_h{};
+    memcpy(&extent_w, view + c + 2, sizeof(extent_w));
+    memcpy(&extent_h, view + c + 3, sizeof(extent_h));
+    view[c] = saved_x + view[o] * static_cast<float>(std::max<uint32_t>(extent_w, 1)) * 0.5f;
+    view[c + 1] = saved_y + view[o + 1] * static_cast<float>(std::max<uint32_t>(extent_h, 1)) * 0.5f;
+    void* result = g_engine_frustum_corner_helper(view, ndc_z, out, rebuild);
+    view[c] = saved_x;
+    view[c + 1] = saved_y;
+    const uint32_t fits = g_randc_cascade_fits.fetch_add(1, std::memory_order_relaxed);
+    if (g_config.runtime_diagnostics && fits < 4) {
+        log_line("RANDC cascade fit sample=%u ndc_z=%.6f offset=%.6f,%.6f centre=%.4f,%.4f extent=%ux%u",
+            fits, ndc_z, view[o], view[o + 1], saved_x, saved_y, extent_w, extent_h);
+    }
+    return result;
+}
+
+void install_remaster_asymmetric_ndc_hooks() {
+    if (!remaster_asymmetric_ndc_configured() ||
+        !g_config.remaster_asymmetric_ndc_cascade_fix ||
+        g_engine_frustum_corner_helper != nullptr) {
+        return;
+    }
+    auto* target = engine_function_target(
+        w3vr::engine_addresses::Function::FrustumCornerHelper);
+    if (target == nullptr) {
+        log_line("RANDC cascade fix unavailable: FrustumCornerHelper not found");
+        return;
+    }
+    if (MH_CreateHook(target, reinterpret_cast<void*>(&hook_engine_frustum_corner_helper),
+            reinterpret_cast<void**>(&g_engine_frustum_corner_helper)) == MH_OK &&
+        MH_EnableHook(target) == MH_OK) {
+        log_line("RANDC cascade fix hooked target=%p", target);
+    } else {
+        g_engine_frustum_corner_helper = nullptr;
+        log_line("RANDC cascade fix hook failed target=%p", target);
+    }
+}
+
+// [FEATURE:REMASTER-SHADOW-PAIR-REUSE 2/7] Sun shadow cascades once per
+// stereo pair. On 5.01 both eyes run the whole sun-shadow job inside the frame
+// builder, one after the other on the render thread, and overwrite the same
+// persistent state: the cascade set at collector+0x100, the SpeedTree cascade
+// frusta at [collector+0x4EE8]+0x1C0 and one D16 shadow map array
+// (renderer+0x418). The lighting constants are rebuilt from the set on every
+// render. So the second render of an exact pair can skip the cascade fit and
+// caster cull (0x141BF39B0) and the cascade depth passes (0x141D1EBF0): its
+// lighting then samples the first render's map with the first render's
+// cascade constants. The frame builder's end-of-render cleanup 0x141BF7F10
+// zeroes the set header (set+0 = collector, set+0x8 = cascade count) and the
+// sixteen draw-list counts after every render; the views, caster frusta,
+// texel constants and parity stay. The reuser's SpeedTree cascade views
+// (0x141CEBC30) and lighting constants (0x141C704B0, from the lighting stage
+// 0x141C2A860 and from 0x141D34AE0) read the count, so the seed keeps the
+// header and a skipped fit writes it back. The draw lists stay empty: only
+// the depth passes read them, and a skipped fit always skips those. A hash of
+// the persistent fit bytes, taken after the seed's fit and checked before the
+// skip, shows that nothing else touched the set in between.
+constexpr uintptr_t kRemaster501ShadowCascadeFitRva = 0x1BF39B0;
+constexpr uintptr_t kRemaster501ShadowCascadeRenderRva = 0x1D1EBF0;
+constexpr uintptr_t kRemaster501SpeedTreeShadowViewsRva = 0x1CEBC30;
+constexpr uintptr_t kRemaster501RenderShadowsRva = 0x1C34E90;
+
+struct EngineCodeBytes {
+    uintptr_t rva;
+    const uint8_t* bytes;
+    size_t size;
+};
+
+// Fit and cull (collector): the prologue through lea rbx,[rcx+0x100] (the
+// set); after the fit, set+0 = collector, the frame+0xF5E4 and set+0x8 count
+// tests and the copy of the caster frusta to [collector+0x4EE8]+0x1C0 with the
+// count at +0x6C0. The fit 0x141CD7500 toggles the parity byte set+0x4CA0.
+constexpr uint8_t kShadowFitPrologue[] = {
+    0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x74, 0x24, 0x10, 0x48, 0x89,
+    0x7C, 0x24, 0x18, 0x4C, 0x89, 0x74, 0x24, 0x20, 0x55, 0x48, 0x81, 0xEC,
+    0x60, 0x05, 0x00, 0x00, 0x48, 0x8D, 0x6C, 0x24, 0x40, 0x48, 0x83, 0xE5,
+    0xE0, 0x48, 0x8B, 0x51, 0x10, 0x48, 0x8D, 0x99, 0x00, 0x01, 0x00, 0x00};
+constexpr uint8_t kShadowFitStore[] = {
+    0x48, 0x89, 0x3B, 0x48, 0x8B, 0x47, 0x10, 0x44, 0x38, 0xB0, 0xE4, 0xF5,
+    0x00, 0x00, 0x0F, 0x84, 0x26, 0x02, 0x00, 0x00, 0x0F, 0xB7, 0x87, 0x08,
+    0x01, 0x00, 0x00, 0x66, 0x85, 0xC0, 0x0F, 0x84, 0x16, 0x02, 0x00, 0x00,
+    0x4C, 0x8B, 0x8F, 0xE8, 0x4E, 0x00, 0x00, 0x4D, 0x85, 0xC9, 0x0F, 0x84,
+    0xD2, 0x00, 0x00, 0x00, 0x41, 0x89, 0x81, 0xC0, 0x06, 0x00, 0x00};
+constexpr uint8_t kShadowFitFrusta[] = {0x49, 0x8D, 0x81, 0xC0, 0x01, 0x00, 0x00};
+constexpr uint8_t kShadowFitParity[] = {0x41, 0x2A, 0x87, 0xA0, 0x4C, 0x00, 0x00};
+constexpr EngineCodeBytes kShadowFitCode[] = {
+    {0x1BF39B0, kShadowFitPrologue, sizeof(kShadowFitPrologue)},
+    {0x1BF3A74, kShadowFitStore, sizeof(kShadowFitStore)},
+    {0x1BF3AC0, kShadowFitFrusta, sizeof(kShadowFitFrusta)},
+    {0x1CD8531, kShadowFitParity, sizeof(kShadowFitParity)},
+};
+// Cascade depth passes (renderer, frame, set, smap): the prologue; the loads
+// of frame+0xF5E4 and the set count; and their early exit, which jumps
+// straight to the epilogue (nothing recorded: no clear, no barrier, no draw).
+constexpr uint8_t kShadowRenderPrologue[] = {
+    0x4C, 0x89, 0x4C, 0x24, 0x20, 0x4C, 0x89, 0x44, 0x24, 0x18, 0x48, 0x89,
+    0x54, 0x24, 0x10, 0x48, 0x89, 0x4C, 0x24, 0x08, 0x55, 0x53, 0x56, 0x57,
+    0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57, 0x48, 0x8D, 0xAC, 0x24,
+    0x08, 0xF2, 0xFF, 0xFF};
+constexpr uint8_t kShadowRenderLoads[] = {
+    0x0F, 0xB6, 0xB2, 0xE4, 0xF5, 0x00, 0x00, 0x4D, 0x8B, 0xF8, 0x41, 0x0F,
+    0xB7, 0x78, 0x08};
+constexpr uint8_t kShadowRenderEarlyExit[] = {
+    0x40, 0x84, 0xF6, 0x0F, 0x84, 0x90, 0x0A, 0x00, 0x00, 0x66, 0x85, 0xFF,
+    0x0F, 0x84, 0x87, 0x0A, 0x00, 0x00};
+constexpr uint8_t kShadowRenderEpilogue[] = {
+    0x48, 0x81, 0xC4, 0xF8, 0x0E, 0x00, 0x00, 0x41, 0x5F, 0x41, 0x5E, 0x41,
+    0x5D, 0x41, 0x5C, 0x5F, 0x5E, 0x5B, 0x5D, 0xC3};
+constexpr EngineCodeBytes kShadowRenderCode[] = {
+    {0x1D1EBF0, kShadowRenderPrologue, sizeof(kShadowRenderPrologue)},
+    {0x1D1EC29, kShadowRenderLoads, sizeof(kShadowRenderLoads)},
+    {0x1D1ECC2, kShadowRenderEarlyExit, sizeof(kShadowRenderEarlyExit)},
+    {0x1D1F75B, kShadowRenderEpilogue, sizeof(kShadowRenderEpilogue)},
+};
+// End-of-render cleanup 0x141BF7F10(collector), called by the frame builder at
+// 0x141C1BD29 after the recording step (0x141C1BCD1) on every render. It joins
+// the render's SpeedTree shadow job ([collector+8] scene, [scene+0x188]
+// SpeedTree, 0x141CED670), so a skipped depth pass needs no join of its own,
+// and it zeroes set+0 and the set count, which a skipped fit writes back.
+constexpr uint8_t kShadowCleanupSpeedTreeJoin[] = {
+    0x48, 0x8B, 0x7B, 0x08, 0x48, 0x85, 0xFF, 0x74, 0x34, 0x48, 0x8B, 0xBF,
+    0x88, 0x01, 0x00, 0x00, 0x48, 0x85, 0xFF, 0x74, 0x28, 0x48, 0x8B, 0xCF,
+    0xE8, 0xF0, 0x56, 0x0F, 0x00};
+constexpr uint8_t kShadowCleanupSetHeader[] = {
+    0x33, 0xF6, 0xC6, 0x83, 0xC2, 0x4D, 0x00, 0x00, 0x00, 0x48, 0x89, 0xB3,
+    0x00, 0x01, 0x00, 0x00, 0xBF, 0xFF, 0xFF, 0xFF, 0xFF, 0x66, 0x89, 0xB3,
+    0x08, 0x01, 0x00, 0x00};
+constexpr uint8_t kShadowFrameBuilderRecord[] = {0xE8, 0xCA, 0x69, 0x11, 0x00};
+constexpr uint8_t kShadowFrameBuilderCleanup[] = {
+    0x48, 0x8D, 0x8E, 0x40, 0x07, 0x00, 0x00, 0xE8, 0xE2, 0xC1, 0xFD, 0xFF};
+constexpr EngineCodeBytes kShadowCleanupCode[] = {
+    {0x1BF7F63, kShadowCleanupSpeedTreeJoin,
+        sizeof(kShadowCleanupSpeedTreeJoin)},
+    {0x1BF7FB1, kShadowCleanupSetHeader, sizeof(kShadowCleanupSetHeader)},
+    {0x1C1BCD1, kShadowFrameBuilderRecord, sizeof(kShadowFrameBuilderRecord)},
+    {0x1C1BD22, kShadowFrameBuilderCleanup,
+        sizeof(kShadowFrameBuilderCleanup)},
+};
+// Timers only: SpeedTree cascade views (speedtree, collector) and the
+// RenderShadows stage (renderer, collector) around the depth passes.
+constexpr uint8_t kSpeedTreeShadowViewsPrologue[] = {
+    0x40, 0x55, 0x53, 0x41, 0x55, 0x41, 0x56, 0x48, 0x8D, 0x6C, 0x24, 0x88,
+    0x48, 0x81, 0xEC, 0x78, 0x01, 0x00, 0x00, 0x83, 0xB9, 0xE0, 0x39, 0x00};
+constexpr uint8_t kRenderShadowsPrologue[] = {
+    0x48, 0x8B, 0xC4, 0x41, 0x55, 0x41, 0x57, 0x48, 0x83, 0xEC, 0x68, 0x4C,
+    0x8B, 0x7A, 0x10, 0x48, 0x89, 0x58, 0x10, 0x48, 0x89, 0x68, 0x18, 0x48};
+constexpr EngineCodeBytes kSpeedTreeShadowViewsCode[] = {
+    {0x1CEBC30, kSpeedTreeShadowViewsPrologue,
+        sizeof(kSpeedTreeShadowViewsPrologue)},
+};
+constexpr EngineCodeBytes kRenderShadowsCode[] = {
+    {0x1C34E90, kRenderShadowsPrologue, sizeof(kRenderShadowsPrologue)},
+};
+
+constexpr size_t kShadowCollectorFrameOffset = 0x10;
+constexpr size_t kShadowCollectorActiveOffset = 0xCA;
+constexpr size_t kShadowCollectorSetOffset = 0x100;
+constexpr size_t kShadowCollectorSceneObjectOffset = 0x4EE8;
+constexpr size_t kShadowSetCountOffset = 0x8;
+constexpr size_t kShadowSetFrustaOffset = 0x20;
+constexpr size_t kShadowSetFrustumBytes = 0x140;
+constexpr size_t kShadowSetEntryOffset = 0x520;
+constexpr size_t kShadowSetEntryStride = 0x11E0;
+// Views A, B and C and the texel constants of an entry; its four draw lists
+// come first and are what the depth passes consume.
+constexpr size_t kShadowSetEntryFitOffset = 0x30;
+constexpr size_t kShadowSetParityOffset = 0x4CA0;
+constexpr size_t kShadowSceneObjectFrustaOffset = 0x1C0;
+constexpr size_t kShadowSceneObjectCountOffset = 0x6C0;
+constexpr size_t kShadowFrameFarOffset = 0x44;
+constexpr size_t kShadowFrameSunOffset = 0xEFB0;
+// Split count, split distances, constant/bias parameters and the per-cascade
+// parameters at +0xF59C.
+constexpr size_t kShadowFrameSplitOffset = 0xF548;
+constexpr size_t kShadowFrameSplitBytes = 0x64;
+constexpr size_t kShadowFrameCascadeParamsOffset = 0xF59C;
+// Sun shadows on (+0xF5E4) through SpeedTree on (+0xF5E8); terrain and
+// SpeedTree shadows (+0xF628/+0xF629).
+constexpr size_t kShadowFrameEnabledOffset = 0xF5E4;
+constexpr size_t kShadowFrameEnabledBytes = 5;
+constexpr size_t kShadowFrameCasterFlagsOffset = 0xF628;
+constexpr uint16_t kShadowMaxCascades = 4;
+// Off for the session after this many mismatching pairs in a row, or more
+// than kShadowPairFailSafeWindowMismatches in kShadowPairFailSafeWindow
+// reuse attempts.
+constexpr uint32_t kShadowPairFailSafeConsecutive = 8;
+constexpr uint32_t kShadowPairFailSafeWindow = 256;
+constexpr uint32_t kShadowPairFailSafeWindowMismatches = 32;
+constexpr uint64_t kShadowPairLogPresentInterval = 1200;
+
+using EngineShadowCascadeFitFn = void(__fastcall*)(void*);
+using EngineShadowCascadeRenderFn = void(__fastcall*)(void*, void*, void*, void*);
+using EngineShadowStageFn = void(__fastcall*)(void*, void*);
+EngineShadowCascadeFitFn g_engine_shadow_cascade_fit{};
+EngineShadowCascadeRenderFn g_engine_shadow_cascade_render{};
+EngineShadowStageFn g_engine_speedtree_shadow_views{};
+EngineShadowStageFn g_engine_render_shadows{};
+
+// Startup, fail-safe and counter lines: in the census log during a
+// measurement run, otherwise through log_line; never twice.
+void log_shadow_pair_line(const char* fmt, ...) {
+    va_list args{};
+    va_start(args, fmt);
+    if (g_config.vrs_log_file) {
+        append_log_file_line_v(fmt, args);
+    } else if (g_config.logging_enabled) {
+        write_log_line_v(fmt, args);
+    }
+    va_end(args);
+}
+
+struct ShadowPairTag {
+    bool valid{};
+    uint64_t pair_id{};
+    uint32_t generation{};
+    uint32_t eye{};
+};
+
+// The exact frame-data tag the gameplay entry set for this render.
+ShadowPairTag current_shadow_pair_tag() {
+    ShadowPairTag tag{};
+    tag.pair_id = g_engine_render_pair_id;
+    tag.generation = g_engine_render_generation;
+    tag.eye = static_cast<uint32_t>(g_engine_render_eye);
+    tag.valid = g_engine_render_tag_frame_lookup_exact &&
+        g_engine_render_eye >= 0 && g_engine_render_eye <= 1 &&
+        tag.pair_id != 0 && tag.pair_id != UINT64_MAX &&
+        tag.generation ==
+            g_streamline_capture_generation.load(std::memory_order_acquire);
+    return tag;
+}
+
+uint64_t shadow_hash_words(uint64_t hash, const uint8_t* bytes, size_t size) {
+    for (size_t offset = 0; offset + sizeof(uint64_t) <= size;
+         offset += sizeof(uint64_t)) {
+        uint64_t word{};
+        memcpy(&word, bytes + offset, sizeof(word));
+        hash = (hash ^ word) * 1099511628211ull;
+    }
+    return hash;
+}
+
+// The set header: set+0 (the collector, stored by the fit) and the cascade
+// count at set+0x8. The end-of-render cleanup zeroes both.
+struct ShadowSetHeader {
+    const uint8_t* collector{};
+    uint16_t cascades{};
+};
+
+bool read_shadow_set_header(const uint8_t* set, ShadowSetHeader& out) {
+    __try {
+        memcpy(&out.collector, set, sizeof(out.collector));
+        memcpy(&out.cascades, set + kShadowSetCountOffset,
+            sizeof(out.cascades));
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+bool write_shadow_set_header(uint8_t* set, const ShadowSetHeader& header) {
+    __try {
+        memcpy(set, &header.collector, sizeof(header.collector));
+        memcpy(set + kShadowSetCountOffset, &header.cascades,
+            sizeof(header.cascades));
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// The set's fit bytes that survive the cleanup, for |cascades| cascades:
+// caster frusta, each cascade's views and texel constants, parity. The count
+// is an input because the cleanup zeroes set+0x8 between the renders. About
+// 19 KB with four cascades, a few microseconds.
+bool hash_shadow_cascade_set(
+    const uint8_t* set, uint16_t cascades, uint64_t& hash, uint8_t& parity) {
+    __try {
+        uint64_t value =
+            (14695981039346656037ull ^ cascades) * 1099511628211ull;
+        value = shadow_hash_words(value, set + kShadowSetFrustaOffset,
+            kShadowSetFrustumBytes * kShadowMaxCascades);
+        for (uint16_t index = 0;
+             index < cascades && index < kShadowMaxCascades; ++index) {
+            value = shadow_hash_words(value,
+                set + kShadowSetEntryOffset + index * kShadowSetEntryStride +
+                    kShadowSetEntryFitOffset,
+                kShadowSetEntryStride - kShadowSetEntryFitOffset);
+        }
+        parity = set[kShadowSetParityOffset];
+        hash = (value ^ parity) * 1099511628211ull;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// Frame inputs of the fit, the cascade constants and the depth passes. Both
+// eyes of a pair share them; only the eye camera differs.
+bool hash_shadow_frame_inputs(
+    const uint8_t* collector, uint64_t& hash, bool& shadows_on) {
+    __try {
+        const uint8_t* frame{};
+        memcpy(&frame, collector + kShadowCollectorFrameOffset, sizeof(frame));
+        if (frame == nullptr) {
+            return false;
+        }
+        uint8_t inputs[4 + 16 + kShadowFrameSplitBytes +
+            kShadowFrameEnabledBytes + 2]{};
+        uint8_t* cursor = inputs;
+        memcpy(cursor, frame + kShadowFrameFarOffset, 4);
+        cursor += 4;
+        memcpy(cursor, frame + kShadowFrameSunOffset, 16);
+        cursor += 16;
+        memcpy(cursor, frame + kShadowFrameSplitOffset, kShadowFrameSplitBytes);
+        cursor += kShadowFrameSplitBytes;
+        memcpy(cursor, frame + kShadowFrameEnabledOffset,
+            kShadowFrameEnabledBytes);
+        cursor += kShadowFrameEnabledBytes;
+        memcpy(cursor, frame + kShadowFrameCasterFlagsOffset, 2);
+        hash = fnv1a64(inputs, sizeof(inputs));
+        shadows_on = frame[kShadowFrameEnabledOffset] != 0;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// The SpeedTree cascade frusta the fit copies into [collector+0x4EE8].
+struct ShadowSceneObjectFrusta {
+    uint8_t* object{};
+    uint32_t count{};
+    uint8_t frusta[kShadowSetFrustumBytes * kShadowMaxCascades]{};
+};
+
+bool read_shadow_scene_object(
+    const uint8_t* collector, ShadowSceneObjectFrusta& out) {
+    __try {
+        memcpy(&out.object, collector + kShadowCollectorSceneObjectOffset,
+            sizeof(out.object));
+        if (out.object != nullptr) {
+            memcpy(&out.count, out.object + kShadowSceneObjectCountOffset,
+                sizeof(out.count));
+            memcpy(out.frusta, out.object + kShadowSceneObjectFrustaOffset,
+                sizeof(out.frusta));
+        }
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// Rewrites the seed's block if anything changed it; |restored| tells.
+bool restore_shadow_scene_object(
+    const ShadowSceneObjectFrusta& seed, bool& restored) {
+    restored = false;
+    if (seed.object == nullptr) {
+        return true;
+    }
+    const size_t bytes = kShadowSetFrustumBytes *
+        std::min<uint32_t>(seed.count, kShadowMaxCascades);
+    __try {
+        uint32_t count{};
+        memcpy(&count, seed.object + kShadowSceneObjectCountOffset,
+            sizeof(count));
+        if (count != seed.count || memcmp(
+                seed.object + kShadowSceneObjectFrustaOffset,
+                seed.frusta, bytes) != 0) {
+            memcpy(seed.object + kShadowSceneObjectFrustaOffset,
+                seed.frusta, bytes);
+            memcpy(seed.object + kShadowSceneObjectCountOffset, &seed.count,
+                sizeof(seed.count));
+            restored = true;
+        }
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// The depth passes' own early-exit test: they draw only with sun shadows on
+// in the frame and a non-empty set.
+bool shadow_cascade_render_draws(const uint8_t* frame, const uint8_t* set) {
+    __try {
+        uint16_t count{};
+        memcpy(&count, set + kShadowSetCountOffset, sizeof(count));
+        return frame[kShadowFrameEnabledOffset] != 0 && count != 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// [FEATURE:REMASTER-SHADOW-PAIR-REUSE 3/7] Pair ledger. One slot: both renders
+// of a pair run back to back on the render thread. The busy flag keeps an
+// unexpected second thread out instead of making it wait; it runs the
+// original code, the set hash catches a fit it ran and the map-write count
+// catches its depth passes.
+enum class ShadowPairAction : uint8_t { Full, Seed, Skip };
+enum class ShadowPairFallback : size_t {
+    Gate,
+    NoTag,
+    SameEye,
+    SeedNotRendered,
+    Busy,
+    ForeignRender,
+    // Mismatches of an exact pair whose seed rendered; they feed the
+    // fail-safe.
+    Thread,
+    Collector,
+    Cascades,
+    Frame,
+    SetHash,
+    SceneObject,
+    ReadFault,
+    Count,
+};
+constexpr const char* kShadowPairFallbackNames[] = {
+    "gate", "no_tag", "same_eye", "seed_not_rendered", "busy",
+    "foreign_render", "thread", "collector", "cascades", "frame", "set_hash",
+    "scene_object", "read_fault"};
+static_assert(std::size(kShadowPairFallbackNames) ==
+    static_cast<size_t>(ShadowPairFallback::Count));
+
+struct ShadowPairSlot {
+    bool valid{};
+    bool seed_rendered{};
+    uint64_t pair_id{};
+    uint32_t generation{};
+    uint32_t seed_eye{};
+    uint32_t thread_id{};
+    const uint8_t* collector{};
+    const uint8_t* set{};
+    // The header the seed's fit left; a skipped fit writes it back.
+    ShadowSetHeader header{};
+    uint64_t set_hash{};
+    uint64_t frame_hash{};
+    // g_shadow_map_writes after the seed's depth passes.
+    uint64_t map_writes{};
+    ShadowSceneObjectFrusta scene_object{};
+};
+
+// What the fit hook decided for the render now running on this thread. The
+// depth-pass hook of the same render follows it as one decision: a skipped
+// fit always skips the depth passes, and a fit that ran always draws them.
+struct ShadowPairRender {
+    bool fit_skipped{};
+    bool seeded{};
+    uint64_t pair_id{};
+    uint32_t generation{};
+    uint32_t eye{};
+    const uint8_t* set{};
+};
+
+std::atomic<bool> g_runtime_shadow_pair_reuse{};
+std::atomic<bool> g_shadow_pair_busy{};
+ShadowPairSlot g_shadow_pair_slot{};
+w3vr::shadow_cascade::ReuseFailSafe g_shadow_pair_fail_safe{};
+thread_local ShadowPairRender t_shadow_pair_render{};
+std::atomic<uint64_t> g_shadow_pair_seeded{};
+std::atomic<uint64_t> g_shadow_pair_fit_skips{};
+std::atomic<uint64_t> g_shadow_pair_render_skips{};
+std::atomic<uint64_t> g_shadow_pair_frusta_restored{};
+// Depth passes that ran, any render and mode. A value other than the seed's
+// at the reuser means another render drew into the shadow map in between.
+std::atomic<uint64_t> g_shadow_map_writes{};
+std::array<std::atomic<uint64_t>,
+    static_cast<size_t>(ShadowPairFallback::Count)> g_shadow_pair_fallbacks{};
+
+bool shadow_pair_reuse_active() {
+    return g_config.remaster_shadow_pair_reuse != 0 &&
+        g_runtime_shadow_pair_reuse.load(std::memory_order_acquire);
+}
+
+constexpr bool shadow_pair_mismatch(ShadowPairFallback reason) {
+    return reason >= ShadowPairFallback::Thread &&
+        reason < ShadowPairFallback::Count;
+}
+
+void count_shadow_pair_fallback(ShadowPairFallback reason) {
+    if (reason != ShadowPairFallback::Count) {
+        g_shadow_pair_fallbacks[static_cast<size_t>(reason)].fetch_add(
+            1, std::memory_order_relaxed);
+    }
+}
+
+// Under g_shadow_pair_busy: one call per reuse attempt that got as far as
+// comparing (the other eye of a pair whose seed rendered, with no other
+// depth passes since); Count means it succeeded.
+void note_shadow_pair_attempt(ShadowPairFallback reason) {
+    const bool trip = w3vr::shadow_cascade::note_reuse_attempt(
+        g_shadow_pair_fail_safe, shadow_pair_mismatch(reason),
+        kShadowPairFailSafeConsecutive, kShadowPairFailSafeWindow,
+        kShadowPairFailSafeWindowMismatches);
+    if (trip && g_runtime_shadow_pair_reuse.exchange(
+            false, std::memory_order_acq_rel)) {
+        g_shadow_pair_slot.valid = false;
+        log_shadow_pair_line(
+            "Shadow pair reuse disabled for the session: consecutive=%u "
+            "last=%s present=%llu",
+            g_shadow_pair_fail_safe.consecutive,
+            kShadowPairFallbackNames[static_cast<size_t>(reason)],
+            static_cast<unsigned long long>(
+                g_present_count.load(std::memory_order_relaxed)));
+    }
+}
+
+// The reuser's checks, then the write-back: the SpeedTree frusta (only if
+// something changed them) and the set header the seed's end-of-render cleanup
+// zeroed. The set itself is compared by its persistent fit bytes for the
+// seed's cascade count; its header must be cleared or still the seed's.
+ShadowPairFallback verify_shadow_pair_fit_reuse(
+    const ShadowPairSlot& slot, uint8_t* collector) {
+    if (!slot.seed_rendered) {
+        return ShadowPairFallback::SeedNotRendered;
+    }
+    if (g_shadow_map_writes.load(std::memory_order_acquire) !=
+        slot.map_writes) {
+        return ShadowPairFallback::ForeignRender;
+    }
+    if (slot.thread_id != GetCurrentThreadId()) {
+        return ShadowPairFallback::Thread;
+    }
+    if (slot.collector != collector) {
+        return ShadowPairFallback::Collector;
+    }
+    uint8_t* set = collector + kShadowCollectorSetOffset;
+    uint64_t frame_hash{};
+    bool shadows_on{};
+    ShadowSetHeader header{};
+    uint64_t set_hash{};
+    uint8_t parity{};
+    ShadowSceneObjectFrusta scene_object{};
+    if (!hash_shadow_frame_inputs(collector, frame_hash, shadows_on) ||
+        !read_shadow_set_header(set, header) ||
+        !hash_shadow_cascade_set(
+            set, slot.header.cascades, set_hash, parity) ||
+        !read_shadow_scene_object(collector, scene_object)) {
+        return ShadowPairFallback::ReadFault;
+    }
+    const bool cleared = header.collector == nullptr && header.cascades == 0;
+    if (!cleared && (header.collector != slot.header.collector ||
+            header.cascades != slot.header.cascades)) {
+        return ShadowPairFallback::Cascades;
+    }
+    if (frame_hash != slot.frame_hash || !shadows_on) {
+        return ShadowPairFallback::Frame;
+    }
+    if (set_hash != slot.set_hash) {
+        return ShadowPairFallback::SetHash;
+    }
+    if (scene_object.object != slot.scene_object.object) {
+        return ShadowPairFallback::SceneObject;
+    }
+    bool restored{};
+    if (!restore_shadow_scene_object(slot.scene_object, restored) ||
+        !write_shadow_set_header(set, slot.header)) {
+        return ShadowPairFallback::ReadFault;
+    }
+    if (restored) {
+        g_shadow_pair_frusta_restored.fetch_add(1, std::memory_order_relaxed);
+    }
+    return ShadowPairFallback::Count;
+}
+
+// Fit hook, mode 1. Seed: the first exact render of a pair (either eye; the
+// order is not stable) runs the fit and is snapshotted after it. Skip: the
+// other eye of a pair whose seed rendered, with the set, the frame inputs and
+// the SpeedTree object unchanged and no depth passes since; the set header is
+// written back. Anything else runs the fit and drops the slot, because the
+// fit rewrites the set.
+ShadowPairAction decide_shadow_pair_fit(
+    uint8_t* collector, const ShadowPairTag& tag) {
+    if (g_shadow_pair_busy.exchange(true, std::memory_order_acquire)) {
+        count_shadow_pair_fallback(ShadowPairFallback::Busy);
+        return ShadowPairAction::Full;
+    }
+    auto& slot = g_shadow_pair_slot;
+    ShadowPairAction action = ShadowPairAction::Full;
+    ShadowPairFallback reason = ShadowPairFallback::Count;
+    if (!shadow_cascade_shared_view_active()) {
+        reason = ShadowPairFallback::Gate;
+    } else if (!tag.valid) {
+        reason = ShadowPairFallback::NoTag;
+    } else {
+        switch (w3vr::shadow_cascade::decide_authority(
+            slot.valid, slot.pair_id, slot.generation, slot.seed_eye,
+            tag.pair_id, tag.generation, tag.eye)) {
+        case w3vr::shadow_cascade::AuthorityAction::Seed:
+            action = ShadowPairAction::Seed;
+            break;
+        case w3vr::shadow_cascade::AuthorityAction::SameEye:
+            reason = ShadowPairFallback::SameEye;
+            break;
+        case w3vr::shadow_cascade::AuthorityAction::Reuse:
+            reason = verify_shadow_pair_fit_reuse(slot, collector);
+            if (reason == ShadowPairFallback::Count) {
+                action = ShadowPairAction::Skip;
+            }
+            if (reason == ShadowPairFallback::Count ||
+                shadow_pair_mismatch(reason)) {
+                note_shadow_pair_attempt(reason);
+            }
+            break;
+        }
+    }
+    if (action != ShadowPairAction::Skip) {
+        slot.valid = false;
+    }
+    g_shadow_pair_busy.store(false, std::memory_order_release);
+    count_shadow_pair_fallback(reason);
+    return action;
+}
+
+// After the seed's fit: the header, the set hash and everything the reuser
+// must find unchanged. A seed with shadows off or an empty set is not kept.
+void seed_shadow_pair_fit(const uint8_t* collector, const ShadowPairTag& tag,
+    const ShadowSetHeader& header, uint64_t set_hash) {
+    ShadowPairSlot seed{};
+    bool shadows_on{};
+    if (header.collector != collector || header.cascades == 0 ||
+        header.cascades > kShadowMaxCascades ||
+        !hash_shadow_frame_inputs(collector, seed.frame_hash, shadows_on) ||
+        !shadows_on ||
+        !read_shadow_scene_object(collector, seed.scene_object)) {
+        return;
+    }
+    seed.valid = true;
+    seed.pair_id = tag.pair_id;
+    seed.generation = tag.generation;
+    seed.seed_eye = tag.eye;
+    seed.thread_id = GetCurrentThreadId();
+    seed.collector = collector;
+    seed.set = collector + kShadowCollectorSetOffset;
+    seed.header = header;
+    seed.set_hash = set_hash;
+    if (g_shadow_pair_busy.exchange(true, std::memory_order_acquire)) {
+        count_shadow_pair_fallback(ShadowPairFallback::Busy);
+        return;
+    }
+    g_shadow_pair_slot = seed;
+    g_shadow_pair_busy.store(false, std::memory_order_release);
+    g_shadow_pair_seeded.fetch_add(1, std::memory_order_relaxed);
+    t_shadow_pair_render = {false, true, tag.pair_id, tag.generation, tag.eye,
+        seed.set};
+}
+
+// Depth-pass hook, for renders whose fit was not skipped (those skip their
+// depth passes without asking). Mode 1: the seed's own depth passes draw and
+// then make the slot usable; any other depth passes draw too and drop the
+// slot, because they overwrite the map. Mode 9 (measurement) decides here
+// alone and has no set guard: the reuser keeps its own fit, so its lighting
+// is misregistered by design.
+ShadowPairAction decide_shadow_pair_render(const uint8_t* set,
+    const ShadowPairTag& tag, const ShadowPairRender& render) {
+    const bool this_render = tag.valid && render.set == set &&
+        render.pair_id == tag.pair_id &&
+        render.generation == tag.generation && render.eye == tag.eye;
+    if (g_shadow_pair_busy.exchange(true, std::memory_order_acquire)) {
+        count_shadow_pair_fallback(ShadowPairFallback::Busy);
+        return ShadowPairAction::Full;
+    }
+    auto& slot = g_shadow_pair_slot;
+    ShadowPairAction action = ShadowPairAction::Full;
+    ShadowPairFallback reason = ShadowPairFallback::Count;
+    if (g_config.remaster_shadow_pair_reuse == 9) {
+        if (!shadow_cascade_shared_view_active()) {
+            reason = ShadowPairFallback::Gate;
+        } else if (!tag.valid) {
+            reason = ShadowPairFallback::NoTag;
+        } else {
+            switch (w3vr::shadow_cascade::decide_authority(
+                slot.valid, slot.pair_id, slot.generation, slot.seed_eye,
+                tag.pair_id, tag.generation, tag.eye)) {
+            case w3vr::shadow_cascade::AuthorityAction::Seed:
+                action = ShadowPairAction::Seed;
+                break;
+            case w3vr::shadow_cascade::AuthorityAction::SameEye:
+                reason = ShadowPairFallback::SameEye;
+                break;
+            case w3vr::shadow_cascade::AuthorityAction::Reuse:
+                if (!slot.seed_rendered) {
+                    reason = ShadowPairFallback::SeedNotRendered;
+                } else if (g_shadow_map_writes.load(
+                               std::memory_order_acquire) != slot.map_writes) {
+                    reason = ShadowPairFallback::ForeignRender;
+                } else if (slot.thread_id != GetCurrentThreadId()) {
+                    reason = ShadowPairFallback::Thread;
+                } else if (slot.set != set) {
+                    reason = ShadowPairFallback::Collector;
+                } else {
+                    action = ShadowPairAction::Skip;
+                }
+                if (reason == ShadowPairFallback::Count ||
+                    shadow_pair_mismatch(reason)) {
+                    note_shadow_pair_attempt(reason);
+                }
+                break;
+            }
+        }
+    } else if (this_render && render.seeded) {
+        // The slot still holds this render's seed and its depth passes have
+        // not run yet. The reuser compares the set with the seed's fit.
+        if (slot.valid && slot.pair_id == tag.pair_id &&
+            slot.generation == tag.generation && slot.seed_eye == tag.eye &&
+            slot.set == set && !slot.seed_rendered) {
+            action = ShadowPairAction::Seed;
+        } else {
+            reason = ShadowPairFallback::ForeignRender;
+        }
+    } else if (slot.valid) {
+        // A render the fit hook did not seed writes the shadow map, so the
+        // slot no longer describes it.
+        reason = ShadowPairFallback::ForeignRender;
+    }
+    if (action == ShadowPairAction::Full) {
+        slot.valid = false;
+    }
+    g_shadow_pair_busy.store(false, std::memory_order_release);
+    count_shadow_pair_fallback(reason);
+    return action;
+}
+
+// After the seed's depth passes, with the map-write count they produced.
+// Mode 1 marks the slot its fit seeded; mode 9 seeds here.
+void finish_shadow_pair_seed_render(const ShadowPairTag& tag,
+    const uint8_t* set, bool drew, uint64_t map_writes) {
+    if (g_shadow_pair_busy.exchange(true, std::memory_order_acquire)) {
+        count_shadow_pair_fallback(ShadowPairFallback::Busy);
+        return;
+    }
+    auto& slot = g_shadow_pair_slot;
+    bool seeded{};
+    if (g_config.remaster_shadow_pair_reuse == 9) {
+        slot = {};
+        slot.valid = drew;
+        slot.seed_rendered = drew;
+        slot.pair_id = tag.pair_id;
+        slot.generation = tag.generation;
+        slot.seed_eye = tag.eye;
+        slot.thread_id = GetCurrentThreadId();
+        slot.set = set;
+        slot.collector = set - kShadowCollectorSetOffset;
+        slot.map_writes = map_writes;
+        seeded = drew;
+    } else if (slot.valid && slot.pair_id == tag.pair_id &&
+        slot.generation == tag.generation && slot.seed_eye == tag.eye) {
+        slot.seed_rendered = drew;
+        slot.valid = drew;
+        slot.map_writes = map_writes;
+    }
+    g_shadow_pair_busy.store(false, std::memory_order_release);
+    if (seeded) {
+        g_shadow_pair_seeded.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+// [FEATURE:REMASTER-SHADOW-PAIR-REUSE 4/7] [perf] shadow_profile: QPC time
+// per call of the four shadow stages per eye (0 left, 1 right, 2 untagged),
+// the set hash between the eyes of a pair, and the draws recorded inside the
+// depth passes against all draws. Calls are per render, not per draw; the
+// draw counters are per thread, one cache line each, so the draw hooks never
+// share a cache line.
+enum class ShadowStage : size_t { Fit, SpeedTreeViews, RenderShadows, Cascades, Count };
+constexpr size_t kShadowStageCount = static_cast<size_t>(ShadowStage::Count);
+
+struct ShadowProfileEye {
+    std::array<std::atomic<uint64_t>, kShadowStageCount> calls{};
+    std::array<std::atomic<uint64_t>, kShadowStageCount> ticks{};
+    std::atomic<uint64_t> skipped_fits{};
+    std::atomic<uint64_t> skipped_renders{};
+    // Fits whose set could be read, and the sums of its count and parity.
+    std::atomic<uint64_t> hashed_fits{};
+    std::atomic<uint64_t> cascades{};
+    std::atomic<uint64_t> parity{};
+    // RenderShadows calls with sun shadows on ([collector+0xCA]).
+    std::atomic<uint64_t> active{};
+    std::atomic<uint64_t> cascade_draws{};
+    std::atomic<uint64_t> set_hash{};
+    std::atomic<uint32_t> smap_size{};
+    std::atomic<uint32_t> smap_count{};
+    std::atomic<uint32_t> smap_handle{};
+};
+std::array<ShadowProfileEye, 3> g_shadow_profile_eyes{};
+// Fits whose previous fit was the other eye of the same pair; of those, the
+// ones that found the set's fit bytes as the other eye left them (the header
+// the cleanup zeroes aside), and the ones that produced the same set.
+std::atomic<uint64_t> g_shadow_profile_pair_fits{};
+std::atomic<uint64_t> g_shadow_profile_set_untouched{};
+std::atomic<uint64_t> g_shadow_profile_same_fit{};
+std::atomic<uint64_t> g_shadow_profile_smap_changes{};
+std::atomic<bool> g_shadow_profile_frame_claimed{};
+std::atomic<bool> g_shadow_profile_frame_ready{};
+// Split count, four split distances, four per-cascade parameters, far plane.
+std::array<float, 10> g_shadow_profile_frame{};
+
+// The last fit on this thread: its set hash for its cascade count.
+struct ShadowProfileFit {
+    bool valid{};
+    uint64_t pair_id{};
+    uint32_t generation{};
+    uint32_t eye{};
+    uint64_t hash{};
+    uint16_t cascades{};
+};
+thread_local ShadowProfileFit t_shadow_profile_last_fit{};
+thread_local uint32_t t_shadow_profile_last_smap_handle{UINT32_MAX};
+
+struct alignas(64) ShadowProfileDrawSlot {
+    std::atomic<uint32_t> thread_id{};
+    std::atomic<uint64_t> draws{};
+};
+std::array<ShadowProfileDrawSlot, 32> g_shadow_profile_draw_slots{};
+std::atomic<uint64_t> g_shadow_profile_draw_overflow{};
+thread_local ShadowProfileDrawSlot* t_shadow_profile_draw_slot{};
+thread_local bool t_shadow_profile_draw_slot_failed{};
+thread_local bool t_shadow_profile_in_cascades{};
+thread_local uint64_t t_shadow_profile_cascade_draws{};
+
+void record_shadow_profile_draw() {
+    if (t_shadow_profile_in_cascades) {
+        ++t_shadow_profile_cascade_draws;
+    }
+    auto* slot = t_shadow_profile_draw_slot;
+    if (slot == nullptr) {
+        if (!t_shadow_profile_draw_slot_failed) {
+            const uint32_t thread_id = GetCurrentThreadId();
+            for (auto& candidate : g_shadow_profile_draw_slots) {
+                uint32_t expected{};
+                if (candidate.thread_id.compare_exchange_strong(
+                        expected, thread_id, std::memory_order_acq_rel)) {
+                    slot = &candidate;
+                    break;
+                }
+            }
+            t_shadow_profile_draw_slot = slot;
+            t_shadow_profile_draw_slot_failed = slot == nullptr;
+        }
+        if (slot == nullptr) {
+            g_shadow_profile_draw_overflow.fetch_add(
+                1, std::memory_order_relaxed);
+            return;
+        }
+    }
+    slot->draws.store(slot->draws.load(std::memory_order_relaxed) + 1,
+        std::memory_order_relaxed);
+}
+
+size_t shadow_profile_eye_index() {
+    return g_engine_render_tag_frame_lookup_exact &&
+            g_engine_render_eye >= 0 && g_engine_render_eye <= 1
+        ? static_cast<size_t>(g_engine_render_eye) : 2;
+}
+
+int64_t shadow_profile_ticks() {
+    LARGE_INTEGER now{};
+    QueryPerformanceCounter(&now);
+    return now.QuadPart;
+}
+
+void record_shadow_profile_stage(size_t eye, ShadowStage stage, int64_t begin) {
+    auto& stats = g_shadow_profile_eyes[eye];
+    const auto index = static_cast<size_t>(stage);
+    stats.calls[index].fetch_add(1, std::memory_order_relaxed);
+    stats.ticks[index].fetch_add(
+        static_cast<uint64_t>(shadow_profile_ticks() - begin),
+        std::memory_order_relaxed);
+}
+
+bool read_shadow_profile_frame(const uint8_t* collector,
+    std::array<float, 10>& values) {
+    __try {
+        const uint8_t* frame{};
+        memcpy(&frame, collector + kShadowCollectorFrameOffset, sizeof(frame));
+        if (frame == nullptr) {
+            return false;
+        }
+        uint32_t splits{};
+        memcpy(&splits, frame + kShadowFrameSplitOffset, sizeof(splits));
+        values[0] = static_cast<float>(splits);
+        memcpy(&values[1], frame + kShadowFrameSplitOffset + 4,
+            4 * sizeof(float));
+        memcpy(&values[5], frame + kShadowFrameCascadeParamsOffset,
+            4 * sizeof(float));
+        memcpy(&values[9], frame + kShadowFrameFarOffset, sizeof(float));
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+void record_shadow_profile_fit(const uint8_t* collector, size_t eye,
+    const ShadowPairTag& tag, bool pre_valid, uint64_t pre_hash,
+    bool post_valid, uint64_t post_hash, uint16_t cascades, uint8_t parity) {
+    auto& stats = g_shadow_profile_eyes[eye];
+    if (post_valid) {
+        stats.hashed_fits.fetch_add(1, std::memory_order_relaxed);
+        stats.cascades.fetch_add(cascades, std::memory_order_relaxed);
+        stats.parity.fetch_add(parity, std::memory_order_relaxed);
+        stats.set_hash.store(post_hash, std::memory_order_relaxed);
+    }
+    auto& last = t_shadow_profile_last_fit;
+    if (tag.valid && last.valid && last.pair_id == tag.pair_id &&
+        last.generation == tag.generation && last.eye != tag.eye) {
+        g_shadow_profile_pair_fits.fetch_add(1, std::memory_order_relaxed);
+        if (pre_valid && pre_hash == last.hash) {
+            g_shadow_profile_set_untouched.fetch_add(
+                1, std::memory_order_relaxed);
+        }
+        if (post_valid && post_hash == last.hash) {
+            g_shadow_profile_same_fit.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    last = {tag.valid && post_valid, tag.pair_id, tag.generation, tag.eye,
+        post_hash, cascades};
+    if (!g_shadow_profile_frame_claimed.load(std::memory_order_relaxed) &&
+        !g_shadow_profile_frame_claimed.exchange(
+            true, std::memory_order_acq_rel)) {
+        if (read_shadow_profile_frame(collector, g_shadow_profile_frame)) {
+            g_shadow_profile_frame_ready.store(true, std::memory_order_release);
+        } else {
+            g_shadow_profile_frame_claimed.store(
+                false, std::memory_order_release);
+        }
+    }
+}
+
+bool read_shadow_map_info(
+    const uint8_t* smap, uint32_t& size, uint32_t& count, uint32_t& handle) {
+    __try {
+        uint16_t cascades{};
+        memcpy(&size, smap, sizeof(size));
+        memcpy(&cascades, smap + 4, sizeof(cascades));
+        memcpy(&handle, smap + 8, sizeof(handle));
+        count = cascades;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+void record_shadow_profile_map(size_t eye, const void* smap) {
+    uint32_t size{};
+    uint32_t count{};
+    uint32_t handle{};
+    if (smap == nullptr || !read_shadow_map_info(
+            static_cast<const uint8_t*>(smap), size, count, handle)) {
+        return;
+    }
+    auto& stats = g_shadow_profile_eyes[eye];
+    stats.smap_size.store(size, std::memory_order_relaxed);
+    stats.smap_count.store(count, std::memory_order_relaxed);
+    stats.smap_handle.store(handle, std::memory_order_relaxed);
+    if (t_shadow_profile_last_smap_handle != UINT32_MAX &&
+        t_shadow_profile_last_smap_handle != handle) {
+        g_shadow_profile_smap_changes.fetch_add(1, std::memory_order_relaxed);
+    }
+    t_shadow_profile_last_smap_handle = handle;
+}
+
+void log_shadow_pair_counters(void (*write_line)(const char*, ...)) {
+    // Previous totals; one writer (the census or the render thread).
+    static uint64_t previous_seeded{};
+    static uint64_t previous_fit_skips{};
+    static uint64_t previous_render_skips{};
+    static uint64_t previous_restored{};
+    static std::array<uint64_t,
+        static_cast<size_t>(ShadowPairFallback::Count)> previous_fallbacks{};
+    const auto window = [](const std::atomic<uint64_t>& counter,
+                            uint64_t& previous, unsigned long long& total) {
+        const uint64_t value = counter.load(std::memory_order_relaxed);
+        const auto delta = static_cast<unsigned long long>(value - previous);
+        previous = value;
+        total = static_cast<unsigned long long>(value);
+        return delta;
+    };
+    unsigned long long seeded{};
+    unsigned long long fit_skips{};
+    unsigned long long render_skips{};
+    unsigned long long restored{};
+    const auto seeded_window =
+        window(g_shadow_pair_seeded, previous_seeded, seeded);
+    const auto fit_window =
+        window(g_shadow_pair_fit_skips, previous_fit_skips, fit_skips);
+    const auto render_window = window(
+        g_shadow_pair_render_skips, previous_render_skips, render_skips);
+    const auto restored_window = window(
+        g_shadow_pair_frusta_restored, previous_restored, restored);
+    char fallbacks[512]{};
+    size_t used{};
+    for (size_t index = 0; index < previous_fallbacks.size(); ++index) {
+        unsigned long long total{};
+        const auto delta = window(
+            g_shadow_pair_fallbacks[index], previous_fallbacks[index], total);
+        if (total == 0 || used >= sizeof(fallbacks)) {
+            continue;
+        }
+        const int written = snprintf(fallbacks + used,
+            sizeof(fallbacks) - used, " %s=+%llu/%llu",
+            kShadowPairFallbackNames[index], delta, total);
+        if (written > 0) {
+            used += static_cast<size_t>(written);
+        }
+    }
+    write_line("Shadow pair reuse mode=%d active=%d seeded=+%llu/%llu "
+        "fit_skipped=+%llu/%llu render_skipped=+%llu/%llu "
+        "frusta_restored=+%llu/%llu fallbacks:%s",
+        g_config.remaster_shadow_pair_reuse,
+        g_runtime_shadow_pair_reuse.load(std::memory_order_relaxed) ? 1 : 0,
+        seeded_window, seeded, fit_window, fit_skips, render_window,
+        render_skips, restored_window, restored,
+        used != 0 ? fallbacks : " none");
+}
+
+// Outside a measurement run the counters go to the diagnostic log.
+void maybe_log_shadow_pair_counters() {
+    if (g_config.vrs_log_file || !g_config.logging_enabled ||
+        !g_config.runtime_diagnostics) {
+        return;
+    }
+    static std::atomic<uint64_t> next_present{kShadowPairLogPresentInterval};
+    const uint64_t present = g_present_count.load(std::memory_order_relaxed);
+    uint64_t next = next_present.load(std::memory_order_relaxed);
+    if (present < next || !next_present.compare_exchange_strong(
+            next, present + kShadowPairLogPresentInterval,
+            std::memory_order_relaxed)) {
+        return;
+    }
+    log_shadow_pair_counters(&log_line);
+}
+
+// [FEATURE:REMASTER-SHADOW-PAIR-REUSE 5/7] The hooks. All four run on the
+// render thread inside the frame builder, so the exact eye/pair tag of the
+// gameplay entry is set.
+void __fastcall hook_engine_shadow_cascade_fit(void* collector) {
+    const bool profile = g_config.perf_shadow_profile;
+    const int64_t begin = profile ? shadow_profile_ticks() : 0;
+    const size_t profile_eye = profile ? shadow_profile_eye_index() : 2;
+    auto* collector_bytes = static_cast<uint8_t*>(collector);
+    const uint8_t* set = collector_bytes + kShadowCollectorSetOffset;
+    const ShadowPairTag tag = current_shadow_pair_tag();
+    t_shadow_pair_render = {};
+    ShadowPairAction action = ShadowPairAction::Full;
+    if (g_config.remaster_shadow_pair_reuse == 1 && collector != nullptr &&
+        shadow_pair_reuse_active()) {
+        action = decide_shadow_pair_fit(collector_bytes, tag);
+    }
+    if (action == ShadowPairAction::Skip) {
+        // The set holds the seed's fit again, header included, and the
+        // SpeedTree frusta are the seed's. This render's depth passes skip.
+        t_shadow_pair_render = {true, false, tag.pair_id, tag.generation,
+            tag.eye, set};
+        g_shadow_pair_fit_skips.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        // The profile hashes the set before the fit for the cascade count of
+        // the previous fit on this thread, which the cleanup has zeroed.
+        const ShadowProfileFit& last = t_shadow_profile_last_fit;
+        uint64_t pre_hash{};
+        uint8_t parity{};
+        const bool pre_valid = profile && collector != nullptr &&
+            last.valid &&
+            hash_shadow_cascade_set(set, last.cascades, pre_hash, parity);
+        g_engine_shadow_cascade_fit(collector);
+        ShadowSetHeader header{};
+        uint64_t post_hash{};
+        const bool post_valid =
+            (profile || action == ShadowPairAction::Seed) &&
+            collector != nullptr && read_shadow_set_header(set, header) &&
+            hash_shadow_cascade_set(set, header.cascades, post_hash, parity);
+        if (action == ShadowPairAction::Seed && post_valid) {
+            seed_shadow_pair_fit(collector_bytes, tag, header, post_hash);
+        }
+        if (profile && collector != nullptr) {
+            record_shadow_profile_fit(collector_bytes, profile_eye, tag,
+                pre_valid, pre_hash, post_valid, post_hash, header.cascades,
+                parity);
+        }
+    }
+    if (profile) {
+        if (action == ShadowPairAction::Skip) {
+            g_shadow_profile_eyes[profile_eye].skipped_fits.fetch_add(
+                1, std::memory_order_relaxed);
+        }
+        record_shadow_profile_stage(profile_eye, ShadowStage::Fit, begin);
+    }
+}
+
+void __fastcall hook_engine_shadow_cascade_render(
+    void* renderer, void* frame, void* set, void* smap) {
+    const bool profile = g_config.perf_shadow_profile;
+    const int64_t begin = profile ? shadow_profile_ticks() : 0;
+    const size_t profile_eye = profile ? shadow_profile_eye_index() : 2;
+    const auto* frame_bytes = static_cast<const uint8_t*>(frame);
+    const auto* set_bytes = static_cast<const uint8_t*>(set);
+    const ShadowPairRender render = t_shadow_pair_render;
+    t_shadow_pair_render = {};
+    ShadowPairTag tag{};
+    ShadowPairAction action = ShadowPairAction::Full;
+    if (render.fit_skipped && render.set == set_bytes) {
+        // One decision per render, made by the fit hook: this render's set
+        // holds the seed's cascades but no caster lists (the cleanup emptied
+        // them), so drawing would clear the seed's map and redraw only the
+        // SpeedTree and particle casters. No checks here and no fallback,
+        // not even when reuse was switched off since.
+        action = ShadowPairAction::Skip;
+    } else if (frame != nullptr && set != nullptr &&
+        shadow_pair_reuse_active()) {
+        tag = current_shadow_pair_tag();
+        action = decide_shadow_pair_render(set_bytes, tag, render);
+    }
+    if (action == ShadowPairAction::Skip) {
+        // The engine's own early exit (frame+0xF5E4 or the set count zero)
+        // returns before recording anything; so does a skipped render. The
+        // SpeedTree shadow job that 0x141CEBC30 launched for this render is
+        // joined by the end-of-render cleanup, as on that early exit.
+        g_shadow_pair_render_skips.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        const bool drew = action == ShadowPairAction::Seed &&
+            shadow_cascade_render_draws(frame_bytes, set_bytes);
+        const uint64_t map_writes =
+            g_shadow_map_writes.fetch_add(1, std::memory_order_acq_rel) + 1;
+        const uint64_t draws_before = t_shadow_profile_cascade_draws;
+        t_shadow_profile_in_cascades = profile;
+        g_engine_shadow_cascade_render(renderer, frame, set, smap);
+        t_shadow_profile_in_cascades = false;
+        if (profile) {
+            g_shadow_profile_eyes[profile_eye].cascade_draws.fetch_add(
+                t_shadow_profile_cascade_draws - draws_before,
+                std::memory_order_relaxed);
+            record_shadow_profile_map(profile_eye, smap);
+        }
+        if (action == ShadowPairAction::Seed) {
+            finish_shadow_pair_seed_render(tag, set_bytes, drew, map_writes);
+        }
+    }
+    if (profile) {
+        if (action == ShadowPairAction::Skip) {
+            g_shadow_profile_eyes[profile_eye].skipped_renders.fetch_add(
+                1, std::memory_order_relaxed);
+        }
+        record_shadow_profile_stage(profile_eye, ShadowStage::Cascades, begin);
+    }
+    if (g_config.remaster_shadow_pair_reuse != 0) {
+        maybe_log_shadow_pair_counters();
+    }
+}
+
+void __fastcall hook_engine_speedtree_shadow_views(
+    void* speedtree, void* collector) {
+    const int64_t begin = shadow_profile_ticks();
+    const size_t eye = shadow_profile_eye_index();
+    g_engine_speedtree_shadow_views(speedtree, collector);
+    record_shadow_profile_stage(eye, ShadowStage::SpeedTreeViews, begin);
+}
+
+bool read_shadow_collector_active(const uint8_t* collector) {
+    __try {
+        return collector != nullptr &&
+            collector[kShadowCollectorActiveOffset] != 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+void __fastcall hook_engine_render_shadows(void* renderer, void* collector) {
+    const int64_t begin = shadow_profile_ticks();
+    const size_t eye = shadow_profile_eye_index();
+    if (read_shadow_collector_active(static_cast<const uint8_t*>(collector))) {
+        g_shadow_profile_eyes[eye].active.fetch_add(
+            1, std::memory_order_relaxed);
+    }
+    g_engine_render_shadows(renderer, collector);
+    record_shadow_profile_stage(eye, ShadowStage::RenderShadows, begin);
+}
+
+// [FEATURE:REMASTER-SHADOW-PAIR-REUSE 6/7] Called from the census under
+// g_vrs_census_busy: the reuse counters and, with [perf] shadow_profile, one
+// line per eye (ms per call of each stage, calls per Present, cascades,
+// parity, draws per depth-pass call, shadow map), one line for the set hash
+// between the eyes, and the frame's split inputs once.
+void log_shadow_census_locked(uint64_t window_presents, int64_t qpc_frequency) {
+    if (g_config.remaster_shadow_pair_reuse != 0) {
+        log_shadow_pair_counters(&log_vrs_line);
+    }
+    if (!g_config.perf_shadow_profile || qpc_frequency <= 0 ||
+        window_presents == 0) {
+        return;
+    }
+    struct EyeTotals {
+        std::array<uint64_t, kShadowStageCount> calls{};
+        std::array<uint64_t, kShadowStageCount> ticks{};
+        uint64_t skipped_fits{};
+        uint64_t skipped_renders{};
+        uint64_t hashed_fits{};
+        uint64_t cascades{};
+        uint64_t parity{};
+        uint64_t active{};
+        uint64_t cascade_draws{};
+    };
+    // Previous totals; the census is serialized, so plain statics suffice.
+    static std::array<EyeTotals, 3> previous{};
+    static uint64_t previous_pair_fits{};
+    static uint64_t previous_untouched{};
+    static uint64_t previous_same_fit{};
+    static uint64_t previous_smap_changes{};
+    static uint64_t previous_draws{};
+    static bool frame_logged{};
+    static constexpr const char* kEyeNames[] = {"left", "right", "untagged"};
+    const double presents = static_cast<double>(window_presents);
+    uint64_t cascade_draws_window{};
+    for (size_t eye = 0; eye < g_shadow_profile_eyes.size(); ++eye) {
+        const auto& stats = g_shadow_profile_eyes[eye];
+        EyeTotals now{};
+        for (size_t stage = 0; stage < kShadowStageCount; ++stage) {
+            now.calls[stage] =
+                stats.calls[stage].load(std::memory_order_relaxed);
+            now.ticks[stage] =
+                stats.ticks[stage].load(std::memory_order_relaxed);
+        }
+        now.skipped_fits = stats.skipped_fits.load(std::memory_order_relaxed);
+        now.skipped_renders =
+            stats.skipped_renders.load(std::memory_order_relaxed);
+        now.hashed_fits = stats.hashed_fits.load(std::memory_order_relaxed);
+        now.cascades = stats.cascades.load(std::memory_order_relaxed);
+        now.parity = stats.parity.load(std::memory_order_relaxed);
+        now.active = stats.active.load(std::memory_order_relaxed);
+        now.cascade_draws =
+            stats.cascade_draws.load(std::memory_order_relaxed);
+        auto& last = previous[eye];
+        std::array<uint64_t, kShadowStageCount> calls{};
+        std::array<double, kShadowStageCount> ms{};
+        uint64_t any_calls{};
+        for (size_t stage = 0; stage < kShadowStageCount; ++stage) {
+            calls[stage] = now.calls[stage] - last.calls[stage];
+            any_calls += calls[stage];
+            ms[stage] = calls[stage] != 0
+                ? 1000.0 * static_cast<double>(
+                      now.ticks[stage] - last.ticks[stage]) /
+                    static_cast<double>(qpc_frequency) /
+                    static_cast<double>(calls[stage])
+                : 0.0;
+        }
+        const uint64_t hashed_fits = now.hashed_fits - last.hashed_fits;
+        const uint64_t skipped_renders =
+            now.skipped_renders - last.skipped_renders;
+        const uint64_t cascade_calls =
+            calls[static_cast<size_t>(ShadowStage::Cascades)];
+        const uint64_t drawn_calls = cascade_calls - skipped_renders;
+        const uint64_t shadows_calls =
+            calls[static_cast<size_t>(ShadowStage::RenderShadows)];
+        const uint64_t eye_draws = now.cascade_draws - last.cascade_draws;
+        cascade_draws_window += eye_draws;
+        const auto average = [](uint64_t sum, uint64_t count) {
+            return count != 0
+                ? static_cast<double>(sum) / static_cast<double>(count) : 0.0;
+        };
+        if (any_calls != 0) {
+            log_vrs_line(
+                "PERF shadow eye=%s renders_per_present=%.2f fit_ms=%.3f "
+                "speedtree_ms=%.3f shadows_ms=%.3f cascades_ms=%.3f "
+                "fit_calls=%llu cascade_calls=%llu skipped_fits=%llu "
+                "skipped_renders=%llu cascades=%.2f parity=%.2f active=%.2f "
+                "draws_per_cascade_call=%.1f set_hash=%016llX smap=%ux%ux%u "
+                "smap_handle=%u",
+                kEyeNames[eye], static_cast<double>(shadows_calls) / presents,
+                ms[static_cast<size_t>(ShadowStage::Fit)],
+                ms[static_cast<size_t>(ShadowStage::SpeedTreeViews)],
+                ms[static_cast<size_t>(ShadowStage::RenderShadows)],
+                ms[static_cast<size_t>(ShadowStage::Cascades)],
+                static_cast<unsigned long long>(
+                    calls[static_cast<size_t>(ShadowStage::Fit)]),
+                static_cast<unsigned long long>(cascade_calls),
+                static_cast<unsigned long long>(
+                    now.skipped_fits - last.skipped_fits),
+                static_cast<unsigned long long>(skipped_renders),
+                average(now.cascades - last.cascades, hashed_fits),
+                average(now.parity - last.parity, hashed_fits),
+                average(now.active - last.active, shadows_calls),
+                average(eye_draws, drawn_calls),
+                static_cast<unsigned long long>(
+                    stats.set_hash.load(std::memory_order_relaxed)),
+                stats.smap_size.load(std::memory_order_relaxed),
+                stats.smap_size.load(std::memory_order_relaxed),
+                stats.smap_count.load(std::memory_order_relaxed),
+                stats.smap_handle.load(std::memory_order_relaxed));
+        }
+        last = now;
+    }
+    uint64_t draws{};
+    uint32_t draw_threads{};
+    for (const auto& slot : g_shadow_profile_draw_slots) {
+        if (slot.thread_id.load(std::memory_order_acquire) != 0) {
+            ++draw_threads;
+            draws += slot.draws.load(std::memory_order_relaxed);
+        }
+    }
+    const uint64_t pair_fits =
+        g_shadow_profile_pair_fits.load(std::memory_order_relaxed);
+    const uint64_t untouched =
+        g_shadow_profile_set_untouched.load(std::memory_order_relaxed);
+    const uint64_t same_fit =
+        g_shadow_profile_same_fit.load(std::memory_order_relaxed);
+    const uint64_t smap_changes =
+        g_shadow_profile_smap_changes.load(std::memory_order_relaxed);
+    const uint64_t draws_window = draws - previous_draws;
+    log_vrs_line(
+        "PERF shadow set pair_fits=%llu untouched=%llu same_fit=%llu "
+        "smap_handle_changes=%llu draws_per_present=%.1f "
+        "cascade_draw_share=%.3f draw_threads=%u draw_overflow=%llu",
+        static_cast<unsigned long long>(pair_fits - previous_pair_fits),
+        static_cast<unsigned long long>(untouched - previous_untouched),
+        static_cast<unsigned long long>(same_fit - previous_same_fit),
+        static_cast<unsigned long long>(smap_changes - previous_smap_changes),
+        static_cast<double>(draws_window) / presents,
+        draws_window != 0
+            ? static_cast<double>(cascade_draws_window) /
+                static_cast<double>(draws_window)
+            : 0.0,
+        draw_threads,
+        static_cast<unsigned long long>(
+            g_shadow_profile_draw_overflow.load(std::memory_order_relaxed)));
+    previous_pair_fits = pair_fits;
+    previous_untouched = untouched;
+    previous_same_fit = same_fit;
+    previous_smap_changes = smap_changes;
+    previous_draws = draws;
+    if (!frame_logged &&
+        g_shadow_profile_frame_ready.load(std::memory_order_acquire)) {
+        frame_logged = true;
+        const auto& f = g_shadow_profile_frame;
+        log_vrs_line(
+            "PERF shadow frame splits=%.0f split_far=%.2f,%.2f,%.2f,%.2f "
+            "cascade_params=%.4f,%.4f,%.4f,%.4f far=%.2f",
+            f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], f[8], f[9]);
+    }
+}
+
+bool engine_code_matches(
+    const uint8_t* module, const EngineCodeBytes* code, size_t count) {
+    for (size_t index = 0; index < count; ++index) {
+        if (std::memcmp(module + code[index].rva, code[index].bytes,
+                code[index].size) != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool create_shadow_pair_hook(uint8_t* module, uintptr_t rva, void* detour,
+    void** original, const char* name) {
+    auto* target = module + rva;
+    if (MH_CreateHook(target, detour, original) == MH_OK &&
+        MH_EnableHook(target) == MH_OK) {
+        log_shadow_pair_line("Shadow %s hook installed target=%p", name, target);
+        return true;
+    }
+    *original = nullptr;
+    log_shadow_pair_line("Shadow %s hook failed target=%p", name, target);
+    return false;
+}
+
+// [FEATURE:REMASTER-SHADOW-PAIR-REUSE 7/7] 5.01 only. Every hook checks its
+// own code bytes first and stays out on a mismatch; reuse needs all of its
+// hooks (mode 1: fit and depth passes, mode 9: depth passes) and the
+// end-of-render cleanup it relies on, or is off.
+void install_remaster_shadow_pair_hooks() {
+    const bool profile = g_config.perf_shadow_profile;
+    if ((g_config.remaster_shadow_pair_reuse == 0 && !profile) ||
+        g_engine_shadow_cascade_render != nullptr ||
+        g_engine_shadow_cascade_fit != nullptr) {
+        return;
+    }
+    auto* module = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
+    if (running_game_build() != w3vr::game_build::Build::Remaster501 ||
+        module == nullptr) {
+        g_config.remaster_shadow_pair_reuse = 0;
+        g_config.perf_shadow_profile = false;
+        log_shadow_pair_line("Shadow pair reuse and profile off: build mismatch");
+        return;
+    }
+    const bool fit_code = engine_code_matches(
+        module, kShadowFitCode, std::size(kShadowFitCode));
+    const bool render_code = engine_code_matches(
+        module, kShadowRenderCode, std::size(kShadowRenderCode));
+    const bool cleanup_code = engine_code_matches(
+        module, kShadowCleanupCode, std::size(kShadowCleanupCode));
+    const int requested = g_config.remaster_shadow_pair_reuse;
+    if (requested != 0 && (!render_code || !cleanup_code ||
+            (requested == 1 && !fit_code))) {
+        g_config.remaster_shadow_pair_reuse = 0;
+        log_shadow_pair_line(
+            "Shadow pair reuse off: code mismatch fit=%d render=%d cleanup=%d",
+            fit_code ? 1 : 0, render_code ? 1 : 0, cleanup_code ? 1 : 0);
+    }
+    const int mode = g_config.remaster_shadow_pair_reuse;
+    bool fit_hooked{};
+    bool render_hooked{};
+    if (fit_code && (mode == 1 || profile)) {
+        fit_hooked = create_shadow_pair_hook(module,
+            kRemaster501ShadowCascadeFitRva,
+            reinterpret_cast<void*>(&hook_engine_shadow_cascade_fit),
+            reinterpret_cast<void**>(&g_engine_shadow_cascade_fit),
+            "cascade fit");
+    }
+    if (render_code && (mode != 0 || profile)) {
+        render_hooked = create_shadow_pair_hook(module,
+            kRemaster501ShadowCascadeRenderRva,
+            reinterpret_cast<void*>(&hook_engine_shadow_cascade_render),
+            reinterpret_cast<void**>(&g_engine_shadow_cascade_render),
+            "cascade render");
+    }
+    bool speedtree_hooked{};
+    bool shadows_hooked{};
+    if (profile) {
+        if (engine_code_matches(module, kSpeedTreeShadowViewsCode,
+                std::size(kSpeedTreeShadowViewsCode))) {
+            speedtree_hooked = create_shadow_pair_hook(module,
+                kRemaster501SpeedTreeShadowViewsRva,
+                reinterpret_cast<void*>(&hook_engine_speedtree_shadow_views),
+                reinterpret_cast<void**>(&g_engine_speedtree_shadow_views),
+                "speedtree views timer");
+        }
+        if (engine_code_matches(module, kRenderShadowsCode,
+                std::size(kRenderShadowsCode))) {
+            shadows_hooked = create_shadow_pair_hook(module,
+                kRemaster501RenderShadowsRva,
+                reinterpret_cast<void*>(&hook_engine_render_shadows),
+                reinterpret_cast<void**>(&g_engine_render_shadows),
+                "render shadows timer");
+        }
+    }
+    const bool reuse_ready = mode != 0 && render_hooked &&
+        (mode == 9 || fit_hooked);
+    if (mode != 0 && !reuse_ready) {
+        g_config.remaster_shadow_pair_reuse = 0;
+    }
+    g_runtime_shadow_pair_reuse.store(reuse_ready, std::memory_order_release);
+    log_shadow_pair_line(
+        "Shadow pair reuse requested=%d mode=%d profile=%d code fit=%d "
+        "render=%d cleanup=%d hooks fit=%d render=%d speedtree_timer=%d "
+        "shadows_timer=%d",
+        requested, g_config.remaster_shadow_pair_reuse, profile ? 1 : 0,
+        fit_code ? 1 : 0, render_code ? 1 : 0, cleanup_code ? 1 : 0,
+        fit_hooked ? 1 : 0, render_hooked ? 1 : 0, speedtree_hooked ? 1 : 0,
+        shadows_hooked ? 1 : 0);
+}
+
+void install_remaster_engine_dlss_hooks() {
+    namespace addresses = w3vr::engine_addresses;
+    if (!remaster_engine_dlss_stereo_active() ||
+        running_game_build() != w3vr::game_build::Build::Remaster501 ||
+        g_engine_dlss_constants_builder != nullptr) {
+        return;
+    }
+    struct HookSpec {
+        addresses::Function function;
+        void* detour;
+        EngineDlssStateFunction* original;
+    };
+    const HookSpec specs[] = {
+        {addresses::Function::DlssConstantsBuilder,
+            reinterpret_cast<void*>(&hook_remaster_dlss_constants_builder),
+            &g_engine_dlss_constants_builder},
+        {addresses::Function::DlssInputPrepare,
+            reinterpret_cast<void*>(&hook_remaster_dlss_input_prepare),
+            &g_engine_dlss_input_prepare},
+        {addresses::Function::DlssSrApply,
+            reinterpret_cast<void*>(&hook_remaster_dlss_sr_apply),
+            &g_engine_dlss_sr_apply},
+    };
+    uint8_t* targets[3]{};
+    for (size_t i = 0; i < 3; ++i) {
+        targets[i] = engine_function_target(specs[i].function);
+        if (targets[i] == nullptr) {
+            log_line("V20001 remaster DLSS per-eye viewports disabled: %s unavailable",
+                addresses::entry(specs[i].function).name);
+            return;
+        }
+    }
+    for (size_t i = 0; i < 3; ++i) {
+        if (MH_CreateHook(targets[i], specs[i].detour,
+                reinterpret_cast<void**>(specs[i].original)) != MH_OK ||
+            MH_EnableHook(targets[i]) != MH_OK) {
+            log_line("V20001 remaster DLSS hook failed: %s",
+                addresses::entry(specs[i].function).name);
+            return;
+        }
+    }
+    log_line("V20001 remaster DLSS per-eye viewports hooked (right eye viewport +0x%X, "
+        "per-eye guards, per_eye_motion=%d)",
+        kRemasterDlssRightEyeViewportOffset,
+        g_config.remaster_dlss_per_eye_motion ? 1 : 0);
+}
+
+// [FIX:HUD-FADE-FILL 2/5] The 5.01 screen fade (FadeOut/FadeIn, blackscreens)
+// is a 2D colour quad that the GUI pass draws after the HUD movies, into the
+// same target: the UI texture t1. Mode 3 lifts t1 out of the eye images and
+// shows it as the shrunk HUD plane, so a full-screen fade became a black
+// HUD-sized rectangle with the centre-split square cut out of it. While that
+// plane owns t1 the fade fill is dropped; every HUD movie is drawn as before.
+// The engine reaches both fade sites only while the fade amount is above 0,
+// so normal play never takes this path, and other callers pass through.
+using EngineGuiFillRect = void(__fastcall*)(
+    void*, int32_t, int32_t, int32_t, int32_t, const uint8_t*);
+EngineGuiFillRect g_engine_gui_fill_rect{};
+uintptr_t g_gui_fade_fill_return{};
+uintptr_t g_fade_object_fill_return{};
+// Latest fade colour as 0xRRGGBBAA (A = amount * 255) and the Present of the
+// last fade fill and of the last suppressed one (UINT64_MAX = none yet). The
+// XR submit reads them without a lock; a one-Present lag is invisible.
+std::atomic<uint32_t> g_gui_fade_rgba{};
+std::atomic<uint64_t> g_gui_fade_present{UINT64_MAX};
+std::atomic<uint64_t> g_gui_fade_suppressed_present{UINT64_MAX};
+constexpr uint64_t kGuiFadeStalePresents = 3;
+// Per-fade counters for the bounded transition log.
+std::atomic<bool> g_gui_fade_active{};
+std::atomic<int> g_gui_fade_last_suppressed{-1};
+std::atomic<uint64_t> g_gui_fade_start_present{};
+std::atomic<uint64_t> g_gui_fade_calls{};
+std::atomic<uint64_t> g_gui_fade_suppressed_calls{};
+std::atomic<uint64_t> g_gui_fade_object_calls{};
+std::atomic<uint32_t> g_gui_fade_max_alpha{};
+std::atomic<uint32_t> g_gui_fade_log_count{};
+// Set once the uniform-mode XR pipeline exists; uniform keeps the native fade
+// until then (and for good if that pipeline cannot be created).
+std::atomic<bool> g_mode3_uniform_fade_ready{};
+
+const char* hud_fade_mode_name() {
+    switch (g_config.hud_fade_mode) {
+    case Config::HudFadeMode::Uniform:
+        return "uniform";
+    case Config::HudFadeMode::Native:
+        return "native";
+    case Config::HudFadeMode::Remove:
+        break;
+    }
+    return "remove";
+}
+
+// The VR HUD plane (or the baked eye composite that shrinks t1 the same way
+// during bootstrap) owns t1: Mode 3 gameplay and automatic Full VR cutscenes.
+// Menus, the loading video and the normal or manual (F10) Cinema panel show
+// t1 over the whole image, so they keep the native fade.
+bool mode3_fade_fill_suppressed() {
+    const bool cinema_panel =
+        g_force_mono_cinema.load(std::memory_order_relaxed) ||
+        (g_cinema_mode_active.load(std::memory_order_relaxed) &&
+            !g_config.cinema_full_vr);
+    return g_config.hud_fade_mode != Config::HudFadeMode::Native &&
+        (g_config.hud_fade_mode != Config::HudFadeMode::Uniform ||
+            g_mode3_uniform_fade_ready.load(std::memory_order_acquire)) &&
+        g_config.openxr_enabled &&
+        !g_config.disable_hud_composite_replacement &&
+        mode3_stereo_transport_active() &&
+        retained_hud_projection_route_configured() &&
+        g_engine_menu_state.load(std::memory_order_relaxed) == 0 &&
+        !g_engine_loading_screen_video_active.load(
+            std::memory_order_acquire) &&
+        !cinema_panel;
+}
+
+void log_gui_fade_fill(const char* event, const char* site, uint32_t rgba,
+    bool suppressed, uint64_t present) {
+    if (!g_config.runtime_diagnostics ||
+        !take_bounded_log_slot(g_gui_fade_log_count, 512)) {
+        return;
+    }
+    log_line("fade fill %s site=%s rgba=%08X suppressed=%d mode=%s present=%llu "
+        "menu=%d video=%d cinema=%d/%d",
+        event, site, rgba, suppressed ? 1 : 0, hud_fade_mode_name(),
+        static_cast<unsigned long long>(present),
+        g_engine_menu_state.load(std::memory_order_relaxed),
+        g_engine_loading_screen_video_active.load(
+            std::memory_order_relaxed) ? 1 : 0,
+        g_cinema_mode_active.load(std::memory_order_relaxed) ? 1 : 0,
+        g_force_mono_cinema.load(std::memory_order_relaxed) ? 1 : 0);
+    w3vr::minimal_xr_log::hud("FADE",
+        "present=%llu event=%s site=%s rgba=%08X suppressed=%d mode=%s",
+        static_cast<unsigned long long>(present), event, site, rgba,
+        suppressed ? 1 : 0, hud_fade_mode_name());
+}
+
+void __fastcall hook_engine_gui_fill_rect(void* context, int32_t x, int32_t y,
+    int32_t width, int32_t height, const uint8_t* rgba) {
+    const auto return_address =
+        reinterpret_cast<uintptr_t>(_ReturnAddress());
+    const bool gui_site = return_address == g_gui_fade_fill_return;
+    if (rgba == nullptr ||
+        (!gui_site && return_address != g_fade_object_fill_return)) {
+        g_engine_gui_fill_rect(context, x, y, width, height, rgba);
+        return;
+    }
+    const uint32_t packed = (uint32_t{rgba[0]} << 24) |
+        (uint32_t{rgba[1]} << 16) | (uint32_t{rgba[2]} << 8) | rgba[3];
+    const uint32_t alpha = packed & 0xFFu;
+    const uint64_t present = g_present_count.load(std::memory_order_relaxed);
+    const bool suppressed = mode3_fade_fill_suppressed();
+    const uint32_t previous =
+        g_gui_fade_rgba.exchange(packed, std::memory_order_acq_rel);
+    g_gui_fade_present.store(present, std::memory_order_release);
+    if (suppressed) {
+        g_gui_fade_suppressed_present.store(
+            present, std::memory_order_release);
+    }
+    const char* const site = gui_site ? "gui" : "object";
+    if (!g_gui_fade_active.exchange(true, std::memory_order_acq_rel)) {
+        g_gui_fade_start_present.store(present, std::memory_order_relaxed);
+        g_gui_fade_calls.store(0, std::memory_order_relaxed);
+        g_gui_fade_suppressed_calls.store(0, std::memory_order_relaxed);
+        g_gui_fade_object_calls.store(0, std::memory_order_relaxed);
+        g_gui_fade_max_alpha.store(0, std::memory_order_relaxed);
+        g_gui_fade_last_suppressed.store(
+            suppressed ? 1 : 0, std::memory_order_relaxed);
+        log_gui_fade_fill("start", site, packed, suppressed, present);
+    } else {
+        // Blackscreen reached (A 255) or left (fade-in begins), and gate
+        // changes inside one fade (menu, Cinema panel).
+        if (alpha == 0xFFu && (previous & 0xFFu) != 0xFFu) {
+            log_gui_fade_fill("full", site, packed, suppressed, present);
+        } else if (alpha != 0xFFu && (previous & 0xFFu) == 0xFFu) {
+            log_gui_fade_fill("partial", site, packed, suppressed, present);
+        }
+        if (g_gui_fade_last_suppressed.exchange(
+                suppressed ? 1 : 0, std::memory_order_relaxed) !=
+            (suppressed ? 1 : 0)) {
+            log_gui_fade_fill("gate", site, packed, suppressed, present);
+        }
+    }
+    g_gui_fade_calls.fetch_add(1, std::memory_order_relaxed);
+    if (!gui_site) {
+        g_gui_fade_object_calls.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (alpha > g_gui_fade_max_alpha.load(std::memory_order_relaxed)) {
+        g_gui_fade_max_alpha.store(alpha, std::memory_order_relaxed);
+    }
+    if (suppressed) {
+        g_gui_fade_suppressed_calls.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    g_engine_gui_fill_rect(context, x, y, width, height, rgba);
+}
+
+// Called once per XR frame. Closes the per-fade log once no fade fill came
+// for kGuiFadeStalePresents Presents (the engine stops at amount 0), and
+// returns the colour of a fill suppressed within that window.
+bool latched_gui_fade_colour(uint64_t present, uint32_t& rgba) {
+    if (g_engine_gui_fill_rect == nullptr) {
+        return false;
+    }
+    const uint64_t last = g_gui_fade_present.load(std::memory_order_acquire);
+    if (last != UINT64_MAX && present > last &&
+        present - last > kGuiFadeStalePresents &&
+        g_gui_fade_active.load(std::memory_order_relaxed) &&
+        g_gui_fade_active.exchange(false, std::memory_order_acq_rel)) {
+        const uint64_t start =
+            g_gui_fade_start_present.load(std::memory_order_relaxed);
+        if (g_config.runtime_diagnostics &&
+            take_bounded_log_slot(g_gui_fade_log_count, 512)) {
+            log_line("fade fill end present=%llu start=%llu presents=%llu "
+                "calls=%llu suppressed=%llu object=%llu max_a=%u last_rgba=%08X mode=%s "
+                "menu=%d video=%d",
+                static_cast<unsigned long long>(present),
+                static_cast<unsigned long long>(start),
+                static_cast<unsigned long long>(last >= start ? last - start + 1 : 0),
+                static_cast<unsigned long long>(g_gui_fade_calls.load()),
+                static_cast<unsigned long long>(g_gui_fade_suppressed_calls.load()),
+                static_cast<unsigned long long>(g_gui_fade_object_calls.load()),
+                g_gui_fade_max_alpha.load(), g_gui_fade_rgba.load(),
+                hud_fade_mode_name(),
+                g_engine_menu_state.load(std::memory_order_relaxed),
+                g_engine_loading_screen_video_active.load(
+                    std::memory_order_relaxed) ? 1 : 0);
+            w3vr::minimal_xr_log::hud("FADE",
+                "present=%llu event=end calls=%llu suppressed=%llu",
+                static_cast<unsigned long long>(present),
+                static_cast<unsigned long long>(g_gui_fade_calls.load()),
+                static_cast<unsigned long long>(g_gui_fade_suppressed_calls.load()));
+        }
+    }
+    const uint64_t suppressed =
+        g_gui_fade_suppressed_present.load(std::memory_order_acquire);
+    if (suppressed == UINT64_MAX ||
+        (present > suppressed &&
+            present - suppressed > kGuiFadeStalePresents)) {
+        return false;
+    }
+    rgba = g_gui_fade_rgba.load(std::memory_order_acquire);
+    return true;
+}
+
+void install_remaster_gui_fade_fill_hook() {
+    namespace addresses = w3vr::engine_addresses;
+    // native installs nothing, except to log the fades of a diagnostic
+    // baseline run (the detour then never suppresses).
+    if ((g_config.hud_fade_mode == Config::HudFadeMode::Native &&
+            !g_config.runtime_diagnostics) ||
+        !g_config.openxr_enabled ||
+        !mode3_stereo_transport_active() ||
+        !retained_hud_projection_route_configured() ||
+        running_game_build() != w3vr::game_build::Build::Remaster501 ||
+        g_engine_gui_fill_rect != nullptr) {
+        return;
+    }
+    const auto build = running_game_build();
+    auto* module = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
+    auto code_matches = [module](uintptr_t rva, const uint8_t* bytes,
+                                 size_t size) {
+        return module != nullptr && rva != 0 &&
+            addresses::signature_matches(
+                module + rva, addresses::Signature{bytes, size});
+    };
+    const uintptr_t amount_test =
+        addresses::value(build, addresses::Value::GuiFadeAmountTest);
+    const uintptr_t gui_return =
+        addresses::value(build, addresses::Value::GuiFadeFillReturn);
+    const uintptr_t object_return =
+        addresses::value(build, addresses::Value::FadeObjectFillReturn);
+    // The call bytes encode the call target, so they also prove that each
+    // return address belongs to a call of GuiFillRect.
+    if (!code_matches(amount_test, addresses::kGuiFadeAmountTest501Bytes,
+            sizeof(addresses::kGuiFadeAmountTest501Bytes)) ||
+        !code_matches(gui_return != 0
+                ? gui_return - sizeof(addresses::kGuiFadeFillCall501Bytes) : 0,
+            addresses::kGuiFadeFillCall501Bytes,
+            sizeof(addresses::kGuiFadeFillCall501Bytes))) {
+        log_line("HUD fade fill hook disabled: GUI-pass fade site mismatch "
+            "amount_test=0x%llX return=0x%llX",
+            static_cast<unsigned long long>(amount_test),
+            static_cast<unsigned long long>(gui_return));
+        return;
+    }
+    const bool object_site = code_matches(object_return != 0
+            ? object_return - sizeof(addresses::kFadeObjectFillCall501Bytes) : 0,
+        addresses::kFadeObjectFillCall501Bytes,
+        sizeof(addresses::kFadeObjectFillCall501Bytes));
+    auto* target = engine_function_target(addresses::Function::GuiFillRect);
+    if (target == nullptr) {
+        log_line("HUD fade fill hook disabled: GuiFillRect unavailable");
+        return;
+    }
+    g_gui_fade_fill_return = reinterpret_cast<uintptr_t>(module + gui_return);
+    g_fade_object_fill_return = object_site
+        ? reinterpret_cast<uintptr_t>(module + object_return) : 0;
+    if (MH_CreateHook(target, reinterpret_cast<void*>(&hook_engine_gui_fill_rect),
+            reinterpret_cast<void**>(&g_engine_gui_fill_rect)) != MH_OK ||
+        MH_EnableHook(target) != MH_OK) {
+        g_engine_gui_fill_rect = nullptr;
+        log_line("HUD fade fill hook failed target=%p", target);
+        return;
+    }
+    log_line("HUD fade fill hooked target=%p mode=%s gui_return=0x%llX "
+        "object_return=0x%llX%s",
+        target, hud_fade_mode_name(),
+        static_cast<unsigned long long>(gui_return),
+        static_cast<unsigned long long>(object_site ? object_return : 0),
+        object_site ? "" : " (object site mismatch, not handled)");
 }
 
 // Per-build address table. The hook adjusts the view inputs (indices
@@ -41373,6 +48301,1052 @@ void install_engine_render_proxy_distance_scale_hook() {
             "RVA=0x%llX target=%p",
             static_cast<unsigned long long>(kEngineViewCopyRebuildRva), target);
     }
+}
+
+// [FEATURE:REMASTER-LOCAL-LIGHTS 2/2] Local lights and local shadows per eye
+// on 5.01. Each engine render ("collection", one per eye in strict Stereo)
+// decides on its own, from its own camera, which shadowed local lights get
+// tiles in the dynamic shadow atlas and at what size (one 2048^2 slice by
+// default; when the packing fails every light is halved and packed once more,
+// and faces that still get no tile cast no shadow), and it advances each
+// visible flickering light by the tick's dt, i.e. twice per stereo pair. The
+// eyes can therefore disagree: a light shadowed in one eye leaks through a
+// wall in the other. Hooks (5.01 prologues verified, fail closed):
+// - collector init 0x01BF84D0 assigns the render's frame index (+0xB0); the
+//   detour publishes {frame index, pair, eye} from the frame builder's render
+//   tag. The first-visit guard stamps every visited light with that frame
+//   index (light+0xEC) right before its flicker update, so the job threads
+//   find their render without a lock.
+// - flicker update 0x01CEE1F0 (light): skipped for a light already advanced
+//   in this pair (_flicker_per_pair).
+// - local shadow prepare 0x01BF3170 (collector; collection step 5):
+//   diagnostics after the original; _pair_lock hands the selection below the
+//   pair position for the duration of the call.
+// - shadow selection 0x01CEFDD0 (light, collector): distance-based size, fade
+//   and strength. It reads nothing of the collector but the view position
+//   pointer at +0x20, so a 0x28-byte shim carries the pair position.
+// - shadow manager init 0x01C4B5C0 reads the LocalShadows atlas cvars; the
+//   detour writes the configured values first.
+// - diagnostics only: dynamic atlas reset 0x01C4B4D0 (packing attempts, by
+//   return address), tile allocator 0x01C49EC0, static cube LRU 0x01D34670.
+constexpr uint8_t kRemaster501CollectorInitBytes[] = {
+    0x48, 0x8B, 0xC4, 0x4C, 0x89, 0x48, 0x20, 0x55, 0x48, 0x81, 0xEC, 0x90,
+    0x00, 0x00, 0x00, 0x48, 0x89, 0x70, 0x10, 0x49, 0x8B, 0xE8, 0x48, 0x89};
+// Through the light-list count test: covers the shadow manager at render
+// global +0x448, collector +0x4DC0 (local shadows on), +0xB8 (per-type light
+// lists), list +0x23F8 (shadowed count) and +0x1174 (light count).
+constexpr uint8_t kRemaster501LocalShadowPrepareBytes[] = {
+    0x40, 0x56, 0x57, 0x48, 0x83, 0xEC, 0x48, 0x48, 0x8B, 0xF9, 0x33, 0xF6,
+    0x48, 0x8B, 0x0D, 0xC5, 0x87, 0xE6, 0x03, 0x48, 0x8B, 0x81, 0x48, 0x04,
+    0x00, 0x00, 0x89, 0x70, 0x3C, 0x89, 0x70, 0x24, 0x48, 0x8B, 0x89, 0x48,
+    0x04, 0x00, 0x00, 0xE8, 0x34, 0x83, 0x05, 0x00, 0x40, 0x38, 0xB7, 0xC0,
+    0x4D, 0x00, 0x00, 0x0F, 0x84, 0xEB, 0x04, 0x00, 0x00, 0x48, 0x8B, 0x87,
+    0xB8, 0x00, 0x00, 0x00, 0x48, 0x89, 0x5C, 0x24, 0x68, 0x48, 0x89, 0x6C,
+    0x24, 0x70, 0x8B, 0xEE, 0x4C, 0x89, 0x64, 0x24, 0x78, 0x89, 0xB0, 0xF8,
+    0x23, 0x00, 0x00, 0x48, 0x8B, 0x87, 0xB8, 0x00, 0x00, 0x00, 0x4C, 0x89,
+    0x6C, 0x24, 0x40, 0x4C, 0x89, 0x74, 0x24, 0x38, 0x4C, 0x89, 0x7C, 0x24,
+    0x30, 0x39, 0xB0, 0x74, 0x11, 0x00, 0x00};
+// Through mov rax,[collector+0x20] and the light type test (+0x10 == 3).
+constexpr uint8_t kRemaster501LightShadowSelectBytes[] = {
+    0x48, 0x83, 0xEC, 0x28, 0x0F, 0xB6, 0x81, 0xBC, 0x01, 0x00, 0x00, 0x44,
+    0x0F, 0xB6, 0xC0, 0x41, 0xD0, 0xE8, 0x44, 0x0A, 0xC0, 0xC5, 0xF8, 0x29,
+    0x74, 0x24, 0x10, 0xC5, 0xF8, 0x29, 0x3C, 0x24, 0x41, 0xF6, 0xC0, 0x01,
+    0x0F, 0x84, 0x10, 0x01, 0x00, 0x00, 0x48, 0x8B, 0x42, 0x20, 0x83, 0x79,
+    0x10, 0x03};
+constexpr uint8_t kRemaster501LightFlickerUpdateBytes[] = {
+    0x48, 0x89, 0x5C, 0x24, 0x08, 0x57, 0x48, 0x83, 0xEC, 0x70, 0x48, 0x8B,
+    0x05, 0x27, 0xD7, 0xD6, 0x03, 0x48, 0x8B, 0xF9, 0xC5, 0xF8, 0x29, 0x7C};
+// Through the four LocalShadows cvar loads (NumDynamicSlices, NumStaticCubes,
+// DynamicShadowmapResolution, StaticShadowmapResolution).
+constexpr uint8_t kRemaster501ShadowManagerInitBytes[] = {
+    0x40, 0x55, 0x53, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41,
+    0x57, 0x48, 0x8D, 0x6C, 0x24, 0xC8, 0x48, 0x81, 0xEC, 0x38, 0x01, 0x00,
+    0x00, 0x33, 0xFF, 0x48, 0x8B, 0xF1, 0x48, 0x89, 0x79, 0x10, 0xBA, 0x10,
+    0x00, 0x00, 0x00, 0x89, 0x79, 0x18, 0x48, 0x89, 0x79, 0x1C, 0x89, 0x79,
+    0x24, 0x48, 0x89, 0x79, 0x28, 0x89, 0x79, 0x30, 0x48, 0x89, 0x79, 0x34,
+    0x89, 0x79, 0x3C, 0x48, 0x89, 0x79, 0x40, 0x48, 0x89, 0x79, 0x48, 0x48,
+    0x8D, 0x4C, 0x24, 0x30, 0x44, 0x8B, 0x25, 0xDD, 0xD2, 0x41, 0x02, 0x44,
+    0x8B, 0x2D, 0x46, 0xD3, 0x41, 0x02, 0x8B, 0x1D, 0x08, 0xD3, 0x41, 0x02,
+    0x44, 0x8B, 0x3D, 0x71, 0xD3, 0x41, 0x02};
+constexpr uint8_t kRemaster501DynamicAtlasResetBytes[] = {
+    0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x6C, 0x24, 0x10, 0x48, 0x89,
+    0x74, 0x24, 0x18, 0x57, 0x41, 0x56, 0x41, 0x57, 0x48, 0x83, 0xEC, 0x20,
+    0x48, 0x8B, 0x31, 0x45, 0x33, 0xFF, 0x4C, 0x8B, 0xF1, 0x41, 0x8B, 0xDF,
+    0x44, 0x39, 0x7E, 0x0C};
+constexpr uint8_t kRemaster501DynamicTileAllocBytes[] = {
+    0x48, 0x89, 0x5C, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18, 0x48, 0x89,
+    0x7C, 0x24, 0x20, 0x41, 0x54, 0x41, 0x56, 0x41, 0x57, 0x48, 0x83, 0xEC,
+    0x30, 0x48, 0x8B, 0x39, 0x45, 0x33, 0xE4, 0x44, 0x0F, 0xB7, 0xFA, 0x41,
+    0x8B, 0xDC, 0x44, 0x39};
+constexpr uint8_t kRemaster501StaticCubeAllocBytes[] = {
+    0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x6C, 0x24, 0x10, 0x48, 0x89,
+    0x74, 0x24, 0x18, 0x57, 0x41, 0x56, 0x41, 0x57, 0x48, 0x83, 0xEC, 0x30,
+    0x8B, 0x41, 0x10, 0x4D, 0x8B, 0xF0, 0x44, 0x8B, 0xFA, 0x48, 0x8B, 0xF1,
+    0x85, 0xC0, 0x0F, 0x84};
+
+struct RemasterLocalLightHook {
+    const char* name;
+    uintptr_t rva;
+    const uint8_t* signature;
+    size_t signature_size;
+};
+constexpr RemasterLocalLightHook kRemasterCollectorInitHook{"CollectorInit",
+    0x01BF84D0, kRemaster501CollectorInitBytes, sizeof(kRemaster501CollectorInitBytes)};
+constexpr RemasterLocalLightHook kRemasterLocalShadowPrepareHook{"LocalShadowPrepare",
+    0x01BF3170, kRemaster501LocalShadowPrepareBytes,
+    sizeof(kRemaster501LocalShadowPrepareBytes)};
+constexpr RemasterLocalLightHook kRemasterLightShadowSelectHook{"LightShadowSelect",
+    0x01CEFDD0, kRemaster501LightShadowSelectBytes,
+    sizeof(kRemaster501LightShadowSelectBytes)};
+constexpr RemasterLocalLightHook kRemasterLightFlickerUpdateHook{"LightFlickerUpdate",
+    0x01CEE1F0, kRemaster501LightFlickerUpdateBytes,
+    sizeof(kRemaster501LightFlickerUpdateBytes)};
+constexpr RemasterLocalLightHook kRemasterShadowManagerInitHook{"ShadowManagerInit",
+    0x01C4B5C0, kRemaster501ShadowManagerInitBytes,
+    sizeof(kRemaster501ShadowManagerInitBytes)};
+constexpr RemasterLocalLightHook kRemasterDynamicAtlasResetHook{"DynamicAtlasReset",
+    0x01C4B4D0, kRemaster501DynamicAtlasResetBytes,
+    sizeof(kRemaster501DynamicAtlasResetBytes)};
+constexpr RemasterLocalLightHook kRemasterDynamicTileAllocHook{"DynamicTileAlloc",
+    0x01C49EC0, kRemaster501DynamicTileAllocBytes,
+    sizeof(kRemaster501DynamicTileAllocBytes)};
+constexpr RemasterLocalLightHook kRemasterStaticCubeAllocHook{"StaticCubeAlloc",
+    0x01D34670, kRemaster501StaticCubeAllocBytes,
+    sizeof(kRemaster501StaticCubeAllocBytes)};
+
+// Code elsewhere that fixes the layout the detours read.
+struct RemasterLocalLightProbe {
+    const char* what;
+    uintptr_t rva;
+    uint8_t size;
+    uint8_t bytes[16];
+    bool diagnostics_only;
+};
+constexpr RemasterLocalLightProbe kRemaster501LocalLightProbes[] = {
+    // Collector init: mov eax,[scene+0x1B8]; mov [collector+0xB0],eax.
+    {"frame index", 0x01BF85B6, 13, {0x8B, 0x85, 0xB8, 0x01, 0x00, 0x00, 0x41,
+        0x89, 0x86, 0xB0, 0x00, 0x00, 0x00}, false},
+    // First-visit guard: xchg [light+0xEC], collector frame index.
+    {"light stamp", 0x01D4663E, 14, {0x8B, 0x92, 0xB0, 0x00, 0x00, 0x00, 0x8B,
+        0xC2, 0x87, 0x81, 0xEC, 0x00, 0x00, 0x00}, false},
+    // Packing loop: the atlas reset that starts each attempt (returns to +5).
+    {"attempt reset", 0x01BF357E, 5, {0xE8, 0x4D, 0x7F, 0x05, 0x00}, true},
+    {"light list", 0x01BF31F0, 7, {0x48, 0x8B, 0x80, 0x6C, 0x11, 0x00, 0x00}, true},
+    {"shadow list", 0x01BF3241, 13, {0x48, 0x8B, 0x90, 0xF0, 0x23, 0x00, 0x00,
+        0x8B, 0x80, 0xF8, 0x23, 0x00, 0x00}, true},
+    // Halving: tile size at light+0x1C8.
+    {"shadow size", 0x01BF35EF, 11, {0x49, 0x8B, 0x49, 0x10, 0x0F, 0xB7, 0x81,
+        0xC8, 0x01, 0x00, 0x00}, true},
+    // Dynamic allocation: six face tiles from light+0x1F8, static cube +0x228.
+    {"face tiles", 0x01D49385, 7, {0x48, 0x8D, 0x99, 0xF8, 0x01, 0x00, 0x00}, true},
+    {"static cube", 0x01D49440, 7, {0x4C, 0x39, 0xAF, 0x28, 0x02, 0x00, 0x00}, true},
+};
+constexpr uintptr_t kRemaster501LocalShadowAttemptReturnRva = 0x01BF3583;
+constexpr uintptr_t kRemaster501NumDynamicSlicesRva = 0x040688F0;
+constexpr uintptr_t kRemaster501UseCorrectedLightSortRva = 0x040668D0;
+// Render global; its +0x448 is the shadow manager (null until created).
+constexpr uintptr_t kRemaster501RenderGlobalRva = 0x05A5B948;
+
+using EngineCollectorInitFn = void(__fastcall*)(void*, void*, void*, void*, uintptr_t);
+using EngineLocalShadowPrepareFn = void(__fastcall*)(void*);
+using EngineLightShadowSelectFn = uint8_t(__fastcall*)(void*, void*);
+using EngineLightFlickerUpdateFn = void(__fastcall*)(void*);
+using EngineShadowManagerInitFn = void*(__fastcall*)(void*);
+using EngineDynamicAtlasResetFn = void(__fastcall*)(void*);
+using EngineDynamicTileAllocFn = void*(__fastcall*)(void*, uintptr_t);
+using EngineStaticCubeAllocFn = void*(__fastcall*)(void*, uintptr_t, void*);
+EngineCollectorInitFn g_engine_collector_init{};
+EngineLocalShadowPrepareFn g_engine_local_shadow_prepare{};
+EngineLightShadowSelectFn g_engine_light_shadow_select{};
+EngineLightFlickerUpdateFn g_engine_light_flicker_update{};
+EngineShadowManagerInitFn g_engine_shadow_manager_init{};
+EngineDynamicAtlasResetFn g_engine_dynamic_atlas_reset{};
+EngineDynamicTileAllocFn g_engine_dynamic_tile_alloc{};
+EngineStaticCubeAllocFn g_engine_static_cube_alloc{};
+
+// Set once at install, before the hooks are enabled.
+bool g_local_light_diag_active{};
+bool g_light_flicker_per_pair_active{};
+bool g_local_light_pair_lock_active{};
+uintptr_t g_local_shadow_attempt_return{};
+uint8_t* g_local_shadow_slices_cvar{};
+uint8_t* g_local_shadow_sort_cvar{};
+
+// Renders published by the collector init, by frame index. key: frame index
+// (bits 0-31), pair id low 16 bits (32-47), eye (48), second render of its
+// pair (49), tagged (50), published (51).
+struct RemasterLocalLightCollectionSlot {
+    std::atomic<uint64_t> key{};
+    std::atomic<uint64_t> pair_id{};
+    // Diagnostics: flicker counters when the render started.
+    std::atomic<uint64_t> flicker_calls{};
+    std::atomic<uint64_t> flicker_repeats{};
+};
+constexpr uint64_t kLocalLightCollectionTagged = uint64_t{1} << 50;
+constexpr uint64_t kLocalLightCollectionPublished = uint64_t{1} << 51;
+std::array<RemasterLocalLightCollectionSlot, 16> g_local_light_collections{};
+std::atomic<uint64_t> g_local_light_last_pair{};
+
+struct RemasterLocalLightCollection {
+    uint64_t pair_id{};
+    uint16_t pair_low{};
+    int eye{-1};
+    bool second{};
+    bool tagged{};
+    uint64_t flicker_calls{};
+    uint64_t flicker_repeats{};
+};
+
+// light pointer << 16 | low 16 bits of the pair it was last advanced in.
+constexpr size_t kLightFlickerPairSlots = 2048;
+std::array<std::atomic<uint64_t>, kLightFlickerPairSlots> g_light_flicker_pairs{};
+
+std::atomic<uint64_t> g_local_light_tag_tls{};
+std::atomic<uint64_t> g_local_light_tag_map{};
+std::atomic<uint64_t> g_local_light_tag_miss{};
+std::atomic<uint64_t> g_light_flicker_calls{};
+std::atomic<uint64_t> g_light_flicker_repeats{};
+std::atomic<uint64_t> g_light_flicker_skipped{};
+std::atomic<uint64_t> g_light_flicker_untagged{};
+std::atomic<uint64_t> g_light_flicker_table_full{};
+std::atomic<uint64_t> g_local_light_pair_seeds{};
+std::atomic<uint64_t> g_local_light_pair_reuses{};
+
+// First eye's view position (collector+0x20 target) for the current pair.
+std::atomic<uint64_t> g_local_light_pair_slot{};
+std::array<std::atomic<float>, 3> g_local_light_pair_slot_position{};
+
+struct LocalShadowPrepareStats {
+    uint32_t attempts{};
+    uint32_t tile_requests{};
+    uint32_t tile_failures[2]{};  // first packing, halved retry
+    uint32_t cube_requests{};
+    uint32_t cube_failures{};
+};
+// Only on the thread running a local shadow prepare, during the original.
+thread_local LocalShadowPrepareStats* g_local_shadow_prepare_stats{};
+thread_local const float* g_local_light_pair_position{};
+
+// Local-light lines: in the census log during a measurement run (diagnostics
+// off), otherwise through log_line; never twice.
+void log_local_light_line(const char* fmt, ...) {
+    va_list args{};
+    va_start(args, fmt);
+    if (g_config.vrs_log_file) {
+        append_log_file_line_v(fmt, args);
+    } else if (g_config.logging_enabled) {
+        write_log_line_v(fmt, args);
+    }
+    va_end(args);
+}
+
+bool find_local_light_collection(
+    uint32_t frame_index, RemasterLocalLightCollection& out) {
+    auto& slot = g_local_light_collections[frame_index %
+        g_local_light_collections.size()];
+    const uint64_t key = slot.key.load(std::memory_order_acquire);
+    if ((key & kLocalLightCollectionPublished) == 0 ||
+        static_cast<uint32_t>(key) != frame_index) {
+        return false;
+    }
+    out.pair_id = slot.pair_id.load(std::memory_order_relaxed);
+    out.pair_low = static_cast<uint16_t>(key >> 32);
+    out.eye = static_cast<int>((key >> 48) & 1);
+    out.second = ((key >> 49) & 1) != 0;
+    out.tagged = (key & kLocalLightCollectionTagged) != 0;
+    out.flicker_calls = slot.flicker_calls.load(std::memory_order_relaxed);
+    out.flicker_repeats = slot.flicker_repeats.load(std::memory_order_relaxed);
+    return true;
+}
+
+void __fastcall hook_remaster_collector_init(
+    void* collector, void* frame, void* scene, void* fourth, uintptr_t fifth) {
+    g_engine_collector_init(collector, frame, scene, fourth, fifth);
+    // Without a scene the frame index is a constant (100): not a world render.
+    if (collector == nullptr || scene == nullptr) {
+        return;
+    }
+    uint32_t frame_index{};
+    memcpy(&frame_index, static_cast<uint8_t*>(collector) + 0xB0,
+        sizeof(frame_index));
+    // The frame builder (the only caller) carries the eye tag on this thread.
+    int eye = g_engine_render_eye;
+    uint64_t pair_id = g_engine_render_pair_id;
+    bool tagged = (eye == 0 || eye == 1) && pair_id != 0 && pair_id != UINT64_MAX;
+    if (tagged) {
+        g_local_light_tag_tls.fetch_add(1, std::memory_order_relaxed);
+    } else if (frame != nullptr &&
+        g_engine_dual_render_active.load(std::memory_order_acquire)) {
+        std::scoped_lock lock{g_engine_dual_frame_mutex};
+        const auto found = g_engine_dual_frame_eyes.find(frame);
+        if (found != g_engine_dual_frame_eyes.end() && found->second.eye <= 1 &&
+            found->second.pair_id != 0 && found->second.pair_id != UINT64_MAX) {
+            eye = static_cast<int>(found->second.eye);
+            pair_id = found->second.pair_id;
+            tagged = true;
+            g_local_light_tag_map.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    bool second = false;
+    if (tagged) {
+        second = g_local_light_last_pair.exchange(
+            pair_id, std::memory_order_relaxed) == pair_id;
+    } else {
+        g_local_light_tag_miss.fetch_add(1, std::memory_order_relaxed);
+    }
+    auto& slot = g_local_light_collections[frame_index %
+        g_local_light_collections.size()];
+    slot.pair_id.store(tagged ? pair_id : 0, std::memory_order_relaxed);
+    slot.flicker_calls.store(
+        g_light_flicker_calls.load(std::memory_order_relaxed),
+        std::memory_order_relaxed);
+    slot.flicker_repeats.store(
+        g_light_flicker_repeats.load(std::memory_order_relaxed),
+        std::memory_order_relaxed);
+    const uint64_t key = uint64_t{frame_index} |
+        (tagged ? (uint64_t{static_cast<uint16_t>(pair_id)} << 32) |
+            (uint64_t(eye & 1) << 48) | (uint64_t{second ? 1u : 0u} << 49) |
+            kLocalLightCollectionTagged : 0) |
+        kLocalLightCollectionPublished;
+    slot.key.store(key, std::memory_order_release);
+}
+
+// True when |light| was already advanced in the pair |pair_low|; otherwise
+// records it. Lock-free: renders of a pair are sequential, and a light is
+// visited once per render (first-visit guard), so slots rarely contend.
+bool light_flicker_advanced_in_pair(const void* light, uint16_t pair_low) {
+    const auto id = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(light));
+    if ((id >> 48) != 0) {
+        return false;
+    }
+    const uint64_t mine = (id << 16) | pair_low;
+    constexpr size_t kMask = kLightFlickerPairSlots - 1;
+    const size_t start =
+        static_cast<size_t>(((id >> 4) * 0x9E3779B97F4A7C15ull) >> 53) & kMask;
+    for (size_t probe = 0; probe < 8; ++probe) {
+        auto& slot = g_light_flicker_pairs[(start + probe) & kMask];
+        uint64_t seen = slot.load(std::memory_order_acquire);
+        if ((seen >> 16) != id) {
+            continue;
+        }
+        if (static_cast<uint16_t>(seen) == pair_low) {
+            return true;
+        }
+        if (slot.compare_exchange_strong(seen, mine, std::memory_order_acq_rel)) {
+            return false;
+        }
+        return seen == mine;
+    }
+    // Not present: take an empty slot or one not used in this pair.
+    for (size_t probe = 0; probe < 8; ++probe) {
+        auto& slot = g_light_flicker_pairs[(start + probe) & kMask];
+        uint64_t seen = slot.load(std::memory_order_acquire);
+        if ((seen == 0 || static_cast<uint16_t>(seen) != pair_low) &&
+            slot.compare_exchange_strong(seen, mine, std::memory_order_acq_rel)) {
+            return false;
+        }
+    }
+    g_light_flicker_table_full.fetch_add(1, std::memory_order_relaxed);
+    return false;
+}
+
+void __fastcall hook_remaster_light_flicker_update(void* light) {
+    if (light != nullptr) {
+        uint32_t frame_index{};
+        memcpy(&frame_index, static_cast<uint8_t*>(light) + 0xEC,
+            sizeof(frame_index));
+        RemasterLocalLightCollection collection{};
+        const bool diag = g_local_light_diag_active;
+        if (diag) {
+            g_light_flicker_calls.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (find_local_light_collection(frame_index, collection) &&
+            collection.tagged) {
+            if (light_flicker_advanced_in_pair(light, collection.pair_low)) {
+                if (diag) {
+                    g_light_flicker_repeats.fetch_add(1, std::memory_order_relaxed);
+                }
+                if (g_light_flicker_per_pair_active) {
+                    // Brightness and position offset stay where the first
+                    // render of the pair left them.
+                    if (diag) {
+                        g_light_flicker_skipped.fetch_add(1, std::memory_order_relaxed);
+                    }
+                    return;
+                }
+            }
+        } else if (diag) {
+            g_light_flicker_untagged.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    g_engine_light_flicker_update(light);
+}
+
+// 0x01BF35EA, the halving loop's call of the selection, keeps r9 and r10 live
+// across the call (the engine was built knowing the callee leaves them
+// alone), so the C++ detour is entered through a stub that saves and restores
+// rcx, rdx and r8-r11 around it. The stub has unwind data, so stack walks
+// through it stay intact.
+void* build_volatile_preserving_stub(void* detour) {
+    constexpr uint8_t kCode[] = {
+        0x51, 0x52, 0x41, 0x50, 0x41, 0x51, 0x41, 0x52, 0x41, 0x53,  // push rcx..r11
+        0x48, 0x83, 0xEC, 0x28,                // sub rsp,0x28 (aligned, home space)
+        0xFF, 0x15, 0x14, 0x00, 0x00, 0x00,    // call [rip+0x14] (detour at +40)
+        0x48, 0x83, 0xC4, 0x28,                // add rsp,0x28
+        0x41, 0x5B, 0x41, 0x5A, 0x41, 0x59, 0x41, 0x58, 0x5A, 0x59,  // pop r11..rcx
+        0xC3,                                  // ret
+        0xCC, 0xCC, 0xCC, 0xCC, 0xCC};
+    // UNWIND_INFO v1: prolog 14 bytes, 7 codes (padded to 8): alloc 0x28 at
+    // 14, then the pushes of r11, r10, r9, r8, rdx, rcx ending at 10..1.
+    constexpr uint8_t kUnwind[] = {
+        0x01, 0x0E, 0x07, 0x00,
+        0x0E, 0x42, 0x0A, 0xB0, 0x08, 0xA0, 0x06, 0x90,
+        0x04, 0x80, 0x02, 0x20, 0x01, 0x10, 0x00, 0x00};
+    constexpr size_t kDetourOffset = 40;
+    constexpr size_t kUnwindOffset = 48;
+    constexpr size_t kFunctionOffset = 72;
+    static_assert(sizeof(kCode) == kDetourOffset);
+    auto* page = static_cast<uint8_t*>(VirtualAlloc(nullptr, 4096,
+        MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    if (page == nullptr) {
+        return nullptr;
+    }
+    memcpy(page, kCode, sizeof(kCode));
+    const auto destination = reinterpret_cast<uint64_t>(detour);
+    memcpy(page + kDetourOffset, &destination, sizeof(destination));
+    memcpy(page + kUnwindOffset, kUnwind, sizeof(kUnwind));
+    auto* function = reinterpret_cast<RUNTIME_FUNCTION*>(page + kFunctionOffset);
+    function->BeginAddress = 0;
+    function->EndAddress = 35;
+    function->UnwindData = static_cast<DWORD>(kUnwindOffset);
+    DWORD old_protect{};
+    if (!VirtualProtect(page, 4096, PAGE_EXECUTE_READ, &old_protect)) {
+        VirtualFree(page, 0, MEM_RELEASE);
+        return nullptr;
+    }
+    FlushInstructionCache(GetCurrentProcess(), page, kDetourOffset);
+    if (!RtlAddFunctionTable(function, 1, reinterpret_cast<DWORD64>(page))) {
+        log_local_light_line("LL stub unwind data not registered (stub still used)");
+    }
+    return page;
+}
+
+uint8_t __fastcall hook_remaster_light_shadow_select(void* light, void* collector) {
+    const float* position = g_local_light_pair_position;
+    if (position == nullptr) {
+        return g_engine_light_shadow_select(light, collector);
+    }
+    alignas(16) uint8_t shim[0x28]{};
+    memcpy(shim + 0x20, &position, sizeof(position));
+    return g_engine_light_shadow_select(light, shim);
+}
+
+bool read_local_light_view_position(const uint8_t* collector, float* position) {
+    __try {
+        const auto* view = *reinterpret_cast<const float* const*>(collector + 0x20);
+        if (view == nullptr) {
+            return false;
+        }
+        position[0] = view[0];
+        position[1] = view[1];
+        position[2] = view[2];
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+    return std::isfinite(position[0]) && std::isfinite(position[1]) &&
+        std::isfinite(position[2]);
+}
+
+// The first render of a pair stores its view position; the other render uses
+// it. Returns the position both renders size their local shadows from.
+bool lock_local_light_pair_position(
+    const uint8_t* collector, uint64_t pair_id, float* position) {
+    float own[3]{};
+    if (!read_local_light_view_position(collector, own)) {
+        return false;
+    }
+    if (g_local_light_pair_slot.load(std::memory_order_acquire) == pair_id) {
+        for (size_t i = 0; i < 3; ++i) {
+            position[i] = g_local_light_pair_slot_position[i].load(
+                std::memory_order_relaxed);
+        }
+        g_local_light_pair_reuses.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+    for (size_t i = 0; i < 3; ++i) {
+        position[i] = own[i];
+        g_local_light_pair_slot_position[i].store(own[i], std::memory_order_relaxed);
+    }
+    g_local_light_pair_slot.store(pair_id, std::memory_order_release);
+    g_local_light_pair_seeds.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+void __fastcall hook_remaster_dynamic_atlas_reset(void* manager) {
+    auto* stats = g_local_shadow_prepare_stats;
+    if (stats != nullptr &&
+        reinterpret_cast<uintptr_t>(_ReturnAddress()) == g_local_shadow_attempt_return) {
+        ++stats->attempts;
+    }
+    g_engine_dynamic_atlas_reset(manager);
+}
+
+void* __fastcall hook_remaster_dynamic_tile_alloc(void* manager, uintptr_t size) {
+    void* const tile = g_engine_dynamic_tile_alloc(manager, size);
+    if (auto* stats = g_local_shadow_prepare_stats) {
+        ++stats->tile_requests;
+        if (tile == nullptr) {
+            ++stats->tile_failures[stats->attempts >= 2 ? 1 : 0];
+        }
+    }
+    return tile;
+}
+
+void* __fastcall hook_remaster_static_cube_alloc(
+    void* allocator, uintptr_t frame_index, void* key) {
+    void* const cube = g_engine_static_cube_alloc(allocator, frame_index, key);
+    if (auto* stats = g_local_shadow_prepare_stats) {
+        ++stats->cube_requests;
+        if (cube == nullptr) {
+            ++stats->cube_failures;
+        }
+    }
+    return cube;
+}
+
+struct LocalLightShadowEntry {
+    uintptr_t light{};
+    uint16_t size{};  // light+0x1C8: tile edge - 8
+    uint8_t faces{};  // atlas tile per cube face (+0x1F8..+0x220)
+    uint8_t flags{};  // 1 point light, 2 live static cube, 4 flickering
+};
+constexpr size_t kLocalLightRecordEntries = 96;
+struct LocalLightCollectionRecord {
+    RemasterLocalLightCollection collection{};
+    uint32_t frame_index{};
+    bool shadows_enabled{};
+    uint32_t lights{};
+    uint32_t shadowed{};
+    float position[3]{};
+    bool position_valid{};
+    LocalShadowPrepareStats stats{};
+    uint64_t flicker_calls{};
+    uint64_t flicker_repeats{};
+    uint32_t entry_count{};
+    std::array<LocalLightShadowEntry, kLocalLightRecordEntries> entries{};
+};
+
+bool read_local_light_collection(
+    const uint8_t* collector, LocalLightCollectionRecord& record) {
+    __try {
+        record.shadows_enabled = collector[0x4DC0] != 0;
+        const auto* lists = *reinterpret_cast<const uint8_t* const*>(collector + 0xB8);
+        if (lists == nullptr) {
+            return false;
+        }
+        memcpy(&record.lights, lists + 0x1174, sizeof(record.lights));
+        memcpy(&record.shadowed, lists + 0x23F8, sizeof(record.shadowed));
+        const auto* shadowed =
+            *reinterpret_cast<const uint8_t* const* const*>(lists + 0x23F0);
+        const uint32_t count = shadowed != nullptr
+            ? std::min<uint32_t>(record.shadowed, kLocalLightRecordEntries) : 0;
+        for (uint32_t i = 0; i < count; ++i) {
+            const uint8_t* light = shadowed[i];
+            if (light == nullptr) {
+                continue;
+            }
+            LocalLightShadowEntry entry{};
+            entry.light = reinterpret_cast<uintptr_t>(light);
+            memcpy(&entry.size, light + 0x1C8, sizeof(entry.size));
+            for (uint32_t face = 0; face < 6; ++face) {
+                if (*reinterpret_cast<void* const*>(light + 0x1F8 + 8 * face) != nullptr) {
+                    entry.faces |= static_cast<uint8_t>(1u << face);
+                }
+            }
+            uint32_t type{};
+            memcpy(&type, light + 0x10, sizeof(type));
+            const auto* cube = *reinterpret_cast<const uint8_t* const*>(light + 0x228);
+            entry.flags = static_cast<uint8_t>((type == 3 ? 1 : 0) |
+                (cube != nullptr &&
+                    *reinterpret_cast<void* const*>(cube + 0x10) != nullptr ? 2 : 0) |
+                (*reinterpret_cast<void* const*>(light + 0x1A0) != nullptr ? 4 : 0));
+            record.entries[record.entry_count++] = entry;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+    return true;
+}
+
+// Edge of the square atlas tile: 512 at "high", halved per distance step.
+uint32_t local_light_tile_edge(const LocalLightShadowEntry& entry) {
+    return static_cast<uint32_t>(entry.size) + 8;
+}
+
+struct RemasterLocalLightDiagState {
+    LocalLightCollectionRecord previous{};
+    bool previous_valid{};
+    uint64_t renders{};
+    uint64_t untagged{};
+    uint64_t read_failures{};
+    uint64_t overflow[2]{};
+    uint64_t dropped_lights{};
+    uint64_t cube_failures{};
+    uint64_t pairs{};
+    uint64_t diff_pairs{};
+    float max_eye_distance{};
+    uint32_t render_lines{};
+    uint32_t event_lines{};
+    uint32_t light_dumps{};
+    uint32_t overflow_dumps{};
+};
+std::mutex g_local_light_diag_mutex{};
+RemasterLocalLightDiagState g_local_light_diag{};
+
+void log_local_light_render_locked(const LocalLightCollectionRecord& record) {
+    uint32_t edges[4]{};  // 512+, 256, 128, 64 and below
+    uint32_t faces = 0;
+    uint32_t cubes = 0;
+    uint32_t flickering = 0;
+    for (uint32_t i = 0; i < record.entry_count; ++i) {
+        const auto& entry = record.entries[i];
+        const uint32_t edge = local_light_tile_edge(entry);
+        ++edges[edge >= 512 ? 0 : edge >= 256 ? 1 : edge >= 128 ? 2 : 3];
+        for (uint32_t face = 0; face < 6; ++face) {
+            faces += (entry.faces >> face) & 1u;
+        }
+        cubes += (entry.flags & 2) != 0 ? 1 : 0;
+        flickering += (entry.flags & 4) != 0 ? 1 : 0;
+    }
+    log_local_light_line(
+        "LL render pair=%llu eye=%d order=%u frame=%u shadows=%u lights=%u shadowed=%u "
+        "attempts=%u tiles=%u fail=%u/%u cubes=%u cube_fail=%u edge512/256/128/64=%u/%u/%u/%u "
+        "faces=%u static=%u flickering=%u flicker_calls=%llu repeats=%llu pos=%.3f,%.3f,%.3f",
+        static_cast<unsigned long long>(record.collection.pair_id),
+        record.collection.eye, record.collection.second ? 2u : 1u,
+        record.frame_index, record.shadows_enabled ? 1u : 0u, record.lights,
+        record.shadowed, record.stats.attempts, record.stats.tile_requests,
+        record.stats.tile_failures[0], record.stats.tile_failures[1],
+        record.stats.cube_requests, record.stats.cube_failures, edges[0], edges[1],
+        edges[2], edges[3], faces, cubes, flickering,
+        static_cast<unsigned long long>(record.flicker_calls),
+        static_cast<unsigned long long>(record.flicker_repeats),
+        record.position[0], record.position[1], record.position[2]);
+}
+
+void log_local_light_entries_locked(const LocalLightCollectionRecord& record) {
+    const uint32_t count = std::min<uint32_t>(record.entry_count, 48);
+    for (uint32_t i = 0; i < count; ++i) {
+        const auto& entry = record.entries[i];
+        log_local_light_line(
+            "LL light pair=%llu eye=%d light=%p type=%s edge=%u faces=0x%02X "
+            "static=%u flicker=%u",
+            static_cast<unsigned long long>(record.collection.pair_id),
+            record.collection.eye, reinterpret_cast<void*>(entry.light),
+            (entry.flags & 1) != 0 ? "point" : "spot", local_light_tile_edge(entry),
+            entry.faces, (entry.flags & 2) != 0 ? 1u : 0u,
+            (entry.flags & 4) != 0 ? 1u : 0u);
+    }
+}
+
+// Both renders of a pair: lights shadowed in one eye only, and lights whose
+// tile size or allocated faces differ between the eyes.
+void compare_local_light_pair_locked(
+    const LocalLightCollectionRecord& first, const LocalLightCollectionRecord& second) {
+    uint32_t only_first = 0;
+    uint32_t only_second = 0;
+    uint32_t size_diff = 0;
+    uint32_t face_diff = 0;
+    const LocalLightShadowEntry* example_first{};
+    const LocalLightShadowEntry* example_second{};
+    uint32_t a = 0;
+    uint32_t b = 0;
+    while (a < first.entry_count || b < second.entry_count) {
+        if (b >= second.entry_count ||
+            (a < first.entry_count && first.entries[a].light < second.entries[b].light)) {
+            ++only_first;
+            ++a;
+            continue;
+        }
+        if (a >= first.entry_count || second.entries[b].light < first.entries[a].light) {
+            ++only_second;
+            ++b;
+            continue;
+        }
+        const auto& x = first.entries[a++];
+        const auto& y = second.entries[b++];
+        const bool sizes = x.size != y.size;
+        const bool faces = x.faces != y.faces;
+        size_diff += sizes ? 1 : 0;
+        face_diff += faces ? 1 : 0;
+        if ((sizes || faces) && example_first == nullptr) {
+            example_first = &x;
+            example_second = &y;
+        }
+    }
+    auto& diag = g_local_light_diag;
+    ++diag.pairs;
+    float eye_distance = 0.0f;
+    if (first.position_valid && second.position_valid) {
+        const float dx = first.position[0] - second.position[0];
+        const float dy = first.position[1] - second.position[1];
+        const float dz = first.position[2] - second.position[2];
+        eye_distance = sqrtf(dx * dx + dy * dy + dz * dz);
+        diag.max_eye_distance = std::max(diag.max_eye_distance, eye_distance);
+    }
+    const bool attempts_differ = first.stats.attempts != second.stats.attempts;
+    if (only_first == 0 && only_second == 0 && size_diff == 0 && face_diff == 0 &&
+        !attempts_differ) {
+        return;
+    }
+    const uint64_t diffs = ++diag.diff_pairs;
+    if (diffs > 100 && diffs % 50 != 0) {
+        return;
+    }
+    log_local_light_line(
+        "LLDIFF pair=%llu eyes=%d/%d attempts=%u/%u shadowed=%u/%u only=%u/%u "
+        "size_diff=%u face_diff=%u dropped=%u/%u eye_distance_mm=%.1f diffs=%llu "
+        "example=%p edge=%u/%u faces=0x%02X/0x%02X",
+        static_cast<unsigned long long>(second.collection.pair_id),
+        first.collection.eye, second.collection.eye, first.stats.attempts,
+        second.stats.attempts, first.shadowed, second.shadowed, only_first,
+        only_second, size_diff, face_diff, first.stats.tile_failures[1],
+        second.stats.tile_failures[1], eye_distance * 1000.0f,
+        static_cast<unsigned long long>(diffs),
+        example_first != nullptr ? reinterpret_cast<void*>(example_first->light) : nullptr,
+        example_first != nullptr ? local_light_tile_edge(*example_first) : 0u,
+        example_second != nullptr ? local_light_tile_edge(*example_second) : 0u,
+        example_first != nullptr ? example_first->faces : 0u,
+        example_second != nullptr ? example_second->faces : 0u);
+}
+
+void record_local_light_collection(const uint8_t* collector, uint32_t frame_index,
+    bool found, const RemasterLocalLightCollection& collection,
+    const LocalShadowPrepareStats& stats) {
+    static LocalLightCollectionRecord record{};
+    std::scoped_lock lock{g_local_light_diag_mutex};
+    auto& diag = g_local_light_diag;
+    ++diag.renders;
+    if (!found || !collection.tagged) {
+        ++diag.untagged;
+        return;
+    }
+    record = {};
+    record.collection = collection;
+    record.frame_index = frame_index;
+    record.stats = stats;
+    record.flicker_calls =
+        g_light_flicker_calls.load(std::memory_order_relaxed) - collection.flicker_calls;
+    record.flicker_repeats =
+        g_light_flicker_repeats.load(std::memory_order_relaxed) - collection.flicker_repeats;
+    record.position_valid = read_local_light_view_position(collector, record.position);
+    if (!read_local_light_collection(collector, record)) {
+        ++diag.read_failures;
+        return;
+    }
+    std::sort(record.entries.begin(), record.entries.begin() + record.entry_count,
+        [](const LocalLightShadowEntry& x, const LocalLightShadowEntry& y) {
+            return x.light < y.light;
+        });
+    const bool overflow = stats.attempts >= 2;
+    const bool event = overflow || stats.cube_failures != 0;
+    if (overflow) {
+        ++diag.overflow[collection.eye & 1];
+    }
+    diag.dropped_lights += stats.tile_failures[1];
+    diag.cube_failures += stats.cube_failures;
+    // Bounded: the first renders, renders that overflowed or missed a static
+    // cube, one in 900, and the light tables of the first renders with
+    // shadowed lights and of the first overflows.
+    const uint64_t tagged = diag.renders - diag.untagged;
+    const bool dump = (record.entry_count != 0 && diag.light_dumps < 4) ||
+        (overflow && diag.overflow_dumps < 4);
+    const bool first_line = diag.render_lines < 24;
+    const bool event_line = event && diag.event_lines < 300;
+    if (dump || first_line || event_line || tagged % 900 == 0) {
+        diag.render_lines += first_line ? 1 : 0;
+        diag.event_lines += event_line ? 1 : 0;
+        log_local_light_render_locked(record);
+    }
+    if (dump) {
+        if (overflow && diag.overflow_dumps < 4) {
+            ++diag.overflow_dumps;
+        } else {
+            ++diag.light_dumps;
+        }
+        log_local_light_entries_locked(record);
+    }
+    if (collection.second && diag.previous_valid &&
+        diag.previous.collection.pair_id == collection.pair_id) {
+        compare_local_light_pair_locked(diag.previous, record);
+    }
+    diag.previous = record;
+    diag.previous_valid = true;
+    if (tagged % 1800 == 0) {
+        log_local_light_line(
+            "LL summary renders=%llu tagged=%llu untagged=%llu read_fail=%llu "
+            "overflow_eye0/1=%llu/%llu dropped_lights=%llu cube_fail=%llu pairs=%llu "
+            "diff_pairs=%llu max_eye_distance_mm=%.1f tag tls/map/miss=%llu/%llu/%llu "
+            "flicker calls=%llu repeats=%llu skipped=%llu untagged=%llu table_full=%llu "
+            "pair_lock seeds=%llu reuses=%llu",
+            static_cast<unsigned long long>(diag.renders),
+            static_cast<unsigned long long>(tagged),
+            static_cast<unsigned long long>(diag.untagged),
+            static_cast<unsigned long long>(diag.read_failures),
+            static_cast<unsigned long long>(diag.overflow[0]),
+            static_cast<unsigned long long>(diag.overflow[1]),
+            static_cast<unsigned long long>(diag.dropped_lights),
+            static_cast<unsigned long long>(diag.cube_failures),
+            static_cast<unsigned long long>(diag.pairs),
+            static_cast<unsigned long long>(diag.diff_pairs),
+            diag.max_eye_distance * 1000.0f,
+            static_cast<unsigned long long>(g_local_light_tag_tls.load()),
+            static_cast<unsigned long long>(g_local_light_tag_map.load()),
+            static_cast<unsigned long long>(g_local_light_tag_miss.load()),
+            static_cast<unsigned long long>(g_light_flicker_calls.load()),
+            static_cast<unsigned long long>(g_light_flicker_repeats.load()),
+            static_cast<unsigned long long>(g_light_flicker_skipped.load()),
+            static_cast<unsigned long long>(g_light_flicker_untagged.load()),
+            static_cast<unsigned long long>(g_light_flicker_table_full.load()),
+            static_cast<unsigned long long>(g_local_light_pair_seeds.load()),
+            static_cast<unsigned long long>(g_local_light_pair_reuses.load()));
+    }
+}
+
+void __fastcall hook_remaster_local_shadow_prepare(void* collector) {
+    if (collector == nullptr) {
+        g_engine_local_shadow_prepare(collector);
+        return;
+    }
+    const auto* bytes = static_cast<const uint8_t*>(collector);
+    uint32_t frame_index{};
+    memcpy(&frame_index, bytes + 0xB0, sizeof(frame_index));
+    RemasterLocalLightCollection collection{};
+    const bool found = find_local_light_collection(frame_index, collection);
+    float pair_position[3]{};
+    const bool pair_locked = g_local_light_pair_lock_active && found &&
+        collection.tagged &&
+        lock_local_light_pair_position(bytes, collection.pair_id, pair_position);
+    LocalShadowPrepareStats stats{};
+    g_local_light_pair_position = pair_locked ? pair_position : nullptr;
+    g_local_shadow_prepare_stats = g_local_light_diag_active ? &stats : nullptr;
+    g_engine_local_shadow_prepare(collector);
+    g_local_shadow_prepare_stats = nullptr;
+    g_local_light_pair_position = nullptr;
+    if (g_local_light_diag_active) {
+        record_local_light_collection(bytes, frame_index, found, collection, stats);
+    }
+}
+
+// REDengine config var {vtable, group*, name*, flags, value*, value} with the
+// value at +0x30: checked by group, name and type before it is written.
+uint8_t* remaster_local_shadow_cvar(
+    uint8_t* module, uintptr_t value_rva, const char* name, uint32_t type) {
+    uint8_t* const value = module + value_rva;
+    const uint8_t* const descriptor = value - 0x30;
+    __try {
+        const auto* group = *reinterpret_cast<const char* const*>(descriptor + 0x08);
+        const auto* key = *reinterpret_cast<const char* const*>(descriptor + 0x10);
+        uint64_t flags{};
+        memcpy(&flags, descriptor + 0x18, sizeof(flags));
+        const auto* value_pointer = *reinterpret_cast<const uint8_t* const*>(descriptor + 0x20);
+        if (value_pointer != value || group == nullptr || key == nullptr ||
+            (flags & 0xFF) != type || strcmp(group, "Rendering/LocalShadows") != 0 ||
+            strcmp(key, name) != 0) {
+            return nullptr;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return nullptr;
+    }
+    return value;
+}
+
+void* __fastcall hook_remaster_shadow_manager_init(void* manager) {
+    uint32_t slices_before{};
+    uint32_t slices_after{};
+    uint32_t sort_before{};
+    if (g_local_shadow_slices_cvar != nullptr) {
+        memcpy(&slices_before, g_local_shadow_slices_cvar, sizeof(slices_before));
+        slices_after = static_cast<uint32_t>(g_config.remaster_local_shadow_slices);
+        memcpy(g_local_shadow_slices_cvar, &slices_after, sizeof(slices_after));
+    }
+    if (g_local_shadow_sort_cvar != nullptr) {
+        sort_before = *g_local_shadow_sort_cvar;
+        *g_local_shadow_sort_cvar = 1;
+    }
+    log_local_light_line(
+        "LL capacity manager=%p NumDynamicSlices=%u->%u UseCorrectedLightSort=%u->%u",
+        manager, slices_before,
+        g_local_shadow_slices_cvar != nullptr ? slices_after : slices_before,
+        sort_before, g_local_shadow_sort_cvar != nullptr ? 1u : sort_before);
+    return g_engine_shadow_manager_init(manager);
+}
+
+bool install_remaster_local_light_hook(uint8_t* module,
+    const RemasterLocalLightHook& hook, void* detour, void** original) {
+    auto* target = module + hook.rva;
+    if (memcmp(target, hook.signature, hook.signature_size) != 0) {
+        log_local_light_line("LL %s signature mismatch at RVA 0x%llX; left vanilla",
+            hook.name, static_cast<unsigned long long>(hook.rva));
+        return false;
+    }
+    if (MH_CreateHook(target, detour, original) == MH_OK &&
+        MH_EnableHook(target) == MH_OK) {
+        log_local_light_line("LL %s hooked target=%p bytes=%zu", hook.name, target,
+            hook.signature_size);
+        return true;
+    }
+    *original = nullptr;
+    log_local_light_line("LL %s hook failed target=%p; left vanilla", hook.name, target);
+    return false;
+}
+
+bool remaster_local_light_probes_match(uint8_t* module, bool diagnostics) {
+    for (const auto& probe : kRemaster501LocalLightProbes) {
+        if (probe.diagnostics_only == diagnostics &&
+            memcmp(module + probe.rva, probe.bytes, probe.size) != 0) {
+            log_local_light_line("LL layout check '%s' failed at RVA 0x%llX",
+                probe.what, static_cast<unsigned long long>(probe.rva));
+            return false;
+        }
+    }
+    return true;
+}
+
+bool remaster_shadow_manager_exists(uint8_t* module) {
+    __try {
+        const auto* global = *reinterpret_cast<const uint8_t* const*>(
+            module + kRemaster501RenderGlobalRva);
+        return global != nullptr &&
+            *reinterpret_cast<void* const*>(global + 0x448) != nullptr;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// Hooks that need the render context: collector init first, then the
+// flicker update, the selection, the diagnostics and the local shadow prepare.
+void install_remaster_local_light_render_hooks(
+    uint8_t* module, bool diag, bool flicker, bool pair_lock) {
+    if (!remaster_local_light_probes_match(module, false) ||
+        !install_remaster_local_light_hook(module, kRemasterCollectorInitHook,
+            reinterpret_cast<void*>(&hook_remaster_collector_init),
+            reinterpret_cast<void**>(&g_engine_collector_init))) {
+        log_local_light_line("LL diag/flicker_per_pair/pair_lock off: no render context");
+        return;
+    }
+    if (diag && !remaster_local_light_probes_match(module, true)) {
+        log_local_light_line("LL diag off: layout check failed");
+        diag = false;
+    }
+    g_local_light_diag_active = diag;
+    g_light_flicker_per_pair_active = flicker;
+    if ((diag || flicker) &&
+        !install_remaster_local_light_hook(module, kRemasterLightFlickerUpdateHook,
+            reinterpret_cast<void*>(&hook_remaster_light_flicker_update),
+            reinterpret_cast<void**>(&g_engine_light_flicker_update))) {
+        g_light_flicker_per_pair_active = false;
+    }
+    if (pair_lock) {
+        // Selection before the prepare, so the prepare never hands out a
+        // position that nothing consumes.
+        void* stub = build_volatile_preserving_stub(
+            reinterpret_cast<void*>(&hook_remaster_light_shadow_select));
+        pair_lock = stub != nullptr &&
+            install_remaster_local_light_hook(module, kRemasterLightShadowSelectHook,
+                stub, reinterpret_cast<void**>(&g_engine_light_shadow_select));
+    }
+    g_local_light_pair_lock_active = pair_lock;
+    if (!diag && !pair_lock) {
+        return;
+    }
+    if (diag) {
+        g_local_shadow_attempt_return = reinterpret_cast<uintptr_t>(module) +
+            kRemaster501LocalShadowAttemptReturnRva;
+        install_remaster_local_light_hook(module, kRemasterDynamicAtlasResetHook,
+            reinterpret_cast<void*>(&hook_remaster_dynamic_atlas_reset),
+            reinterpret_cast<void**>(&g_engine_dynamic_atlas_reset));
+        install_remaster_local_light_hook(module, kRemasterDynamicTileAllocHook,
+            reinterpret_cast<void*>(&hook_remaster_dynamic_tile_alloc),
+            reinterpret_cast<void**>(&g_engine_dynamic_tile_alloc));
+        install_remaster_local_light_hook(module, kRemasterStaticCubeAllocHook,
+            reinterpret_cast<void*>(&hook_remaster_static_cube_alloc),
+            reinterpret_cast<void**>(&g_engine_static_cube_alloc));
+    }
+    if (!install_remaster_local_light_hook(module, kRemasterLocalShadowPrepareHook,
+            reinterpret_cast<void*>(&hook_remaster_local_shadow_prepare),
+            reinterpret_cast<void**>(&g_engine_local_shadow_prepare))) {
+        g_local_light_diag_active = false;
+        g_local_light_pair_lock_active = false;
+    }
+}
+
+void install_remaster_local_light_hooks() {
+    const bool diag = g_config.remaster_local_light_diag;
+    const bool capacity = g_config.remaster_local_shadow_slices > 1 ||
+        g_config.remaster_local_shadow_sort_corrected;
+    bool flicker = g_config.remaster_light_flicker_per_pair;
+    bool pair_lock = g_config.remaster_local_light_pair_lock;
+    if ((!diag && !capacity && !flicker && !pair_lock) ||
+        g_engine_collector_init != nullptr || g_engine_shadow_manager_init != nullptr) {
+        return;
+    }
+    auto* module = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
+    if (running_game_build() != w3vr::game_build::Build::Remaster501 ||
+        module == nullptr) {
+        log_local_light_line("LL local lights off: build mismatch");
+        return;
+    }
+    log_local_light_line(
+        "LL config diag=%d slices=%d sort_corrected=%d flicker_per_pair=%d pair_lock=%d",
+        diag ? 1 : 0, g_config.remaster_local_shadow_slices,
+        g_config.remaster_local_shadow_sort_corrected ? 1 : 0, flicker ? 1 : 0,
+        pair_lock ? 1 : 0);
+    // AER renders one eye per tick and keeps a pair over two ticks: per-pair
+    // flicker would run at half speed, and the pair position would be a tick
+    // old.
+    if ((flicker || pair_lock) && mode3_aer_presentation_active()) {
+        log_local_light_line("LL flicker_per_pair/pair_lock off: AER renders one eye per tick");
+        flicker = false;
+        pair_lock = false;
+    }
+    if (capacity) {
+        if (g_config.remaster_local_shadow_slices > 1) {
+            g_local_shadow_slices_cvar = remaster_local_shadow_cvar(module,
+                kRemaster501NumDynamicSlicesRva, "NumDynamicSlices", 0x01);
+        }
+        if (g_config.remaster_local_shadow_sort_corrected) {
+            g_local_shadow_sort_cvar = remaster_local_shadow_cvar(module,
+                kRemaster501UseCorrectedLightSortRva, "UseCorrectedLightSort", 0x00);
+        }
+        if (g_local_shadow_slices_cvar == nullptr && g_local_shadow_sort_cvar == nullptr) {
+            log_local_light_line("LL capacity off: LocalShadows cvars not verified");
+        } else {
+            if (remaster_shadow_manager_exists(module)) {
+                // Too late for this manager's slices; a settings re-create
+                // picks them up. The sort order is read on every collection,
+                // so it applies right away.
+                log_local_light_line("LL capacity: shadow manager already created");
+                if (g_local_shadow_sort_cvar != nullptr) {
+                    *g_local_shadow_sort_cvar = 1;
+                }
+            }
+            if (!install_remaster_local_light_hook(module, kRemasterShadowManagerInitHook,
+                    reinterpret_cast<void*>(&hook_remaster_shadow_manager_init),
+                    reinterpret_cast<void**>(&g_engine_shadow_manager_init))) {
+                g_local_shadow_slices_cvar = nullptr;
+                g_local_shadow_sort_cvar = nullptr;
+            }
+        }
+    }
+    if (diag || flicker || pair_lock) {
+        install_remaster_local_light_render_hooks(module, diag, flicker, pair_lock);
+    }
+    log_local_light_line("LL active diag=%d flicker_per_pair=%d pair_lock=%d "
+        "slices_cvar=%d sort_cvar=%d",
+        g_local_light_diag_active ? 1 : 0, g_light_flicker_per_pair_active ? 1 : 0,
+        g_local_light_pair_lock_active ? 1 : 0, g_local_shadow_slices_cvar != nullptr ? 1 : 0,
+        g_local_shadow_sort_cvar != nullptr ? 1 : 0);
 }
 
 void publish_engine_menu_state(
@@ -41879,8 +49853,15 @@ void* __fastcall hook_engine_frame_data_factory(void* render_context, void* rend
     // generation} duplication and temporal-history route active in cinema;
     // only fullscreen menus remain single-view.
     if (duplicate_render) {
+        // [PERF:PAIR-BARRIER-LAG 8/11] With run-ahead the next factory can
+        // run before the Present count moves, while the render thread still
+        // renders this pair; give every pair its own slot instead.
+        static std::atomic<uint64_t> lagged_descriptor_slot{};
+        const uint64_t descriptor_slot = g_config.perf_pair_barrier_lag != 0
+            ? lagged_descriptor_slot.fetch_add(1, std::memory_order_relaxed)
+            : present;
         right_scene_descriptor = &g_engine_dual_scene_descriptors[
-            present % g_engine_dual_scene_descriptors.size()];
+            descriptor_slot % g_engine_dual_scene_descriptors.size()];
         const bool asymmetric_taau_descriptor_hardening =
             native_asymmetric_noaa_route_active() &&
             temporal_backend_is_taau();
@@ -42637,6 +50618,16 @@ bool dispatch_clean_mono_dlss_camera_motion(
     return true;
 }
 
+// [FIX:MENU-MONO-CAMERA 4/4] Mode-3 menu state latched once per Present.
+std::atomic<bool> g_streamline_menu_mono_latched{};
+
+void latch_streamline_menu_mono() {
+    g_streamline_menu_mono_latched.store(
+        geometry_stereo_transport_active() &&
+            g_engine_menu_state.load(std::memory_order_relaxed) != 0,
+        std::memory_order_relaxed);
+}
+
 uint32_t streamline_eye() {
     if (g_streamline_forced_eye >= 0) {
         return static_cast<uint32_t>(g_streamline_forced_eye);
@@ -42646,6 +50637,20 @@ uint32_t streamline_eye() {
     }
     if (g_engine_dual_render_active.load() && g_engine_render_eye >= 0) {
         return static_cast<uint32_t>(g_engine_render_eye);
+    }
+    // [FIX:MENU-MONO-CAMERA 3/4] Untagged Mode-3 frames while a fullscreen
+    // menu is open are one centre-camera view (1/4). Keep them on the eye-0
+    // DLSS viewport/history instead of ping-ponging between the two per-eye
+    // instances by Present parity: each instance would otherwise see every
+    // other frame with one-frame motion vectors and half of the jitter
+    // sequence, so the two converged images alternate on screen. Tagged
+    // frames still in flight at menu entry keep their eye (checked above).
+    // The flag is latched at Present (4/4), the same clock as the parity
+    // fallback below, so the constants, tags and evaluate of one recorded
+    // frame cannot land on different viewports when IsAnyMenu flips from
+    // another thread in the middle of that frame.
+    if (g_streamline_menu_mono_latched.load(std::memory_order_relaxed)) {
+        return 0;
     }
     return static_cast<uint32_t>(g_present_count.load() & 1ull);
 }
@@ -46398,6 +54403,7 @@ void ensure_initialized() {
         // with the default OFF setting the adjacent DLL is never loaded.
         initialize_real_dxgi_exports();
         load_config();
+        log_remaster_streamline_wine_bypass();
         if (g_config.renderdoc_capture_enabled &&
             g_config.renderdoc_streamline_device_bridge) {
             initialize_real_d3d12_create_device_export();
@@ -46423,6 +54429,10 @@ void ensure_initialized() {
         install_engine_gameplay_entry_probe();
         install_engine_scene_enqueue_probe();
         install_engine_temporal_camera_builder_hook();
+        install_remaster_engine_dlss_hooks();
+        install_remaster_gui_fade_fill_hook();
+        install_remaster_asymmetric_ndc_hooks();
+        install_remaster_shadow_pair_hooks();
         install_engine_view_factory_probe();
         install_engine_render_proxy_distance_scale_hook();
         install_engine_native_camera_authority_hooks();
@@ -46440,6 +54450,7 @@ void ensure_initialized() {
         install_engine_menu_state_probe();
         install_engine_viewport_resolution_hook();
         install_engine_camera_light_placement_hook();
+        install_remaster_local_light_hooks();
         log_line(
             "Hook routes taau_functional=%u taau_metadata=%u dlss=%u reverse_diagnostics=%u mode=%d",
             taau_functional_hooks_needed() ? 1u : 0u,
@@ -46693,6 +54704,8 @@ void capture_d3d12_objects(IUnknown* dxgi_device_parameter) {
         g_d3d12_device = device;
     }
     log_line("Captured D3D12 queue=%p device=%p", g_command_queue, g_d3d12_device);
+    // [FEATURE:VRS-MEASUREMENT 7/8] Decide before the detours are created.
+    initialize_vrs_measurement(g_d3d12_device);
     install_reverse_hooks();
     // Clean mono never enables the Mode-3 dual-render transition. Install the
     // shared barrier/lifetime observer at device capture so its one TAAU
@@ -46741,6 +54754,203 @@ bool wait_for_xr_command_allocator(size_t index) {
         return false;
     }
     return WaitForSingleObject(g_xr_fence_event, 1000) == WAIT_OBJECT_0;
+}
+
+// [FIX:HUD-FADE-FILL 3/5] hud_fade_mode=uniform: the fade fill dropped from
+// t1 is applied to each whole eye image instead, before the HUD plane, with
+// the latched colour and amount. Straight-alpha blending into the sRGB target
+// happens in linear light, like the flat composite's lerp(scene, t1, t1.a) in
+// decoded space, so a black fade gives scene * (1 - a) in both.
+ID3D12RootSignature* g_xr_fade_root_signature{};
+ID3D12PipelineState* g_xr_fade_pipeline{};
+
+bool initialize_mode3_uniform_fade_pipeline(DXGI_FORMAT target_format) {
+    if (g_xr_fade_pipeline != nullptr) {
+        return true;
+    }
+    if (g_d3d12_device == nullptr || !initialize_dxc()) {
+        return false;
+    }
+    static constexpr char kShader[] = R"(
+cbuffer FadeColour : register(b0) {
+    float4 fade_colour;
+};
+float4 vs_main(uint vertex_id : SV_VertexID) : SV_Position {
+    // One triangle that covers the whole viewport.
+    float2 corner = float2((vertex_id << 1) & 2, vertex_id & 2);
+    return float4(corner * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.5, 1.0);
+}
+float4 ps_main(float4 position : SV_Position) : SV_Target0 {
+    return fade_colour;
+}
+)";
+    auto compile_stage = [](const wchar_t* entry,
+                            const wchar_t* target) -> IDxcBlob* {
+        DxcBuffer source{kShader, sizeof(kShader) - 1, DXC_CP_UTF8};
+        LPCWSTR arguments[] = {L"-E", entry, L"-T", target, L"-O3"};
+        IDxcResult* result{};
+        if (FAILED(g_dxc_compiler->Compile(&source, arguments,
+                static_cast<UINT32>(std::size(arguments)), nullptr,
+                IID_PPV_ARGS(&result))) ||
+            result == nullptr) {
+            return nullptr;
+        }
+        HRESULT status{};
+        result->GetStatus(&status);
+        IDxcBlob* shader{};
+        if (FAILED(status) || FAILED(result->GetOutput(
+                DXC_OUT_OBJECT, IID_PPV_ARGS(&shader), nullptr))) {
+            shader = nullptr;
+        }
+        result->Release();
+        return shader;
+    };
+    IDxcBlob* vertex_shader = compile_stage(L"vs_main", L"vs_6_0");
+    IDxcBlob* pixel_shader = compile_stage(L"ps_main", L"ps_6_0");
+    if (vertex_shader == nullptr || pixel_shader == nullptr) {
+        if (vertex_shader != nullptr) vertex_shader->Release();
+        if (pixel_shader != nullptr) pixel_shader->Release();
+        log_line("HUD fade uniform shader compile failed");
+        return false;
+    }
+
+    D3D12_ROOT_PARAMETER parameter{};
+    parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    parameter.Constants.ShaderRegister = 0;
+    parameter.Constants.RegisterSpace = 0;
+    parameter.Constants.Num32BitValues = 4;
+    parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    D3D12_ROOT_SIGNATURE_DESC root_desc{};
+    root_desc.NumParameters = 1;
+    root_desc.pParameters = &parameter;
+    ID3DBlob* serialized{};
+    ID3DBlob* errors{};
+    const auto serialize_hr = D3D12SerializeRootSignature(
+        &root_desc, D3D_ROOT_SIGNATURE_VERSION_1, &serialized, &errors);
+    if (errors != nullptr) errors->Release();
+    if (FAILED(serialize_hr) || serialized == nullptr ||
+        FAILED(g_d3d12_device->CreateRootSignature(0,
+            serialized->GetBufferPointer(), serialized->GetBufferSize(),
+            IID_PPV_ARGS(&g_xr_fade_root_signature)))) {
+        log_line("HUD fade uniform root signature failed hr=0x%08X",
+            static_cast<unsigned>(serialize_hr));
+        if (serialized != nullptr) serialized->Release();
+        vertex_shader->Release();
+        pixel_shader->Release();
+        return false;
+    }
+    serialized->Release();
+
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pipeline_desc{};
+    pipeline_desc.pRootSignature = g_xr_fade_root_signature;
+    pipeline_desc.VS = {
+        vertex_shader->GetBufferPointer(), vertex_shader->GetBufferSize()};
+    pipeline_desc.PS = {
+        pixel_shader->GetBufferPointer(), pixel_shader->GetBufferSize()};
+    auto& target_blend = pipeline_desc.BlendState.RenderTarget[0];
+    target_blend.BlendEnable = TRUE;
+    target_blend.SrcBlend = D3D12_BLEND_SRC_ALPHA;
+    target_blend.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+    target_blend.BlendOp = D3D12_BLEND_OP_ADD;
+    target_blend.SrcBlendAlpha = D3D12_BLEND_ZERO;
+    target_blend.DestBlendAlpha = D3D12_BLEND_ONE;
+    target_blend.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+    target_blend.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    pipeline_desc.SampleMask = UINT_MAX;
+    pipeline_desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pipeline_desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pipeline_desc.RasterizerState.DepthClipEnable = TRUE;
+    pipeline_desc.DepthStencilState.DepthEnable = FALSE;
+    pipeline_desc.DepthStencilState.StencilEnable = FALSE;
+    pipeline_desc.PrimitiveTopologyType =
+        D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pipeline_desc.NumRenderTargets = 1;
+    pipeline_desc.RTVFormats[0] = target_format;
+    pipeline_desc.SampleDesc.Count = 1;
+    const auto pipeline_hr = g_d3d12_device->CreateGraphicsPipelineState(
+        &pipeline_desc, IID_PPV_ARGS(&g_xr_fade_pipeline));
+    vertex_shader->Release();
+    pixel_shader->Release();
+    if (FAILED(pipeline_hr) || g_xr_fade_pipeline == nullptr) {
+        g_xr_fade_pipeline = nullptr;
+        g_xr_fade_root_signature->Release();
+        g_xr_fade_root_signature = nullptr;
+        log_line("HUD fade uniform pipeline failed hr=0x%08X",
+            static_cast<unsigned>(pipeline_hr));
+        return false;
+    }
+    log_line("HUD fade uniform pipeline ready format=%u",
+        static_cast<unsigned>(target_format));
+    return true;
+}
+
+// Blends the 0xRRGGBBAA fade over both eye images of the current projection
+// image, which the scene copy left in render-target state on the XR list.
+bool record_mode3_uniform_fade(
+    XrEyeSwapchain& target_swapchain,
+    uint32_t image_index,
+    const XrCompositionLayerProjectionView* submitted_views,
+    uint32_t rgba) {
+    if (g_xr_fade_pipeline == nullptr ||
+        g_xr_fade_root_signature == nullptr ||
+        g_xr_command_list == nullptr ||
+        g_set_graphics_root_signature == nullptr ||
+        g_set_pipeline_state == nullptr ||
+        g_draw_instanced == nullptr ||
+        submitted_views == nullptr ||
+        image_index >= target_swapchain.images.size() ||
+        image_index * 2 + 1 >= target_swapchain.rtvs.size()) {
+        return false;
+    }
+    // The engine's fade colour is display-encoded like the rest of t1.
+    auto decode = [](uint32_t byte) {
+        const float value = static_cast<float>(byte) / 255.0f;
+        return value <= 0.04045f
+            ? value / 12.92f
+            : powf((value + 0.055f) / 1.055f, 2.4f);
+    };
+    const float colour[4]{
+        decode((rgba >> 24) & 0xFFu),
+        decode((rgba >> 16) & 0xFFu),
+        decode((rgba >> 8) & 0xFFu),
+        static_cast<float>(rgba & 0xFFu) / 255.0f};
+    g_set_graphics_root_signature(
+        g_xr_command_list, g_xr_fade_root_signature);
+    g_set_pipeline_state(g_xr_command_list, g_xr_fade_pipeline);
+    g_xr_command_list->IASetPrimitiveTopology(
+        D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    g_xr_command_list->SetGraphicsRoot32BitConstants(0, 4, colour, 0);
+    for (uint32_t eye = 0; eye < 2; ++eye) {
+        // The submitted imageRect, or the whole slice if it is not usable.
+        const auto& image_rect = submitted_views[eye].subImage.imageRect;
+        const bool valid_image_rect = image_rect.offset.x >= 0 &&
+            image_rect.offset.y >= 0 &&
+            image_rect.extent.width > 0 &&
+            image_rect.extent.height > 0 &&
+            static_cast<int64_t>(image_rect.offset.x) +
+                    image_rect.extent.width <= target_swapchain.width &&
+            static_cast<int64_t>(image_rect.offset.y) +
+                    image_rect.extent.height <= target_swapchain.height;
+        const LONG left = valid_image_rect ? image_rect.offset.x : 0;
+        const LONG top = valid_image_rect ? image_rect.offset.y : 0;
+        const LONG width = valid_image_rect
+            ? image_rect.extent.width
+            : static_cast<LONG>(target_swapchain.width);
+        const LONG height = valid_image_rect
+            ? image_rect.extent.height
+            : static_cast<LONG>(target_swapchain.height);
+        const D3D12_VIEWPORT viewport{
+            static_cast<float>(left), static_cast<float>(top),
+            static_cast<float>(width), static_cast<float>(height),
+            0.0f, 1.0f};
+        const D3D12_RECT scissor{left, top, left + width, top + height};
+        g_xr_command_list->RSSetViewports(1, &viewport);
+        g_xr_command_list->RSSetScissorRects(1, &scissor);
+        const auto rtv = target_swapchain.rtvs[image_index * 2 + eye];
+        g_xr_command_list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+        g_draw_instanced(g_xr_command_list, 3, 1, 0, 0);
+    }
+    return true;
 }
 
 // [FIX:RETAINED-EYE-HUD 4/9] This private pipeline samples only REDengine's
@@ -46798,7 +55008,7 @@ cbuffer HudSamplingParameters : register(b1) {
     uint geometry_owns_hud_transform;
     uint reticle_pass;
     float reticle_half_extent_fraction;
-    uint sampling_padding;
+    uint filtered_sampling;
 };
 struct PixelInput {
     float4 position : SV_Position;
@@ -46813,11 +55023,32 @@ float3 srgb_to_linear(float3 value) {
         high, low,
         step(value, float3(0.04045, 0.04045, 0.04045)));
 }
+// Linear-light, alpha-premultiplied HUD texel; out-of-range Loads return 0
+// (transparent), so the HUD edges fade instead of smearing.
+float4 load_premultiplied(int2 coordinate) {
+    float4 texel = hud_texture.Load(int3(coordinate, 0));
+    texel.rgb = srgb_to_linear(texel.rgb) * texel.a;
+    return texel;
+}
+float4 bilinear_premultiplied(float2 position) {
+    float2 q = position - 0.5;
+    int2 base = int2(floor(q));
+    float2 f = q - float2(base);
+    float4 top = lerp(load_premultiplied(base),
+        load_premultiplied(base + int2(1, 0)), f.x);
+    float4 bottom = lerp(load_premultiplied(base + int2(0, 1)),
+        load_premultiplied(base + int2(1, 1)), f.x);
+    return lerp(top, bottom, f.y);
+}
 float4 ps_main(PixelInput input) : SV_Target0 {
     uint source_width, source_height;
     hud_texture.GetDimensions(source_width, source_height);
     float2 source_size = float2(source_width, source_height);
     float2 source_position = input.uv * source_size;
+    // Source texels covered by one target pixel (the HUD plane is usually
+    // minified, e.g. 2:1 at hud_size 0.5).
+    float2 footprint_x = ddx(source_position);
+    float2 footprint_y = ddy(source_position);
     int2 coordinate;
     if (geometry_owns_hud_transform != 0u) {
         // UVs are perspective-correct across the physical cyclopean plane.
@@ -46852,6 +55083,25 @@ float4 ps_main(PixelInput input) : SV_Target0 {
     if ((reticle_pass == 1u && inside_reticle) ||
         (reticle_pass == 2u && !inside_reticle)) {
         return float4(0.0, 0.0, 0.0, 0.0);
+    }
+    if (filtered_sampling != 0u && geometry_owns_hud_transform != 0u) {
+        // Box-filter the pixel footprint with up to 4x4 bilinear taps in
+        // premultiplied linear light. A single nearest Load drops 3 of 4 HUD
+        // texels at 2:1, which breaks glyph strokes and crawls with the head.
+        float footprint = max(length(footprint_x), length(footprint_y));
+        int taps = int(clamp(ceil(footprint - 0.01), 1.0, 4.0));
+        float4 sum = float4(0.0, 0.0, 0.0, 0.0);
+        for (int y = 0; y < taps; ++y) {
+            for (int x = 0; x < taps; ++x) {
+                float2 offset = (float2(x, y) + 0.5) / float(taps) - 0.5;
+                sum += bilinear_premultiplied(source_position +
+                    offset.x * footprint_x + offset.y * footprint_y);
+            }
+        }
+        sum /= float(taps * taps);
+        return sum.a > (1.0 / 1024.0)
+            ? float4(sum.rgb / sum.a, sum.a)
+            : float4(0.0, 0.0, 0.0, 0.0);
     }
     // [FIX:MODE3-HUD-SRGB 1/1] REDengine stores display-encoded HUD RGB in an
     // UNORM t1 view. Decode it before blending into the OpenXR sRGB projection
@@ -47345,7 +55595,12 @@ bool composite_mode3_hud_into_projection_image(
             center_valid = g_hmd_center_valid.load(
                 std::memory_order_acquire);
             if (center_valid) {
-                center_orientation = g_hmd_center_orientation;
+                // The head's pitch and roll at the recenter instant (often
+                // while the headset is being put on) would otherwise tilt and
+                // raise the whole HUD for the session.
+                center_orientation = g_config.hud_anchor_level
+                    ? g_hmd_center_yaw_orientation
+                    : g_hmd_center_orientation;
             }
         }
         if (center_valid) {
@@ -47357,6 +55612,53 @@ bool composite_mode3_hud_into_projection_image(
             }
         }
     }
+    // One scale origin for the cyclopean plane: the centre of the visible
+    // image (both eyes share their vertical FOV on Quest 3; average anyway).
+    float hud_scale_origin_tangent_y = NAN;
+    if (g_config.hud_scale_origin_visible && hud_size < 0.999f &&
+        submitted_views != nullptr) {
+        const float left_center =
+            w3vr::openxr_eye_geometry::visible_center_tangent_y(
+                submitted_views[0].fov);
+        const float right_center =
+            w3vr::openxr_eye_geometry::visible_center_tangent_y(
+                submitted_views[1].fov);
+        if (std::isfinite(left_center) && std::isfinite(right_center)) {
+            hud_scale_origin_tangent_y = (left_center + right_center) * 0.5f;
+        }
+    }
+    // [FIX:WORLD-MARKER-EXACT-HUD-PLANE 9/9] World markers are mapped onto this
+    // exact plane (scale and origin) by the next factory pairs.
+    if (controller_locked_hud_active) {
+        publish_world_marker_hud_plane(hud_size, hud_scale_origin_tangent_y);
+    }
+    // A shifted origin would also move the HUD texture centre (crosshair,
+    // aim prompts) off the aim axis. That centre square is drawn separately
+    // about the render centre, like the first-person reticle pass; on 5.01
+    // only while aiming (hud_centre_split_allowed).
+    const uint64_t centre_split_present =
+        g_present_count.load(std::memory_order_relaxed);
+    const bool hud_centre_split = std::isfinite(hud_scale_origin_tangent_y) &&
+        hud_centre_split_allowed(centre_split_present);
+    if (std::isfinite(hud_scale_origin_tangent_y) &&
+        g_hud_centre_split_active.load(std::memory_order_relaxed) !=
+            hud_centre_split) {
+        g_hud_centre_split_active.store(
+            hud_centre_split, std::memory_order_relaxed);
+        static std::atomic<uint32_t> centre_split_logs{};
+        if (g_config.world_marker_diagnostics &&
+            take_bounded_log_slot(centre_split_logs, 64)) {
+            const uint64_t crosshair_present =
+                g_aim_crosshair_last_present.load(std::memory_order_relaxed);
+            log_line("HUD centre split active=%d present=%llu crosshair_present=%lld",
+                hud_centre_split ? 1 : 0,
+                static_cast<unsigned long long>(centre_split_present),
+                crosshair_present != UINT64_MAX
+                    ? static_cast<long long>(crosshair_present) : -1ll);
+        }
+    }
+    std::array<float, 16> hud_centre_clip_positions[2]{};
+    bool hud_centre_visible = hud_centre_split;
     for (uint32_t eye = 0; eye < 2 && headset_projection; ++eye) {
         const auto& image_rect = submitted_views[eye].subImage.imageRect;
         const int64_t image_right = static_cast<int64_t>(image_rect.offset.x) +
@@ -47375,7 +55677,17 @@ bool composite_mode3_hud_into_projection_image(
                 build_cyclopean_hud_plane_clip_positions(
                     hud_plane_geometry, eye, source_render_fov,
                     submitted_views[eye].fov, hud_size,
-                    inverse_hud_distance, hud_clip_positions[eye]);
+                    inverse_hud_distance, hud_clip_positions[eye],
+                    hud_scale_origin_tangent_y);
+            if (hud_centre_split) {
+                hud_centre_visible = hud_centre_visible &&
+                    w3vr::openxr_eye_geometry::
+                        build_cyclopean_hud_plane_clip_positions(
+                            hud_plane_geometry, eye, source_render_fov,
+                            submitted_views[eye].fov, hud_size,
+                            inverse_hud_distance,
+                            hud_centre_clip_positions[eye]);
+            }
             if (controller_locked_hud_active) {
                 controller_hud_visible = controller_hud_visible &&
                     plane_visible;
@@ -47608,14 +55920,18 @@ bool composite_mode3_hud_into_projection_image(
             : hud_size;
         const float hud_scale_y = hud_size;
         constexpr float kReticleHalfExtentFraction = 0.08f;
+        const bool centre_split_draw = headset_projection &&
+            hud_centre_split && hud_centre_visible &&
+            controller_hud_visible && !distance_converged_reticle;
         uint32_t sampling_constants[8]{
             static_cast<uint32_t>(source_shift_x),
             static_cast<uint32_t>(source_shift_y),
             0,
             0,
             headset_projection ? 1u : 0u,
-            distance_converged_reticle ? 1u : 0u,
-            0, 0};
+            (distance_converged_reticle || centre_split_draw) ? 1u : 0u,
+            0,
+            g_config.hud_filtered_sampling ? 1u : 0u};
         memcpy(&sampling_constants[2], &hud_scale_x, sizeof(hud_scale_x));
         memcpy(&sampling_constants[3], &hud_scale_y, sizeof(hud_scale_y));
         memcpy(
@@ -47637,6 +55953,19 @@ bool composite_mode3_hud_into_projection_image(
                 1,
                 static_cast<UINT>(reticle_clip_positions[eye].size()),
                 reticle_clip_positions[eye].data(),
+                0);
+            g_xr_command_list->SetGraphicsRoot32BitConstants(
+                2,
+                static_cast<UINT>(std::size(sampling_constants)),
+                sampling_constants,
+                0);
+            g_draw_instanced(g_xr_command_list, 6, 1, 0, 0);
+        } else if (centre_split_draw) {
+            sampling_constants[5] = 2u;
+            g_xr_command_list->SetGraphicsRoot32BitConstants(
+                1,
+                static_cast<UINT>(hud_centre_clip_positions[eye].size()),
+                hud_centre_clip_positions[eye].data(),
                 0);
             g_xr_command_list->SetGraphicsRoot32BitConstants(
                 2,
@@ -48505,6 +56834,18 @@ bool create_openxr_swapchains() {
         g_mode3_hud_layer_available.store(
             hud_ready, std::memory_order_release);
     }
+    // [FIX:HUD-FADE-FILL 4/5] Without this pipeline uniform keeps the native
+    // fade instead of dropping it.
+    if (g_config.hud_fade_mode == Config::HudFadeMode::Uniform &&
+        g_engine_gui_fill_rect != nullptr) {
+        const bool fade_ready =
+            initialize_mode3_uniform_fade_pipeline(selected_format);
+        if (!fade_ready) {
+            log_line("HUD fade uniform pipeline unavailable; keeping the native fade");
+        }
+        g_mode3_uniform_fade_ready.store(
+            fade_ready, std::memory_order_release);
+    }
     const bool cinema_projection_ready =
         initialize_anchored_cinema_projection_pipeline(
             selected_format, image_count);
@@ -48561,9 +56902,24 @@ void initialize_openxr_probe() {
             return;
         }
 
-        g_openxr_loader = LoadLibraryA("openxr_loader.dll");
+        std::string loader_path = "openxr_loader.dll";
+        if (!g_config.test_openxr_loader.empty()) {
+            loader_path = g_config.test_openxr_loader;
+            const bool rooted = loader_path.size() >= 2 &&
+                (loader_path[1] == ':' || loader_path[0] == '\\' ||
+                    loader_path[0] == '/');
+            if (!rooted) {
+                char exe_path[MAX_PATH]{};
+                const DWORD length = GetModuleFileNameA(nullptr, exe_path, MAX_PATH);
+                std::string exe_dir(exe_path, length);
+                exe_dir.resize(exe_dir.find_last_of("\\/") + 1);
+                loader_path = exe_dir + loader_path;
+            }
+            log_line("OpenXR test loader override: %s", loader_path.c_str());
+        }
+        g_openxr_loader = LoadLibraryA(loader_path.c_str());
         if (g_openxr_loader == nullptr) {
-            log_line("OpenXR loader not found via LoadLibrary(openxr_loader.dll), gle=%lu", GetLastError());
+            log_line("OpenXR loader not found via LoadLibrary(%s), gle=%lu", loader_path.c_str(), GetLastError());
             return;
         }
 
@@ -48782,6 +57138,9 @@ void poll_openxr_events() {
 
             if (g_xr_session_state == XR_SESSION_STATE_READY && !g_xr_session_running) {
                 reset_native_asymmetric_noaa_state();
+                // [FEATURE:OPENXR-EARLY-FRAME-WAIT 2/5] A new session starts
+                // without a begun frame.
+                g_xr_early_frame_pending.store(false, std::memory_order_release);
                 XrSessionBeginInfo begin_info{XR_TYPE_SESSION_BEGIN_INFO};
                 begin_info.primaryViewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
                 const auto result = pfn_xrBeginSession(g_xr_session, &begin_info);
@@ -48794,6 +57153,9 @@ void poll_openxr_events() {
                        pfn_xrEndSession != nullptr) {
                 const auto result = pfn_xrEndSession(g_xr_session);
                 g_xr_session_running = false;
+                // xrEndSession discards a waited or begun frame, including
+                // one armed early after the last xrEndFrame.
+                g_xr_early_frame_pending.store(false, std::memory_order_release);
                 reset_native_asymmetric_noaa_state();
                 log_line("OpenXR xrEndSession result=%s (%d)", xr_result_name(result), result);
             }
@@ -48819,6 +57181,18 @@ XrQuaternionf multiply_quaternions(const XrQuaternionf& a, const XrQuaternionf& 
         a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
         a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
         a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z};
+}
+
+// Pitch that centres a menu/loading panel on the visible image instead of on
+// the straight-ahead axis (13 degrees down for the Quest 3 FOV of +44/-55).
+XrQuaternionf menu_visible_center_tilt(const XrFovf& fov) {
+    const float center_tangent =
+        w3vr::openxr_eye_geometry::visible_center_tangent_y(fov);
+    if (!g_config.menu_center_visible || !std::isfinite(center_tangent)) {
+        return XrQuaternionf{0.0f, 0.0f, 0.0f, 1.0f};
+    }
+    const float half_pitch = atanf(center_tangent) * 0.5f;
+    return XrQuaternionf{sinf(half_pitch), 0.0f, 0.0f, cosf(half_pitch)};
 }
 
 XrVector3f rotate_vector(const XrQuaternionf& rotation, const XrVector3f& vector) {
@@ -48885,6 +57259,18 @@ void update_runtime_eye_geometry() {
     }
 }
 
+// Heading of a yaw-only centre quaternion, for the recenter log lines.
+float hmd_center_heading_degrees(const XrQuaternionf& yaw_orientation) {
+    float heading = 2.0f * atan2f(yaw_orientation.y, yaw_orientation.w) *
+        (180.0f / 3.14159265358979323846f);
+    if (heading > 180.0f) {
+        heading -= 360.0f;
+    } else if (heading < -180.0f) {
+        heading += 360.0f;
+    }
+    return heading;
+}
+
 void update_hmd_freelook_pose() {
     if (!g_config.hmd_freelook || g_xr_views.size() < 2) {
         g_hmd_f9_latched.store(false, std::memory_order_relaxed);
@@ -48932,7 +57318,80 @@ void update_hmd_freelook_pose() {
         g_hmd_vertical_pitch_recenter_pending.store(
             true, std::memory_order_release);
     }
+    // [FEATURE:CINEMA-RESTORE-GAMEPLAY-RECENTER 3/5] Cinema exit: the centre
+    // gameplay used before the cutscene's auto-recenter becomes current
+    // again. A cutscene recenter requested but not applied yet is dropped,
+    // which leaves that gameplay centre in place. F9 always wins. The
+    // session's first centre (taken whenever OpenXR started, often in the
+    // menu) is never restored, so the auto-recenter that starts gameplay
+    // after a load keeps working as before.
+    static bool center_ever_set{};
+    static bool center_is_initial{};
+    auto& saved_gameplay_center = g_hmd_cinema_saved_gameplay_center;
+    if (g_hmd_cinema_center_restore_requested.exchange(
+            false, std::memory_order_acq_rel)) {
+        const bool pending_cinema_recenter =
+            g_hmd_cinema_recenter_save_requested.exchange(
+                false, std::memory_order_acq_rel);
+        if (!manual_recenter && saved_gameplay_center.valid) {
+            const float cinema_heading =
+                hmd_center_heading_degrees(g_hmd_center_yaw_orientation);
+            g_hmd_center_orientation = saved_gameplay_center.orientation;
+            g_hmd_center_yaw_orientation =
+                saved_gameplay_center.yaw_orientation;
+            g_hmd_center_position = saved_gameplay_center.position;
+            g_hmd_center_views[0] = saved_gameplay_center.views[0];
+            g_hmd_center_views[1] = saved_gameplay_center.views[1];
+            g_hmd_center_valid.store(true, std::memory_order_release);
+            g_hmd_center_gameplay_used.store(true, std::memory_order_relaxed);
+            log_line("HMD cinema gameplay centre restored present=%llu "
+                "gameplay_heading=%.2f cinema_heading=%.2f",
+                static_cast<unsigned long long>(g_present_count.load()),
+                hmd_center_heading_degrees(g_hmd_center_yaw_orientation),
+                cinema_heading);
+        } else if (!manual_recenter && pending_cinema_recenter &&
+            center_ever_set && !center_is_initial &&
+            !g_hmd_center_valid.load()) {
+            g_hmd_center_valid.store(true, std::memory_order_release);
+            log_line("HMD cinema recenter dropped at cinema exit present=%llu "
+                "gameplay_heading=%.2f",
+                static_cast<unsigned long long>(g_present_count.load()),
+                hmd_center_heading_degrees(g_hmd_center_yaw_orientation));
+        }
+        saved_gameplay_center.valid = false;
+    }
     if (manual_recenter || !g_hmd_center_valid.load()) {
+        // Only the cutscene auto-recenter saves the gameplay centre it
+        // replaces. F9 or any other recenter makes a saved centre obsolete.
+        const bool cinema_recenter =
+            g_hmd_cinema_recenter_save_requested.exchange(
+                false, std::memory_order_acq_rel) && !manual_recenter;
+        if (cinema_recenter && center_ever_set && !center_is_initial) {
+            saved_gameplay_center.orientation = g_hmd_center_orientation;
+            saved_gameplay_center.yaw_orientation =
+                g_hmd_center_yaw_orientation;
+            saved_gameplay_center.position = g_hmd_center_position;
+            saved_gameplay_center.views[0] = g_hmd_center_views[0];
+            saved_gameplay_center.views[1] = g_hmd_center_views[1];
+            saved_gameplay_center.valid = true;
+            log_line("HMD cinema gameplay centre saved present=%llu "
+                "gameplay_heading=%.2f",
+                static_cast<unsigned long long>(g_present_count.load()),
+                hmd_center_heading_degrees(g_hmd_center_yaw_orientation));
+        } else if (saved_gameplay_center.valid) {
+            saved_gameplay_center.valid = false;
+            log_line("HMD cinema gameplay centre discarded present=%llu "
+                "reason=%s",
+                static_cast<unsigned long long>(g_present_count.load()),
+                manual_recenter ? "manual" : "other_recenter");
+        } else if (cinema_recenter) {
+            log_line("HMD cinema gameplay centre not saved present=%llu "
+                "reason=initial_centre",
+                static_cast<unsigned long long>(g_present_count.load()));
+        }
+        center_is_initial = !center_ever_set;
+        center_ever_set = true;
+        g_hmd_center_gameplay_used.store(false, std::memory_order_relaxed);
         g_hmd_center_orientation = current;
         const float yaw_twist_length = sqrtf(
             current.y * current.y + current.w * current.w);
@@ -48944,8 +57403,15 @@ void update_hmd_freelook_pose() {
         g_hmd_center_views[0] = g_xr_views[0];
         g_hmd_center_views[1] = g_xr_views[1];
         g_hmd_center_valid.store(true);
-        log_line("HMD freelook recentered present=%llu",
-            static_cast<unsigned long long>(g_present_count.load()));
+        const XrVector3f recenter_forward =
+            rotate_vector(current, XrVector3f{0.0f, 0.0f, -1.0f});
+        const XrVector3f recenter_right =
+            rotate_vector(current, XrVector3f{1.0f, 0.0f, 0.0f});
+        log_line("HMD freelook recentered present=%llu head_pitch=%.2f head_roll=%.2f manual=%d",
+            static_cast<unsigned long long>(g_present_count.load()),
+            asinf(std::clamp(recenter_forward.y, -1.0f, 1.0f)) * 57.29578f,
+            asinf(std::clamp(recenter_right.y, -1.0f, 1.0f)) * 57.29578f,
+            manual_recenter ? 1 : 0);
     }
 
     const XrQuaternionf inverse_center_yaw{
@@ -49031,9 +57497,28 @@ void prepare_openxr_render_frame(uint32_t origin) {
         !g_xr_resources_ready || !g_xr_session_running) {
         return;
     }
+    // [FEATURE:OPENXR-EARLY-FRAME-WAIT 3/5] The render thread has already
+    // begun the next frame after the last xrEndFrame. Another Wait/Begin would
+    // discard it; the next submit consumes it and locates its own views.
+    if (g_xr_early_frame_pending.load(std::memory_order_acquire)) {
+        if (g_xr_early_frame_prepare_deferrals.fetch_add(
+                1, std::memory_order_relaxed) < 8) {
+            log_line("OpenXR early frame wait: prepare origin=%u deferred to the pending frame present=%llu",
+                origin,
+                static_cast<unsigned long long>(
+                    g_present_count.load(std::memory_order_relaxed)));
+        }
+        return;
+    }
 
     poll_openxr_events();
     if (!g_xr_session_running || g_xr_render_frame_prepared.load()) {
+        return;
+    }
+    const XrFrameWaitClaim wait_claim{};
+    if (!wait_claim.held ||
+        g_xr_early_frame_pending.load(std::memory_order_acquire) ||
+        g_xr_render_frame_prepared.load(std::memory_order_acquire)) {
         return;
     }
 
@@ -49120,9 +57605,13 @@ XrTime locate_openxr_mode3_pair_pose() {
         return 0;
     }
 
-    constexpr XrDuration kMode3PipelineLeadPeriods = 2;
+    // [PERF:PAIR-BARRIER-LAG 9/11] 2 periods unless lag 1 measured another
+    // depth; the completed time travels with the pair so its publication can
+    // measure the lead (mode3_pair_pose_lead_periods).
+    const XrDuration pipeline_lead_periods = mode3_pair_pose_lead_periods();
+    t_mode3_pair_pose_completed_time = completed_time;
     const XrTime target_time =
-        completed_time + period * kMode3PipelineLeadPeriods;
+        completed_time + period * pipeline_lead_periods;
 
     std::array<XrView, 2> located_views{{
         {XR_TYPE_VIEW}, {XR_TYPE_VIEW}}};
@@ -50708,9 +59197,42 @@ bool update_packed_eye_cache() {
                     native_dlss_input_mask, native_pair_generation,
                     generation);
             }
+            // [FEATURE:REMASTER-ASYMMETRIC-NDC] A rejected pair holds the
+            // previous image; if per-eye pairs keep failing, return to the
+            // symmetric envelope instead of freezing the headset image.
+            // Runs on every Present while the rejected pair is the newest
+            // capture: count each pair (and generation) once.
+            static uint64_t randc_counted_pair{};
+            static uint32_t randc_counted_generation{UINT32_MAX};
+            const bool randc_new_rejection =
+                remaster_asymmetric_ndc_configured() && native_pair != nullptr &&
+                (accepted_pair != randc_counted_pair ||
+                    generation != randc_counted_generation);
+            if (randc_new_rejection) {
+                randc_counted_pair = accepted_pair;
+                randc_counted_generation = generation;
+            }
+            if (randc_new_rejection &&
+                g_randc_consecutive_rejected_pairs.fetch_add(
+                    1, std::memory_order_relaxed) + 1 >= 90 &&
+                g_runtime_randc.exchange(false, std::memory_order_acq_rel)) {
+                log_line(
+                    "RANDC disabled reason=consecutive_pair_rejections pair=%llu "
+                    "factory_mask=0x%X captured=%d,%d",
+                    static_cast<unsigned long long>(accepted_pair),
+                    native_factory_mask, captured_native_eye0 ? 1 : 0,
+                    captured_native_eye1 ? 1 : 0);
+            }
             return false;
         }
     }
+    if (native_pair_complete) {
+        g_randc_accepted_pairs.fetch_add(1, std::memory_order_relaxed);
+    } else if (remaster_asymmetric_ndc_configured()) {
+        g_randc_symmetric_pairs.fetch_add(1, std::memory_order_relaxed);
+    }
+    // Any accepted pair ends a run of rejections.
+    g_randc_consecutive_rejected_pairs.store(0, std::memory_order_relaxed);
 
     // [FIX:MODE3-STRICT-PREVIOUS-HUD 2/2] Freeze the exact scene predecessor
     // before advancing the scene cache. This is a relation between accepted
@@ -50869,8 +59391,12 @@ bool ensure_streamline_capture_ring(const D3D12_RESOURCE_DESC& source_desc) {
     heap_props.CreationNodeMask = 1;
     heap_props.VisibleNodeMask = 1;
 
+    // [PERF:PAIR-BARRIER-LAG 10/11] Slots past streamline_capture_ring_slots()
+    // stay null; every reader skips a slot without a resource.
     for (auto& eye_ring : g_streamline_capture_ring) {
-        for (auto& slot : eye_ring) {
+        for (uint32_t index = 0; index < streamline_capture_ring_slots();
+                ++index) {
+            auto& slot = eye_ring[index];
             if (FAILED(g_d3d12_device->CreateCommittedResource(
                     &heap_props,
                     D3D12_HEAP_FLAG_NONE,
@@ -50886,11 +59412,12 @@ bool ensure_streamline_capture_ring(const D3D12_RESOURCE_DESC& source_desc) {
     g_streamline_capture_width = static_cast<UINT>(source_desc.Width);
     g_streamline_capture_height = source_desc.Height;
     g_streamline_capture_format = capture_format;
-    log_line("Streamline stereo capture ring created size=%ux%u format=%u source_format=%u",
+    log_line("Streamline stereo capture ring created size=%ux%u format=%u source_format=%u slots=%u",
         g_streamline_capture_width,
         g_streamline_capture_height,
         static_cast<unsigned>(g_streamline_capture_format),
-        static_cast<unsigned>(source_desc.Format));
+        static_cast<unsigned>(source_desc.Format),
+        streamline_capture_ring_slots());
     return true;
 }
 
@@ -50908,10 +59435,10 @@ bool reserve_streamline_capture_slot(
     std::scoped_lock lock{g_streamline_capture_mutex};
     const uint64_t start = g_streamline_capture_write_count[eye].fetch_add(
         1, std::memory_order_relaxed);
-    for (uint32_t offset = 0;
-            offset < kStreamlineCaptureRingSize; ++offset) {
+    const uint32_t ring_slots = streamline_capture_ring_slots();
+    for (uint32_t offset = 0; offset < ring_slots; ++offset) {
         const uint32_t candidate_index = static_cast<uint32_t>(
-            (start + offset) % kStreamlineCaptureRingSize);
+            (start + offset) % ring_slots);
         auto& candidate = g_streamline_capture_ring[eye][candidate_index];
         if (candidate.recording_pending || candidate.resource == nullptr ||
             !private_resource_slot_retired(
@@ -50931,6 +59458,7 @@ bool reserve_streamline_capture_slot(
         slot_index = candidate_index;
         return true;
     }
+    g_streamline_capture_ring_full.fetch_add(1, std::memory_order_relaxed);
     return false;
 }
 
@@ -51159,6 +59687,150 @@ DXGI_FORMAT dxgi_copy_family(DXGI_FORMAT format) {
     }
 }
 
+// [FEATURE:OPENXR-EARLY-FRAME-WAIT 4/5] The pair-bound strict-Stereo
+// lifecycle (one runtime frame per published pair), the same predicate as
+// pair_bound_openxr_frame in the Present hook.
+bool openxr_early_frame_wait_active() {
+    return g_config.frame_wait_early &&
+        mode3_stereo_transport_active() &&
+        g_engine_dual_render_active.load(std::memory_order_acquire) &&
+        !mode3_aer_presentation_active();
+}
+
+// Render-thread counters; written to the diagnostic log only.
+struct OpenXrEarlyFrameWaitStats {
+    uint64_t armed{};
+    uint64_t consumed{};
+    uint64_t inline_frames{};
+    uint64_t failures{};
+    int64_t armed_qpc{};
+    uint32_t window_frames{};
+    double window_wait_ms{};
+    double window_wait_max_ms{};
+    double window_pending_ms{};
+};
+OpenXrEarlyFrameWaitStats g_xr_early_frame_stats{};
+
+// Standard OpenXR loop order: wait for and begin the next frame right after
+// xrEndFrame, on the same render thread. The runtime pacer then measures the
+// real application time (its wake-up to xrEndFrame spans a whole pair). With
+// the inline order it saw only the few milliseconds between Wait and End,
+// took the application for fast and could sleep each pair to a display slot
+// (WiVRn's app pacer), which locks the pair rate to whole periods, e.g. 30
+// pairs/s at 90 Hz for a 25 ms pair.
+void begin_openxr_frame_early() {
+    if (!g_config.frame_wait_early) {
+        return;
+    }
+    const bool active = openxr_early_frame_wait_active();
+    static bool configuration_logged{};
+    if (!configuration_logged) {
+        configuration_logged = true;
+        log_line("OpenXR early frame wait configured=1 pair_bound=%d present=%llu",
+            active ? 1 : 0,
+            static_cast<unsigned long long>(
+                g_present_count.load(std::memory_order_relaxed)));
+    }
+    if (!active || !g_xr_session_running ||
+        g_xr_early_frame_pending.load(std::memory_order_acquire) ||
+        g_xr_render_frame_prepared.load(std::memory_order_acquire)) {
+        return;
+    }
+    const XrFrameWaitClaim wait_claim{};
+    if (!wait_claim.held ||
+        g_xr_early_frame_pending.load(std::memory_order_acquire) ||
+        g_xr_render_frame_prepared.load(std::memory_order_acquire)) {
+        return;
+    }
+
+    auto& stats = g_xr_early_frame_stats;
+    XrFrameWaitInfo wait_info{XR_TYPE_FRAME_WAIT_INFO};
+    XrFrameState frame_state{XR_TYPE_FRAME_STATE};
+    const int64_t wait_qpc = present_phase_qpc_now();
+    const int64_t flight_wait_begin = w3vr::pipeline_flight::cpu_begin();
+    XrResult result = pfn_xrWaitFrame(g_xr_session, &wait_info, &frame_state);
+    w3vr::pipeline_flight::cpu_end(
+        w3vr::pipeline_flight::Phase::XrWaitFrame,
+        flight_wait_begin);
+    const int64_t woke_qpc = present_phase_qpc_now();
+    if (XR_FAILED(result)) {
+        if (++stats.failures <= 8) {
+            log_taau_trace_line("OpenXR early xrWaitFrame result=%s (%d)", xr_result_name(result), result);
+        }
+        return;
+    }
+
+    XrFrameBeginInfo begin_info{XR_TYPE_FRAME_BEGIN_INFO};
+    result = pfn_xrBeginFrame(g_xr_session, &begin_info);
+    if (XR_FAILED(result)) {
+        if (++stats.failures <= 8) {
+            log_taau_trace_line("OpenXR early xrBeginFrame result=%s (%d)", xr_result_name(result), result);
+        }
+        return;
+    }
+    g_xr_early_frame_state = frame_state;
+    g_xr_early_frame_pending.store(true, std::memory_order_release);
+    if (taau_drop_diagnostics_active()) {
+        g_xr_frame_begin_qpc.store(
+            present_phase_qpc_now(), std::memory_order_relaxed);
+        g_xr_frame_begin_present.store(
+            g_present_count.load(std::memory_order_relaxed),
+            std::memory_order_relaxed);
+        g_xr_frame_prepare_origin.store(4, std::memory_order_relaxed);
+    }
+
+    const double wait_ms = present_phase_qpc_ms(wait_qpc, woke_qpc);
+    if (stats.armed++ == 0) {
+        log_line("OpenXR early frame wait armed first frame present=%llu wait_ms=%.3f period_ns=%lld",
+            static_cast<unsigned long long>(
+                g_present_count.load(std::memory_order_relaxed)),
+            wait_ms,
+            static_cast<long long>(frame_state.predictedDisplayPeriod));
+    }
+    stats.armed_qpc = woke_qpc;
+    stats.window_wait_ms += wait_ms;
+    stats.window_wait_max_ms = std::max(stats.window_wait_max_ms, wait_ms);
+}
+
+// Takes the frame begun by begin_openxr_frame_early, if any. A pair that
+// finds none (first pair, after a failure or a session restart, or after
+// leaving the pair-bound lifecycle) waits and begins inline as before.
+bool consume_openxr_early_frame(XrFrameState& frame_state) {
+    auto& stats = g_xr_early_frame_stats;
+    if (!g_xr_early_frame_pending.exchange(false, std::memory_order_acq_rel)) {
+        if (openxr_early_frame_wait_active() &&
+            ++stats.inline_frames <= 8) {
+            log_line("OpenXR early frame wait: no pending frame, inline wait present=%llu armed=%llu",
+                static_cast<unsigned long long>(
+                    g_present_count.load(std::memory_order_relaxed)),
+                static_cast<unsigned long long>(stats.armed));
+        }
+        return false;
+    }
+    frame_state = g_xr_early_frame_state;
+    ++stats.consumed;
+    ++stats.window_frames;
+    stats.window_pending_ms += present_phase_qpc_ms(
+        stats.armed_qpc, present_phase_qpc_now());
+    constexpr uint32_t kSummaryFrames = 1024;
+    if (stats.window_frames >= kSummaryFrames) {
+        log_line("OpenXR early frame wait armed=%llu consumed=%llu inline=%llu failed=%llu prepare_deferred=%u wait_ms mean=%.3f max=%.3f pending_ms mean=%.3f",
+            static_cast<unsigned long long>(stats.armed),
+            static_cast<unsigned long long>(stats.consumed),
+            static_cast<unsigned long long>(stats.inline_frames),
+            static_cast<unsigned long long>(stats.failures),
+            g_xr_early_frame_prepare_deferrals.load(std::memory_order_relaxed),
+            stats.window_wait_ms / stats.window_frames,
+            stats.window_wait_max_ms,
+            stats.window_pending_ms / stats.window_frames);
+        stats.window_frames = 0;
+        stats.window_wait_ms = 0.0;
+        stats.window_wait_max_ms = 0.0;
+        stats.window_pending_ms = 0.0;
+    }
+    return true;
+}
+
 void render_openxr_test_frame(
     PoseTimelineEvent trace_reason = PoseTimelineEvent::SubmitOther,
     uint64_t trace_pair_id = 0) {
@@ -51186,38 +59858,50 @@ void render_openxr_test_frame(
         trace_reason == PoseTimelineEvent::SubmitRescue;
     const bool frame_was_prepared =
         g_xr_render_frame_prepared.load(std::memory_order_acquire);
+    // [FEATURE:OPENXR-EARLY-FRAME-WAIT 5/5] A frame begun right after the
+    // previous xrEndFrame replaces the inline Wait/Begin. Its predicted
+    // display time locates the views below and is this frame's xrEndFrame
+    // display time.
+    const bool frame_was_begun_early =
+        !frame_was_prepared && consume_openxr_early_frame(frame_state);
     if (frame_was_prepared) {
         frame_state = g_xr_render_frame_state;
         views_valid = g_xr_render_views_valid;
         located_view_state_flags = g_xr_render_view_state_flags.load(
             std::memory_order_acquire);
     } else {
-        XrFrameWaitInfo wait_info{XR_TYPE_FRAME_WAIT_INFO};
-        const int64_t flight_wait_begin =
-            w3vr::pipeline_flight::cpu_begin();
-        result = pfn_xrWaitFrame(
-            g_xr_session, &wait_info, &frame_state);
-        w3vr::pipeline_flight::cpu_end(
-            w3vr::pipeline_flight::Phase::XrWaitFrame,
-            flight_wait_begin);
-        if (XR_FAILED(result)) {
-            log_taau_trace_line("OpenXR xrWaitFrame result=%s (%d)", xr_result_name(result), result);
-            return;
-        }
+        if (!frame_was_begun_early) {
+            XrFrameWaitInfo wait_info{XR_TYPE_FRAME_WAIT_INFO};
+            const int64_t flight_wait_begin =
+                w3vr::pipeline_flight::cpu_begin();
+            result = pfn_xrWaitFrame(
+                g_xr_session, &wait_info, &frame_state);
+            w3vr::pipeline_flight::cpu_end(
+                w3vr::pipeline_flight::Phase::XrWaitFrame,
+                flight_wait_begin);
+            if (XR_FAILED(result)) {
+                log_taau_trace_line("OpenXR xrWaitFrame result=%s (%d)", xr_result_name(result), result);
+                return;
+            }
+            if (trace_reason == PoseTimelineEvent::SubmitReal) {
+                observe_pair_rate_phase(frame_state.predictedDisplayTime,
+                    frame_state.predictedDisplayPeriod);
+            }
 
-        XrFrameBeginInfo begin_info{XR_TYPE_FRAME_BEGIN_INFO};
-        result = pfn_xrBeginFrame(g_xr_session, &begin_info);
-        if (XR_FAILED(result)) {
-            log_taau_trace_line("OpenXR xrBeginFrame result=%s (%d)", xr_result_name(result), result);
-            return;
-        }
-        if (taau_drop_diagnostics_active()) {
-            g_xr_frame_begin_qpc.store(
-                present_phase_qpc_now(), std::memory_order_relaxed);
-            g_xr_frame_begin_present.store(
-                g_present_count.load(std::memory_order_relaxed),
-                std::memory_order_relaxed);
-            g_xr_frame_prepare_origin.store(3, std::memory_order_relaxed);
+            XrFrameBeginInfo begin_info{XR_TYPE_FRAME_BEGIN_INFO};
+            result = pfn_xrBeginFrame(g_xr_session, &begin_info);
+            if (XR_FAILED(result)) {
+                log_taau_trace_line("OpenXR xrBeginFrame result=%s (%d)", xr_result_name(result), result);
+                return;
+            }
+            if (taau_drop_diagnostics_active()) {
+                g_xr_frame_begin_qpc.store(
+                    present_phase_qpc_now(), std::memory_order_relaxed);
+                g_xr_frame_begin_present.store(
+                    g_present_count.load(std::memory_order_relaxed),
+                    std::memory_order_relaxed);
+                g_xr_frame_prepare_origin.store(3, std::memory_order_relaxed);
+            }
         }
 
         XrViewState view_state{XR_TYPE_VIEW_STATE};
@@ -51441,6 +60125,14 @@ void render_openxr_test_frame(
                     g_engine_completed_tag_queue_mutex};
                 g_engine_completed_tag_queue.clear();
             }
+        }
+        // [FEATURE:CINEMA-RESTORE-GAMEPLAY-RECENTER 4/5] Leaving cinema hands
+        // the gameplay centre saved by its auto-recenter back to the next
+        // HMD pose update.
+        if (previous_cinema && !cinema_mode &&
+            g_config.cinema_restore_gameplay_recenter) {
+            g_hmd_cinema_center_restore_requested.store(
+                true, std::memory_order_release);
         }
         log_cinema_camera_diagnostic(
             "OpenXR cinema mode active=%d present=%llu last_hmd=%llu "
@@ -54600,6 +63292,22 @@ void render_openxr_test_frame(
             current_present, hud_scene_pair_id, unsigned(command_list_recording),
             unsigned(submitted), unsigned(hud_composite_ready), unsigned(cinema_panel),
             unsigned(cinema_projection_panel_ready));
+        // [FIX:HUD-FADE-FILL 5/5] Uniform fade under the HUD plane; it does
+        // not depend on the HUD composite, so bootstrap frames fade too.
+        uint32_t uniform_fade_rgba{};
+        if (latched_gui_fade_colour(current_present, uniform_fade_rgba) &&
+            g_config.hud_fade_mode == Config::HudFadeMode::Uniform &&
+            command_list_recording && submitted &&
+            !fullscreen_menu && !cinema_panel &&
+            record_mode3_uniform_fade(swapchain, image_index,
+                projection_views.data(), uniform_fade_rgba)) {
+            static std::atomic<uint32_t> uniform_fade_logs{};
+            if (take_bounded_log_slot(uniform_fade_logs, 16)) {
+                log_line("fade fill uniform drawn rgba=%08X image=%u present=%llu",
+                    uniform_fade_rgba, image_index,
+                    static_cast<unsigned long long>(current_present));
+            }
+        }
         const bool fsr_hudless_recorded =
             command_list_recording && submitted && hud_composite_ready &&
             (!cinema_panel || cinema_projection_panel_ready) &&
@@ -54844,6 +63552,12 @@ void render_openxr_test_frame(
                   0.0f,
                   tracked_orientation.w / yaw_twist_length}
             : XrQuaternionf{0.0f, 0.0f, 0.0f, 1.0f};
+        if (fullscreen_menu) {
+            anchored_panel_pose.orientation =
+                w3vr::openxr_eye_geometry::multiply(
+                    anchored_panel_pose.orientation,
+                    menu_visible_center_tilt(anchor_views[0].fov));
+        }
         const XrVector3f head_position{
             (anchor_views[0].pose.position.x +
                 anchor_views[1].pose.position.x) * 0.5f,
@@ -54879,10 +63593,15 @@ void render_openxr_test_frame(
     menu_layer.space = anchored_panel_pose_valid
         ? g_xr_space
         : g_xr_view_space;
-    menu_layer.pose = anchored_panel_pose_valid
-        ? anchored_panel_pose
-        : XrPosef{{0.0f, 0.0f, 0.0f, 1.0f},
-            {0.0f, 0.0f, -g_config.menu_distance}};
+    if (anchored_panel_pose_valid) {
+        menu_layer.pose = anchored_panel_pose;
+    } else {
+        const XrQuaternionf view_tilt = fullscreen_menu && views_valid
+            ? menu_visible_center_tilt(g_xr_views[0].fov)
+            : XrQuaternionf{0.0f, 0.0f, 0.0f, 1.0f};
+        menu_layer.pose = XrPosef{view_tilt, rotate_vector(view_tilt,
+            XrVector3f{0.0f, 0.0f, -g_config.menu_distance})};
+    }
     const float spatial_panel_scale = cinema_panel && !fullscreen_menu
         ? g_config.cinema_scale
         : g_config.menu_scale;
@@ -55069,11 +63788,18 @@ void render_openxr_test_frame(
             frame_state.predictedDisplayPeriod, std::memory_order_relaxed);
         g_xr_last_completed_display_time.store(
             frame_state.predictedDisplayTime, std::memory_order_release);
+        // [PERF:PAIR-BARRIER-LAG 11/11] Measures the pair pose lead.
+        observe_mode3_pair_pose_publication(trace_reason, trace_pair_id,
+            frame_state.predictedDisplayTime,
+            frame_state.predictedDisplayPeriod);
     }
     g_xr_frame_begin_qpc.store(0, std::memory_order_relaxed);
     g_xr_frame_begin_present.store(0, std::memory_order_relaxed);
     g_xr_frame_prepare_origin.store(0, std::memory_order_relaxed);
     g_xr_render_frame_prepared.store(false);
+    if (XR_SUCCEEDED(result)) {
+        begin_openxr_frame_early();
+    }
     if (trace_layer_transition) {
         log_taau_trace_line("OpenXR layer transition xrEndFrame result=%s (%d) present=%llu",
             xr_result_name(result), result,
@@ -55456,6 +64182,7 @@ HRESULT STDMETHODCALLTYPE hook_present(IDXGISwapChain* swapchain, UINT sync_inte
     }
 
     const auto frame = ++g_present_count;
+    latch_streamline_menu_mono();
     record_route_flight_present(frame);
     test_mode_on_present(frame);
     test_mode_capture_if_pending(swapchain);
@@ -55590,10 +64317,16 @@ HRESULT STDMETHODCALLTYPE hook_present(IDXGISwapChain* swapchain, UINT sync_inte
     // three-state counter shared with the companion WitcherScript.
     const auto announce_camera_mode = [&](
         int camera_mode, const char* trigger) {
-        const char* names[] = {"main", "close", "first_person"};
-        log_line("Camera mode toggled trigger=%s mode=%d name=%s close=%.3f first_right=%.3f first_forward=%.3f first_eye_nudge=%.3f first_up=%.3f first_horizontal_forward=%.3f first_world_z=%.3f first_dynamic_anchor=%d present=%llu",
+        // [FEATURE:CAMERA-CENTRE 6/6] F8 compares the game's own shoulder
+        // camera (0) with the VR centred view (1: Geralt centred plus the
+        // near-view distance; only the distance when camera_center=0).
+        const char* names[] = {"vanilla_shoulder",
+            g_config.camera_center > 0.0f ? "vr_centred" : "near",
+            "first_person"};
+        log_line("Camera mode toggled trigger=%s mode=%d name=%s close=%.3f centre=%.2f first_right=%.3f first_forward=%.3f first_eye_nudge=%.3f first_up=%.3f first_horizontal_forward=%.3f first_world_z=%.3f first_dynamic_anchor=%d present=%llu",
             trigger, camera_mode, names[camera_mode],
             g_config.engine_close_camera_offset,
+            g_config.camera_center,
             g_config.engine_first_person_camera_right_offset,
             g_config.engine_first_person_camera_offset,
             g_config.engine_first_person_camera_eye_nudge,
@@ -56021,10 +64754,21 @@ HRESULT STDMETHODCALLTYPE hook_present(IDXGISwapChain* swapchain, UINT sync_inte
             // Reuse the exact F9 recenter path on the next located HMD pose.
             // Trigger only after OpenXR has accepted the first real packed
             // pair, so tutorial/camera state cannot center us prematurely.
+            // [FEATURE:CINEMA-RESTORE-GAMEPLAY-RECENTER 5/5] Inside a cutscene
+            // that interrupted gameplay, the centre it replaces is saved
+            // first. An arm left over from a cinema that produced no pair
+            // fires in gameplay and stays a plain recenter.
+            const bool save_gameplay_center =
+                g_config.cinema_restore_gameplay_recenter &&
+                g_cinema_mode_active.load(std::memory_order_relaxed) &&
+                g_hmd_center_gameplay_used.load(std::memory_order_relaxed);
+            g_hmd_cinema_recenter_save_requested.store(
+                save_gameplay_center, std::memory_order_release);
             g_hmd_center_valid.store(false, std::memory_order_release);
-            log_line("HMD auto-recenter armed by first packed pair=%llu present=%llu",
+            log_line("HMD auto-recenter armed by first packed pair=%llu present=%llu save_gameplay=%d",
                 static_cast<unsigned long long>(g_packed_accepted_pair_id),
-                static_cast<unsigned long long>(frame));
+                static_cast<unsigned long long>(frame),
+                save_gameplay_center ? 1 : 0);
         }
         constexpr uint64_t kOpenXrRescueCadencePresents = 2;
         constexpr uint64_t kCinemaRescueCadencePresents = 8;
@@ -56178,6 +64922,7 @@ HRESULT STDMETHODCALLTYPE hook_present1(
     handle_f3_capture_hotkey(swapchain);
     handle_puredark_afw_visual_debug_hotkey();
     const auto frame = ++g_present_count;
+    latch_streamline_menu_mono();
     record_route_flight_present(frame);
     test_mode_on_present(frame);
     test_mode_capture_if_pending(swapchain);
@@ -56613,10 +65358,99 @@ extern "C" HRESULT WINAPI DXGIDisableVBlankVirtualization() {
     return hr;
 }
 
+// [FEATURE:REMASTER-SL-WINE-GATE] Remastered 5.01 does not create its Streamline
+// manager when ntdll exports wine_get_version (jne at RVA 0x01B788CB), so DLSS
+// never initialises under Proton. With [engine] remaster_sl_wine_bypass=1, or
+// unset with a DLSS temporal_backend, the jump is replaced by NOPs. This must
+// happen before the game's render init, so it runs from DllMain: kernel32
+// only, no logging, no LoadLibrary. The result is logged later by
+// log_remaster_streamline_wine_bypass().
+enum class RemasterSlWineBypass : int {
+    Off = 0,
+    Patched = 1,
+    OtherBuild = 2,
+    BytesMismatch = 3,
+    ProtectFailed = 4,
+};
+std::atomic<int> g_remaster_sl_wine_bypass{
+    static_cast<int>(RemasterSlWineBypass::Off)};
+
+void install_remaster_streamline_wine_bypass() {
+    wchar_t ini_path[MAX_PATH]{};
+    const DWORD length = GetModuleFileNameW(nullptr, ini_path, MAX_PATH);
+    if (length == 0 || length >= MAX_PATH) {
+        return;
+    }
+    wchar_t* slash = wcsrchr(ini_path, L'\\');
+    if (slash == nullptr ||
+        wcscpy_s(slash + 1, MAX_PATH - (slash + 1 - ini_path), L"witcher3vr.ini") != 0) {
+        return;
+    }
+    // Default: on when the 5.01 engine DLSS is requested ([engine]
+    // temporal_backend=dlss). The jump is only taken under Wine, so the patch
+    // changes nothing on Windows.
+    const int bypass = static_cast<int>(GetPrivateProfileIntW(
+        L"engine", L"remaster_sl_wine_bypass", -1, ini_path));
+    if (bypass == 0) {
+        return;
+    }
+    if (bypass < 0) {
+        wchar_t backend[16]{};
+        GetPrivateProfileStringW(L"engine", L"temporal_backend", L"",
+            backend, static_cast<DWORD>(std::size(backend)), ini_path);
+        // The aliases parse_temporal_backend() maps to DLSS.
+        if (_wcsicmp(backend, L"dlss") != 0 &&
+            _wcsicmp(backend, L"dlss_packed") != 0 &&
+            _wcsicmp(backend, L"packed_dlss") != 0 &&
+            _wcsicmp(backend, L"dlss_sbs") != 0) {
+            return;
+        }
+    }
+    auto* image = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(image);
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(image + dos->e_lfanew);
+    const auto build = w3vr::game_build::identify(
+        nt->FileHeader.TimeDateStamp, nt->OptionalHeader.SizeOfImage);
+    if (build != w3vr::game_build::Build::Remaster501) {
+        g_remaster_sl_wine_bypass.store(static_cast<int>(RemasterSlWineBypass::OtherBuild));
+        return;
+    }
+    // call [GetProcAddress]; test rax,rax; jne +0x42; cmp [rip+..], r13
+    static constexpr uint8_t kContext[] = {
+        0xFF, 0x15, 0x68, 0x3F, 0xE1, 0x00, 0x48, 0x85, 0xC0,
+        0x75, 0x42, 0x4C, 0x39, 0x2D, 0x74, 0xF5, 0xCD, 0x03};
+    constexpr uintptr_t kContextRva = 0x01B788C2;
+    constexpr size_t kJumpOffset = 9;
+    uint8_t* context = image + kContextRva;
+    if (std::memcmp(context, kContext, sizeof(kContext)) != 0) {
+        g_remaster_sl_wine_bypass.store(static_cast<int>(RemasterSlWineBypass::BytesMismatch));
+        return;
+    }
+    DWORD old_protect = 0;
+    if (!VirtualProtect(context + kJumpOffset, 2, PAGE_EXECUTE_READWRITE, &old_protect)) {
+        g_remaster_sl_wine_bypass.store(static_cast<int>(RemasterSlWineBypass::ProtectFailed));
+        return;
+    }
+    context[kJumpOffset] = 0x90;
+    context[kJumpOffset + 1] = 0x90;
+    VirtualProtect(context + kJumpOffset, 2, old_protect, &old_protect);
+    FlushInstructionCache(GetCurrentProcess(), context + kJumpOffset, 2);
+    g_remaster_sl_wine_bypass.store(static_cast<int>(RemasterSlWineBypass::Patched));
+}
+
+void log_remaster_streamline_wine_bypass() {
+    static constexpr const char* kNames[] = {
+        "off", "patched", "other_build", "bytes_mismatch", "protect_failed"};
+    const int result = g_remaster_sl_wine_bypass.load();
+    log_line("Remaster Streamline Wine gate bypass=%s rva=0x1B788CB",
+        result >= 0 && result < 5 ? kNames[result] : "unknown");
+}
+
 BOOL APIENTRY DllMain(HMODULE module, DWORD reason, void* reserved) {
     if (reason == DLL_PROCESS_ATTACH) {
         g_proxy_module = module;
         DisableThreadLibraryCalls(module);
+        install_remaster_streamline_wine_bypass();
     } else if (reason == DLL_PROCESS_DETACH) {
         // At process termination dependency teardown order is unspecified and
         // the OS reclaims every object. In particular, RenderDoc may already

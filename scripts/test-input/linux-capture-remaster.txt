@@ -1,0 +1,22 @@
+# Linux capture run for Remastered 5.01 (Proton loads much slower than Windows): start, skip intros,
+# Continue the latest save, then capture repeatedly so some captures land in gameplay, walk a bit,
+# capture, quit. Times are ms since the first Present. Each "capture" writes the backbuffer and,
+# when a stereo pair exists, both XR eye images (xr_eye0/1) to bin/x64_dx12/witcher3vr_captures/.
+14000 tap A            # "press any key": gamepad input
+15500 tap X            # skip intro part 1
+18500 tap X            # skip intro part 2
+22000 tap X            # skip intro part 3
+26000 tap X            # extra skip (slower start on Linux)
+32000 tap A            # main menu: Continue (latest save)
+36000 capture          # loading screen
+90000 capture
+120000 capture
+150000 capture
+180000 capture
+210000 capture
+211000 stick L 0 1     # walk forward
+214000 stick L 0 0
+215000 capture
+230000 tap BACK        # system menu (pause)
+234000 capture         # pause menu with the world behind it
+240000 quit            # close the game window

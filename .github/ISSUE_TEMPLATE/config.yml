@@ -1,5 +1,8 @@
 blank_issues_enabled: false
 contact_links:
+  - name: Original Witcher 3 VR (Next-Gen 4.04)
+    url: https://github.com/tig3rmast3r/witcher3-vr
+    about: The original mod by tig3rmast3r, for patch 4.04. Report 4.04 problems there.
   - name: Flat2VR community
     url: https://www.flat2vr.com/
     about: Community discussion and general VR troubleshooting

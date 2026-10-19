@@ -1843,13 +1843,30 @@ bool BuildUpdatedDocuments(const ConfigPaths& paths, const LauncherState& state,
     game_settings.Set("Viewport", "Resolution", "\"" +
         std::to_string(state.width) + "x" + std::to_string(state.height) + "\"");
     if (state.remastered) {
-        // Remastered 5.x: the mod runs the No-AA route with the game's FXAA
-        // (5.x AAMode values: 0 off, 1 FXAA, 5 FSR, 6 DLSS, 7 XeSS). The Fast
+        // Remastered 5.x (AAMode values: 0 off, 1 FXAA, 5 FSR, 6 DLSS, 7 XeSS).
+        // The mod's transport is the No-AA route; with a DLSS mode the game
+        // runs its own DLSS and the DLL gives each eye its own Streamline
+        // viewport and history. Otherwise the game's FXAA. The Fast
         // Transitions DLC modifies 4.04 behavior data and stays disabled.
-        game_settings.Set("PostProcess", "AAMode", "1");
-        game_settings.Set("Rendering", "AllowDLSS", "false");
+        game_settings.Set("PostProcess", "AAMode", mode.allow_dlss ? "6" : "1");
+        game_settings.Set("Rendering", "AllowDLSS",
+            mode.allow_dlss ? "true" : "false");
+        if (mode.allow_dlss) {
+            // 5.x DLSSQuality: 1 Quality, 2 Balanced, 3 Performance,
+            // 4 Ultra Performance, 5 DLAA (0 is Auto).
+            game_settings.Set("PostProcess", "DLSSQuality",
+                std::to_string(state.dlss_quality == 0
+                    ? 5
+                    : std::clamp(state.dlss_quality, 1, 4)));
+            // The mod presents its own eye pairs: no frame generation or Reflex.
+            game_settings.Set("Rendering", "AllowDLSSG", "false");
+            game_settings.Set("Rendering", "AllowReflex", "false");
+        }
         game_settings.Set("DLC", "DlcEnabled_movementinputfix", "0");
-        // The native asymmetric projection is not ported to 5.x yet.
+        // 5.x does not use the 4.04 native_stereo path (its view centre
+        // block holds the DLSS jitter there); per-eye frusta come from
+        // [engine] remaster_asymmetric_ndc instead. The launcher does not
+        // write that key, so it keeps its INI value (off by default).
         vr_ini.Set("openxr", "native_stereo", "0");
         return true;
     }
@@ -2062,9 +2079,19 @@ GameEdition DetectGameEdition(const std::filesystem::path& game_executable) {
 RenderMode AvailableRenderMode(
     RenderMode mode, bool remastered, bool afw_plugin_present) {
     if (remastered) {
-        const bool mono = mode == RenderMode::MonoNone ||
-            mode == RenderMode::MonoTaau || mode == RenderMode::MonoDlss;
-        return mono ? RenderMode::MonoNone : RenderMode::StereoNone;
+        // 5.x has no TAAU and no AER + AFW route; DLSS is the game's own.
+        switch (mode) {
+        case RenderMode::MonoDlss:
+            return RenderMode::MonoDlss;
+        case RenderMode::MonoNone:
+        case RenderMode::MonoTaau:
+            return RenderMode::MonoNone;
+        case RenderMode::StereoDlssSequential:
+        case RenderMode::AerAfwDlss:
+            return RenderMode::StereoDlssSequential;
+        default:
+            return RenderMode::StereoNone;
+        }
     }
     if (!afw_plugin_present) {
         if (mode == RenderMode::AerAfwTaau) return RenderMode::StereoTaau;
@@ -2078,10 +2105,12 @@ std::wstring RenderModeUnavailableReason(
     const bool aer = state.mode == RenderMode::AerAfwTaau ||
         state.mode == RenderMode::AerAfwDlss;
     if (state.remastered && state.mode != RenderMode::StereoNone &&
-        state.mode != RenderMode::MonoNone) {
+        state.mode != RenderMode::MonoNone &&
+        state.mode != RenderMode::StereoDlssSequential &&
+        state.mode != RenderMode::MonoDlss) {
         return L"The Witcher 3 Remastered (5.x) is detected. So far only "
-            L"\"Stereo - No AA / FXAA\" and \"Mono - No AA / FXAA\" are "
-            L"supported on it; TAAU, DLSS and AER + AFW are not ported yet.";
+            L"the \"No AA / FXAA\" and \"DLSS\" Stereo and Mono modes are "
+            L"supported on it; TAAU and AER + AFW are not ported yet.";
     }
     if (state.remastered &&
         (state.integration_mode != IntegrationMode::Off ||
@@ -2181,8 +2210,16 @@ bool ConfigureRemasteredGameSettingsForVr(
         const char* value;
     };
     static constexpr Setting kSettings[] = {
-        // No temporal AA route on 5.x yet: FXAA.
+        // FXAA; a DLSS mode switches AAMode when the launcher state is saved.
         {"PostProcess", "AAMode", "1"},
+        // Sharpening adds shimmer after the headset stream's resampling.
+        {"PostProcess", "SharpenAmount", "0"},
+        {"Rendering/TAA", "EnableCAS", "false"},
+        // Close exploration and combat cameras, as on 4.04. The 5.x defaults
+        // (Modern, Dynamic) re-frame while walking; with the game pitch locked
+        // for VR only the translation remains, which reads as zooming.
+        {"Gameplay", "EnableAlternateExplorationCamera", "1"},
+        {"Gameplay", "EnableAlternateCombatCamera", "1"},
         // Light shafts veil the whole image whenever the sun is in view.
         {"PostProcess", "AllowShafts", "false"},
         // Ray and path tracing, ray reconstruction.
@@ -2196,6 +2233,8 @@ bool ConfigureRemasteredGameSettingsForVr(
         {"PostProcess", "EnableDLSSRR", "false"},
         {"Rendering", "AllowDLSSRR", "false"},
         {"Rendering", "AllowDLSS", "false"},
+        {"Rendering", "AllowDLSSG", "false"},
+        {"Rendering", "AllowReflex", "false"},
         // Frame generation and low-latency modes.
         {"PostProcess", "FSRFramegen", "0"},
         {"PostProcess", "XessFrameGeneration", "false"},

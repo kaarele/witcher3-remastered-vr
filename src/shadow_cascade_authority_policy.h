@@ -38,4 +38,34 @@ constexpr AuthorityAction decide_authority(
         : AuthorityAction::Reuse;
 }
 
+// Pair-reuse fail-safe (5.01 remaster_shadow_pair_reuse): one call per reuse
+// attempt. Trips after |consecutive_limit| mismatching attempts in a row, or
+// after more than |window_limit| mismatches within one window of
+// |window_size| attempts.
+struct ReuseFailSafe {
+    uint32_t consecutive{};
+    uint32_t window_attempts{};
+    uint32_t window_mismatches{};
+};
+
+constexpr bool note_reuse_attempt(
+    ReuseFailSafe& state,
+    bool mismatch,
+    uint32_t consecutive_limit,
+    uint32_t window_size,
+    uint32_t window_limit) {
+    state.consecutive = mismatch ? state.consecutive + 1 : 0;
+    ++state.window_attempts;
+    if (mismatch) {
+        ++state.window_mismatches;
+    }
+    const bool trip = state.consecutive >= consecutive_limit ||
+        state.window_mismatches > window_limit;
+    if (state.window_attempts >= window_size) {
+        state.window_attempts = 0;
+        state.window_mismatches = 0;
+    }
+    return trip;
+}
+
 }  // namespace w3vr::shadow_cascade

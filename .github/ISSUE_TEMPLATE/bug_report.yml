@@ -1,5 +1,5 @@
 name: Bug report
-description: Report a reproducible problem with Witcher 3 VR
+description: Report a reproducible problem with Witcher 3 Remastered VR
 title: "[Bug]: "
 labels:
   - bug
@@ -7,10 +7,26 @@ body:
   - type: markdown
     attributes:
       value: |
-        Thanks for helping improve Witcher 3 VR. Please complete every relevant field.
-        For renderer problems, enable Diagnostic Logging in the launcher, reproduce the issue once, and close the game normally.
-        This fork supports the latest Next-Gen version (4.04) and, experimentally, the latest Remastered version (5.x) of The Witcher 3. Please name the game version in the problem description.
+        Thanks for helping improve Witcher 3 Remastered VR. Please complete every relevant field.
+        For renderer problems, enable Diagnostic Logging in the launcher (on Linux: `[debug] logging_enabled=1` and `runtime_diagnostics=1` in `bin/x64_dx12/witcher3vr.ini`), reproduce the issue once, and close the game normally.
+        This project supports The Witcher 3 Remastered, patch 5.01, on Linux with Proton (tested) and on Windows (not tested yet). For Next-Gen 4.04, use the original mod at https://github.com/tig3rmast3r/witcher3-vr.
         Third-party mods are currently unsupported. Disable them and reproduce the problem before opening an issue.
+
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: "Example: Windows 11, or SteamOS / Fedora with Proton Hotfix"
+    validations:
+      required: true
+
+  - type: input
+    id: game
+    attributes:
+      label: Game store and patch
+      placeholder: "Example: Steam, 5.01"
+    validations:
+      required: true
 
   - type: input
     id: gpu
@@ -24,7 +40,7 @@ body:
     id: headset
     attributes:
       label: Headset and connection
-      placeholder: "Example: Quest 3 via Virtual Desktop, Pimax via DisplayPort"
+      placeholder: "Example: Quest 3 via WiVRn, Quest 3 via Virtual Desktop, Pimax via DisplayPort"
     validations:
       required: true
 
@@ -32,7 +48,7 @@ body:
     id: runtime
     attributes:
       label: OpenXR runtime
-      placeholder: "Example: VDXR, SteamVR, Meta OpenXR"
+      placeholder: "Example: WiVRn, SteamVR, VDXR, Meta OpenXR"
     validations:
       required: true
 
@@ -54,7 +70,6 @@ body:
       label: Anti-aliasing backend
       options:
         - No AA / FXAA
-        - TAAU
         - DLSS
         - DLAA
         - Unknown
@@ -85,7 +100,7 @@ body:
     attributes:
       label: Diagnostic files
       description: |
-        Attach witcher3vr.ini and the generated witcher3vr-vxxx.log.
+        Attach witcher3vr.ini and the generated witcher3vr.log (both in bin/x64_dx12).
         Add a save file if the problem is scene-specific. Review logs for personal paths before uploading.
     validations:
       required: true
@@ -103,7 +118,7 @@ body:
       options:
         - label: I searched existing issues for the same problem.
           required: true
-        - label: I reproduced the problem on the latest Next-Gen (4.04) or the latest Remastered (5.x) version of The Witcher 3.
+        - label: I reproduced the problem on The Witcher 3 Remastered, patch 5.01.
           required: true
         - label: I reproduced the problem with all third-party mods disabled.
           required: true

@@ -590,6 +590,14 @@ float inverse_hud_distance_from_parallel_reference(
         (reference_baseline_m * reference_source_width_px);
 }
 
+float visible_center_tangent_y(const XrFovf& fov) {
+    const float up = std::tan(fov.angleUp);
+    const float down = std::tan(fov.angleDown);
+    return std::isfinite(up) && std::isfinite(down) && up > down
+        ? (up + down) * 0.5f
+        : NAN;
+}
+
 bool build_cyclopean_hud_plane_clip_positions(
     const EyeGeometry& geometry,
     uint32_t eye,
@@ -597,7 +605,8 @@ bool build_cyclopean_hud_plane_clip_positions(
     const XrFovf& target_fov,
     float hud_size,
     float inverse_distance_m,
-    std::array<float, 16>& clip_positions) {
+    std::array<float, 16>& clip_positions,
+    float scale_origin_tangent_y) {
     if (eye >= geometry.relative_orientations.size() ||
         !std::isfinite(hud_size) || hud_size <= 0.0f ||
         !std::isfinite(inverse_distance_m) ||
@@ -631,7 +640,9 @@ bool build_cyclopean_hud_plane_clip_positions(
     }
 
     const float source_center_x = (source_left + source_right) * 0.5f;
-    const float source_center_y = (source_up + source_down) * 0.5f;
+    const float source_center_y = std::isfinite(scale_origin_tangent_y)
+        ? scale_origin_tangent_y
+        : (source_up + source_down) * 0.5f;
     const float source_corner_x[4]{
         source_left, source_right, source_left, source_right};
     const float source_corner_y[4]{
@@ -675,6 +686,131 @@ bool build_cyclopean_hud_plane_clip_positions(
         clip_positions[corner * 4 + 3] = forward;
     }
     return true;
+}
+
+bool scaleform_stage_ratio_scale(
+    uint32_t width,
+    uint32_t height,
+    float& scale_x,
+    float& scale_y) {
+    if (width == 0 || height == 0) {
+        return false;
+    }
+    constexpr float kMovieWidth = 1920.0f;
+    constexpr float kMovieHeight = 1080.0f;
+    const float texture_width = static_cast<float>(width);
+    const float texture_height = static_cast<float>(height);
+    const float ratio = texture_width / texture_height;
+    float stage_width = kMovieWidth;
+    float stage_height = kMovieHeight;
+    if (std::fabs(ratio - 4.0f / 3.0f) < 0.01f) {
+        stage_height = 1440.0f;
+    } else if (std::fabs(ratio - 21.0f / 9.0f) < 0.01f) {
+        stage_width = 2520.0f;
+    } else if (std::fabs(ratio - 43.0f / 18.0f) < 0.01f) {
+        stage_width = 2580.0f;
+    }
+    const float movie_scale = std::min(
+        texture_width / kMovieWidth, texture_height / kMovieHeight);
+    scale_x = stage_width * movie_scale / texture_width;
+    scale_y = stage_height * movie_scale / texture_height;
+    return std::isfinite(scale_x) && std::isfinite(scale_y) &&
+        scale_x > 0.0f && scale_y > 0.0f;
+}
+
+bool hud_marker_clip_mapping(
+    const XrFovf& source_fov,
+    float marker_half_tangent_x,
+    float marker_half_tangent_y,
+    float hud_size,
+    float scale_origin_tangent_y,
+    float stage_scale_x,
+    float stage_scale_y,
+    HudMarkerClipMapping& mapping) {
+    const float left = std::tan(source_fov.angleLeft);
+    const float right = std::tan(source_fov.angleRight);
+    const float up = std::tan(source_fov.angleUp);
+    const float down = std::tan(source_fov.angleDown);
+    if (!std::isfinite(left) || !std::isfinite(right) ||
+        !std::isfinite(up) || !std::isfinite(down) ||
+        right <= left || up <= down ||
+        !std::isfinite(marker_half_tangent_x) ||
+        !std::isfinite(marker_half_tangent_y) ||
+        marker_half_tangent_x <= 0.0f || marker_half_tangent_y <= 0.0f ||
+        !std::isfinite(hud_size) || hud_size <= 0.0f ||
+        !std::isfinite(stage_scale_x) || !std::isfinite(stage_scale_y) ||
+        stage_scale_x <= 0.0f || stage_scale_y <= 0.0f) {
+        return false;
+    }
+    const float half_x = (right - left) * 0.5f;
+    const float half_y = (up - down) * 0.5f;
+    const float center_x = (left + right) * 0.5f;
+    const float center_y = (up + down) * 0.5f;
+    const float origin_y = std::isfinite(scale_origin_tangent_y)
+        ? scale_origin_tangent_y
+        : center_y;
+    // Composite: plane = origin + hud_size * (source - origin). Inverted for
+    // a marker at plane tangent t, then source tangent -> texture NDC -> ratio:
+    //   ratio = ((origin + (t - origin) / hud_size) - centre) / (half * stage)
+    // with t = marker_half_tangent * clip / w of the centred marker camera.
+    HudMarkerClipMapping candidate{};
+    candidate.scale_x = marker_half_tangent_x /
+        (hud_size * half_x * stage_scale_x);
+    candidate.offset_x = -center_x / (hud_size * half_x * stage_scale_x);
+    candidate.scale_y = marker_half_tangent_y /
+        (hud_size * half_y * stage_scale_y);
+    candidate.offset_y = (origin_y * (1.0f - 1.0f / hud_size) - center_y) /
+        (half_y * stage_scale_y);
+    candidate.source_left = left;
+    candidate.source_right = right;
+    candidate.source_up = up;
+    candidate.source_down = down;
+    candidate.hud_size = hud_size;
+    candidate.origin_x = center_x;
+    candidate.origin_y = origin_y;
+    candidate.stage_scale_x = stage_scale_x;
+    candidate.stage_scale_y = stage_scale_y;
+    candidate.marker_half_tangent_x = marker_half_tangent_x;
+    candidate.marker_half_tangent_y = marker_half_tangent_y;
+    if (!std::isfinite(candidate.scale_x) ||
+        !std::isfinite(candidate.offset_x) ||
+        !std::isfinite(candidate.scale_y) ||
+        !std::isfinite(candidate.offset_y)) {
+        return false;
+    }
+    mapping = candidate;
+    return true;
+}
+
+void apply_hud_marker_clip_mapping(
+    const HudMarkerClipMapping& mapping, float* world_to_clip) {
+    if (world_to_clip == nullptr) {
+        return;
+    }
+    for (size_t row = 0; row < 4; ++row) {
+        float* m = world_to_clip + row * 4;
+        m[0] = mapping.scale_x * m[0] + mapping.offset_x * m[3];
+        m[1] = mapping.scale_y * m[1] + mapping.offset_y * m[3];
+    }
+}
+
+bool hud_marker_ratio_to_plane_tangent(
+    const HudMarkerClipMapping& mapping,
+    float ratio_x,
+    float ratio_y,
+    float& plane_tangent_x,
+    float& plane_tangent_y) {
+    const float half_x = (mapping.source_right - mapping.source_left) * 0.5f;
+    const float half_y = (mapping.source_up - mapping.source_down) * 0.5f;
+    const float center_x = (mapping.source_left + mapping.source_right) * 0.5f;
+    const float center_y = (mapping.source_up + mapping.source_down) * 0.5f;
+    const float source_x = center_x + ratio_x * mapping.stage_scale_x * half_x;
+    const float source_y = center_y - ratio_y * mapping.stage_scale_y * half_y;
+    plane_tangent_x = mapping.origin_x +
+        mapping.hud_size * (source_x - mapping.origin_x);
+    plane_tangent_y = mapping.origin_y +
+        mapping.hud_size * (source_y - mapping.origin_y);
+    return std::isfinite(plane_tangent_x) && std::isfinite(plane_tangent_y);
 }
 
 } // namespace w3vr::openxr_eye_geometry

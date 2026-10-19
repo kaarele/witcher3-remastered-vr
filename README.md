@@ -1,465 +1,766 @@
-# The Witcher 3 VR
+# Witcher 3 Remastered VR
 
-> [!NOTE]
-> This is a fork of [Witcher 3 VR](https://github.com/tig3rmast3r/witcher3-vr) by
-> [tig3rmast3r](https://github.com/tig3rmast3r). All credit for the mod goes to him: the VR
-> renderer, launcher, integrations and nearly all of the code in this repository are his work. This
-> fork only adds support for The Witcher 3 Remastered (patch 5.x) on top of it.
+> This is an unofficial fan work and is not approved/endorsed by CD PROJEKT RED.
 
-The goal of this fork is to support both the latest Next-Gen version (4.04) and the latest
-Remastered version (5.x) of the game. Once Remastered support is stable and has at least all
-essential features, support for Next-Gen may be dropped.
-
-Play The Witcher 3 in VR with configurable stereo rendering, a movable VR HUD, first-person gameplay, cinema modes, DLSS, DLAA and TAAU support, optional frame generation, ReShade and OptiScaler integration. On Remastered 5.x only a subset is available so far; see [Remastered (5.x) status](#remastered-5x-status) below.
-
-Its DX12 and VR architecture was informed by
-[REFramework](https://github.com/praydog/REFramework) and
-[UEVR](https://github.com/praydog/UEVR) by praydog; neither project is bundled
-as a runtime dependency.
+Play *The Witcher 3: Wild Hunt* Remastered (patch 5.01) in VR, in full stereo 3D, through an OpenXR
+runtime. This project continues the [Witcher 3 VR](https://github.com/tig3rmast3r/witcher3-vr) mod
+by tig3rmast3r and the [Remastered port](https://github.com/joschi127/witcher3-vr/tree/remaster) by
+joschi127. It adds Linux/Proton support, DLSS with a separate history for each eye, a sharper
+per-eye projection, a cleaner VR HUD and a number of performance improvements.
 
 > [!WARNING]
-> This project is under active development. Features may be incomplete,
-> unstable, or incompatible with some hardware and game configurations.
-> Intermittent crashes may occur when using DLSS 5 Neural Rendering.
-> This release includes safeguards, but does not resolve every case.
+> **Pre-release. There is no release package yet.** Until the first release you install the mod
+> from source (see [Installation](#installation)).
+>
+> So far the mod has been tested on **one setup only**: Linux (Bazzite) with Steam, Proton Hotfix
+> and vkd3d-proton, an NVIDIA GeForce RTX 3080, and a Meta Quest 3 through WiVRn (OpenXR) at
+> 90 Hz, running the Steam edition of The Witcher 3 Remastered, patch 5.01. Windows, SteamVR, other
+> GPUs, other headsets and the GOG edition have **not** been tested yet. See
+> [Platform support](#platform-support).
 
-> [!IMPORTANT]
-> The included custom OptiScaler is the only launcher-managed DLSS 5 integration.
-> Supply only `nvngx_dlssnr.dll` separately. ReShade is included without add-ons;
-> user-installed DLSS 5 ReShade add-ons are not supported.
+## Contents
 
-> [!IMPORTANT]
-> Gameplay currently requires a mouse and keyboard or a gamepad. VR motion
-> controllers are not supported and are not currently planned at this time.
+- [What this project adds](#what-this-project-adds)
+- [Requirements](#requirements)
+- [Installation](#installation)
+- [Recommended settings](#recommended-settings)
+- [Controls](#controls)
+- [Configuration reference](#configuration-reference)
+- [Platform support](#platform-support)
+- [Troubleshooting and known issues](#troubleshooting-and-known-issues)
+- [Building from source](#building-from-source)
+- [Headless testing (for developers)](#headless-testing-for-developers)
+- [Documentation](#documentation)
+- [Reporting problems](#reporting-problems)
+- [License and credits](#license-and-credits)
 
-## Remastered (5.x) status
+## What this project adds
 
-Remastered support is experimental. It is developed and tested with the GOG release, patch 5.01, on
-an AMD GPU with a Pico 4 over Virtual Desktop. What works and what does not:
+Everything the Remastered port offers on 5.01 is still there: Stereo and Mono rendering, the VR
+HUD, cutscenes and cinema modes, the near view and the launcher. The full upstream feature
+description is in the
+[README of the Remastered port](https://github.com/joschi127/witcher3-vr/blob/remaster/README.md).
+On top of that, this project adds the features below. Some of them have so far only been tested
+without a headset; the [feature status table](#platform-support) shows which.
 
-- Third-person gameplay in Stereo mode with correct 3D depth, HUD, menus, loading screens, combat,
-  horse riding and cutscenes.
-- Anti-aliasing: No AA route with the game's FXAA only. TAAU does not exist in 5.x; DLSS, ray
-  tracing, OptiScaler, OFXR and the other integrations are not ported yet.
-- Unknown or newer game builds are detected and the game hooks stay disabled, so an update of the
-  game does not break it blindly, but the mod then does nothing.
-- Release packages are on [this fork's releases page](https://github.com/joschi127/witcher3-vr/releases)
-  and work for both game versions (see [Installation](#installation)).
-- The launcher detects 5.x: **Configure Settings for VR** applies the 5.x VR settings there, and only
-  the modes that work on 5.x can be saved.
-- On AMD GPUs, use Adrenalin 26.9.2 or newer; older drivers render some 5.x grass solid black (with
-  or without the mod). The automatic AMD update may not offer it yet.
+**Linux**
+- Runs under Steam + Proton. A setup tool (`linux/w3vr-linux.py`, Python 3, standard library only)
+  replaces the Windows launcher: it finds the game, backs up your saves, installs the mod, writes a
+  tested VR preset and prints the Steam launch options for your OpenXR runtime.
+- The DLL can be built on Linux with clang-cl inside a distrobox container.
 
-Details: [port status log](docs/remaster-port-status.md) and
-[known problems](docs/remaster-open-issues.md).
+**Image quality**
+- **DLSS on Remastered 5.01, with its own history for each eye.** In Stereo the game would run
+  both eyes through one DLSS history, which blends the two eye images. The mod gives each eye its
+  own DLSS viewport, history and motion-vector camera. DLSS Quality, Balanced, Performance, Ultra
+  Performance and DLAA can all be used (tested under Proton only).
+- **DLSS under Proton.** The game normally skips its DLSS setup when it detects Wine. The mod
+  removes that check in memory at startup (only on the exact 5.01 build it knows).
+- **Per-eye projection** (`remaster_asymmetric_ndc`, set by the Linux tool). Each eye is rendered
+  with its own off-centre field of view and the whole image goes to the headset. Without it, each
+  eye renders a wider centred image and about a third of it is cropped away, so the same render
+  size looks noticeably sharper with it.
+- **Sharp, readable HUD.** A shrunk HUD is filtered instead of skipping pixels, so text no longer
+  breaks up and crawls when you move your head.
 
-## Highlights
+**HUD, menus and markers**
+- The controller-locked HUD stays level (it follows your heading, not the tilt of your head when
+  you recentred).
+- The HUD, menus and loading screens are centred on the part of the image you actually see.
+- No more black HUD-sized rectangle when a cutscene or loading screen fades to black.
+- Interaction prompts and NPC or door markers sit on their targets instead of floating too high
+  and moving with the camera pitch.
+- The pause menu no longer jitters left and right in Stereo.
 
-### Three ways to play
+**Camera**
+- The near view centres Geralt in front of you, instead of the game's over-the-shoulder framing.
+- After a cutscene, gameplay keeps the forward direction it had before the cutscene.
+- The setup tool and the launcher select the game's *Close* exploration and combat cameras. The
+  default 5.01 camera re-frames while walking, which looks like zooming in and out in VR.
 
-| Mode | What it offers | Anti-aliasing and upscaling |
-| --- | --- | --- |
-| AER + AFW | The fastest stereo option. Best when you need the highest frame rate. | TAAU, DLSS or DLAA |
-| Stereo | Both eyes are rendered every frame. Better image consistency at a higher performance cost. | No AA, FXAA, TAAU, DLSS or DLAA |
-| Mono | The lightest mode. It has no stereo depth, but can be useful on slower systems. | No AA, FXAA, TAAU, DLSS or DLAA |
+**Performance** (the game is CPU-limited in VR because it renders the scene twice per frame)
+- Much less CPU overhead from the mod's own descriptor tracking on the render thread (on by
+  default).
+- Optional one-pair run-ahead: the game prepares the next frame while the current one renders.
+  In our headless, CPU-limited tests this gave about 15% more frames per second.
+- Optional shared sun shadows: the second eye reuses the first eye's sun-shadow maps.
 
-Asymmetric projection is enabled by default. Press `F2` to switch temporarily to symmetric projection if needed. This toggle is intended for testing and may be removed in a future release.
+**Consistency between the eyes** (optional)
+- Flickering lights (torches, candles, fires) flicker the same in both eyes and at the normal
+  speed.
+- Local shadows are chosen the same way for both eyes, so a shadow no longer shows in one eye
+  only.
 
-### Frame Generation for VR
-
-OFXR is a VR frame-generation system based on optical flow. It can improve smoothness when the game cannot reach the headset refresh rate on its own.
-
-- It has been tested with VDXR and partially tested with SteamVR OpenXR.
-- Both FidelityFX and NVIDIA Optical Flow can provide around a 40% frame-rate increase, based on current testing.
-- NVIDIA Optical Flow generally produces a cleaner image, while FidelityFX usually shows more artifacts.
-- Results vary by GPU, scene, resolution and headset refresh rate.
-- Some overlays, including xrFPS, may report half the perceived frame rate while OFXR is active.
-- The game must be started through `Witcher3VRLauncher.exe` for OFXR to load.
-
-### ReShade, DLSS5 and OptiScaler
-
-Choose the integration you want directly from the launcher:
-
-- **ReShade support**, on its own or alongside OptiScaler.
-- **OptiScaler support**, using our stereo-compatible DLSS5/VR fork.
-
-The bundled ReShade is [our unofficial ReShade VR fork](https://github.com/tig3rmast3r/ReShade_VR), based on ReShade 6.8.0. It includes a targeted fix for a startup crash when SteamVR uses DirectX 11 and 12 together. This fix has been validated with Witcher3VR; it is not a claim of compatibility with every game or VR setup.
-
-Disable DLSS Override before using OptiScaler. Its neural-rendering route requires a compatible NVIDIA NR DLL supplied separately; that file is not included with the mod.
-
-### Cinema Modes
-
-Cinema mode supports `5:4`, `4:3`, `16:10` and `16:9` presentation formats.
-
-### First-Person View
-
-First-person mode is available for exploration, combat, horseback riding and sailing. Some animations and unusual camera situations can still look better in third person.
-
-### VR HUD Editor
-
-HUD elements can be positioned in VR and saved from inside the game. Separate presets can be kept for different play styles and presentation modes.
-
-## Current Support
-
-The table describes Next-Gen 4.04. For Remastered 5.x see [Remastered (5.x) status](#remastered-5x-status).
-
-| Feature | Status |
-| --- | --- |
-| The Witcher 3 Next-Gen 4.04 | Supported |
-| The Witcher 3 Remastered 5.x | Experimental (Stereo, No AA / FXAA) |
-| OpenXR | Supported |
-| VDXR | Supported and recommended for Quest headsets |
-| SteamVR OpenXR | Supported; standard Presentation Size |
-| Mouse and keyboard / gamepad | Supported |
-| VR motion controllers | Not supported |
-| AER + AFW | Supported |
-| Stereo rendering | Supported |
-| Mono rendering | Preliminary |
-| No AA / FXAA / TAAU / DLSS / DLAA | Supported, depending on render mode |
-| OptiScaler | Supported |
-| ReShade | Supported through our fork with the validated SteamVR startup crash fix |
-| DLSS5 via OptiScaler | Supported through the stereo-compatible fork |
-| OFXR frame generation | Experimental; tested with VDXR and partially with SteamVR OpenXR |
-
-The most frequently tested configurations are Quest 3 through VDXR and Pimax headsets through SteamVR OpenXR. Other OpenXR runtimes may work but need more user feedback.
-
-The ForceDLAA parameter-query and resolution-override approach is adapted from
-[DLSSTweaks](https://github.com/emoose/DLSSTweaks) by emoose.
-
-### Not Supported
-
-- Ray tracing
-- Screen Space Reflections (High)
-- Far/Distant game camera modes for exploration, combat and horse riding; only close/near cameras are currently corrected
+**For developers**
+- A headless OpenXR runtime (`tools/w3vr-nullxr`) runs the full VR path without a headset,
+  including under Proton, and saves the images a compositor would receive.
 
 ## Requirements
 
-- The Witcher 3 Next-Gen (2022), v4.0.4, DirectX 12 version, or The Witcher 3 Remastered, patch
-  5.01 (experimental, see [Remastered (5.x) status](#remastered-5x-status))
-- A working OpenXR runtime for your headset
-- A mouse and keyboard or gamepad
-- Windows 10 or Windows 11
-- A VR-ready GPU and CPU
-- The current Microsoft Visual C++ Redistributable
-
-DLSS and DLAA require a compatible NVIDIA GPU. OptiScaler and OFXR have their own hardware and software requirements.
+- *The Witcher 3: Wild Hunt*, Remastered, **patch 5.01**, DirectX 12, legally obtained. The Steam
+  edition is tested. The mod checks the game build at startup and does nothing on other builds.
+- A VR headset with an **OpenXR runtime**. Tested: WiVRn on Linux. Others (SteamVR, Meta Quest
+  Link, Virtual Desktop, Monado, ...) are untested.
+- Mouse and keyboard, or a gamepad. VR motion controllers are not supported.
+- For DLSS: an NVIDIA GeForce RTX GPU. Other GPUs can use FXAA (untested by this project). On AMD
+  GPUs, use a current Adrenalin driver: older drivers render some 5.x grass solid black, with or
+  without the mod.
+- A strong desktop CPU. In Stereo the game renders every frame twice and is mostly CPU-limited.
+- **Linux:** Steam with Proton (Proton Hotfix is tested) and Python 3, which SteamOS, Bazzite and
+  most desktop distributions already include.
+- **Windows:** Windows 10 or 11 (untested). The mod links the C++ runtime statically, so no Visual
+  C++ Redistributable is needed for it.
 
 ## Installation
 
-Download the package from [this fork's releases page](https://github.com/joschi127/witcher3-vr/releases).
-It is a complete package for both game versions, with two optional parts that are **not** included:
+> [!IMPORTANT]
+> Back up your saves before you install anything. On Windows they are in
+> `Documents\The Witcher 3\gamesaves`. On Linux they are in
+> `steamapps/compatdata/292030/pfx/drive_c/users/steamuser/Documents/The Witcher 3/gamesaves`
+> inside the Steam library that holds the game. The Linux tool also makes and verifies a backup
+> before it changes anything.
 
-- **PureDark AFW** (`PDAFWPlugin.dll`), needed only for the AER + AFW render modes on Next-Gen 4.04.
-  Take it from the [original Witcher 3 VR release](https://github.com/tig3rmast3r/witcher3-vr/releases)
-  and copy it into `bin\x64_dx12`. Without it, use a Stereo or Mono mode.
-- **Fast Transitions DLC** (optional faster movement transitions on 4.04). It is also part of the
-  original release (`dlc` folder) if you want it.
+### Before you start
 
-**Everything else needed for the launcher-managed integrations is included except the NVIDIA NR DLL:** ReShade, the custom VR OptiScaler, OFXR and the launcher are supplied in the package. ReShade add-ons are optional and user-managed. On Remastered 5.x these integrations are not ported yet.
+- Stay on Steam's default branch (patch 5.01). Do not switch to the `next-gen` (4.04) branch.
+- **Start the game once without the mod**, reach the main menu and quit. This creates the
+  settings files the setup edits (`dx12user.settings` and `input.settings`) and, on Linux, the
+  Proton prefix.
+- **Close the game** before you install, configure or uninstall. The game rewrites its settings
+  files when it exits.
 
-1. Extract the release archive into the Witcher 3 game folder, the directory containing `bin`, `content` and `mods`.
-2. Merge the folders and overwrite the package files when prompted.
-3. To use OptiScaler, obtain a compatible `nvngx_dlssnr.dll` for your GPU (**RTX 50xx or RTX 40xx**) separately and put it in `The Witcher 3\bin\x64_dx12\witcher3vr-dlss5-reference`. This folder is empty in the release. ReShade alone does not need the NR DLL.
-4. Run `bin\x64_dx12\Witcher3VRLauncher.exe`.
-5. Choose Off, OptiScaler, ReShade or OptiScaler + ReShade, then select **Save & Launch**. OptiScaler needs a DLSS/DLAA rendering mode. The launcher handles its own runtime files; choose **Off** and save to disable the integrations. ReShade add-ons, if desired, must be installed and configured separately by the user.
+The mod adds these files to the game folder. It is not meant to replace game files (but see the
+[Windows launcher problems](#windows-untested) below), and the Linux tool backs up any existing
+file before it overwrites it:
 
-The package layout includes the VR DLL, launcher, OFXR, ReShade, one OptiScaler reference, configuration, scripts and bundled mod files inside the correct `bin\x64_dx12`, `mods` and `Witcher3VR` folders. The launcher copies the selected integration from its reference folder into the DX12 directory; it never modifies the references. The NVIDIA NR DLL is not bundled. The root `OptiScaler.ini` stays in place and retains user settings. Install the whole package when changing release versions; replacing only the DLL can leave incompatible files behind.
+| Where | What |
+|---|---|
+| `bin/x64_dx12/dxgi.dll` | The VR renderer (a DXGI proxy). Setup copies it here from `bin/x64_dx12/witcher3vr-mod-reference/`. |
+| `bin/x64_dx12/openxr_loader.dll` | The Khronos OpenXR loader |
+| `bin/x64_dx12/witcher3vr.ini` | The mod's settings, written by the launcher or the Linux tool |
+| `mods/modWitcher3VR*`, `mods/modW3VRKeepHudFrameScale` | Script mods: state bridge, first person, HUD editor, HUD scale guard |
+| `bin/config/r4game/user_config_matrix/pc/modWitcher3VRHUDEditor.xml` | HUD editor menu |
 
-The separate **RenderDoc Addon** is only for diagnostic captures. It is not required to play.
+### Linux (Steam + Proton)
 
-Back up any files you have edited manually before installing a new release.
+1. **Build `dxgi.dll`** from this repository, see [Building from source](#linux-clang-cl-in-a-distrobox).
+2. **Download a Witcher 3 VR Remastered release zip** from
+   [joschi127/witcher3-vr releases](https://github.com/joschi127/witcher3-vr/releases). It supplies
+   `openxr_loader.dll` and the base script mods. Check it against its SHA-256 file:
+   `sha256sum -c <name>-SHA256.txt`.
+3. **Connect your headset to WiVRn** (or start your OpenXR runtime). WiVRn only registers itself as
+   the active OpenXR runtime while a headset is connected.
+4. From a checkout of this repository, run:
 
-## Launcher Guide
+   ```bash
+   python3 linux/w3vr-linux.py status        # Steam, game folder, game build, OpenXR runtime
+   python3 linux/w3vr-linux.py install <release>.zip --dll <path/to/your/dxgi.dll>
+   python3 linux/w3vr-linux.py configure     # the tested 5.01 preset; see configure --help
+   python3 linux/w3vr-linux.py launch-options
+   python3 linux/w3vr-linux.py wivrn-shortcut   # optional: list the game in WiVRn's in-headset launcher
+   ```
 
-### First-Time Setup
+   - `install` backs up and verifies your saves, copies the files, activates `dxgi.dll` and installs
+     the 5.01 versions of the scripts plus the HUD scale guard.
+   - `configure` writes the preset to `witcher3vr.ini` and only the keys it needs to
+     `dx12user.settings`, and registers the HUD editor. It keeps a backup of every file it changes.
+     The preset: strict Stereo, the game's DLSS on NVIDIA (FXAA otherwise), per-eye projection,
+     the Close cameras, a half-size controller-locked HUD and the near view.
+   - `configure` uses WiVRn's recommended Quest 3 render size (2476x2594 per eye). For another
+     headset pass `--res WIDTHxHEIGHT` with your runtime's recommended per-eye size.
+   - `--dlss-quality` selects the DLSS mode: 1 Quality, 2 Balanced (default), 3 Performance,
+     4 Ultra Performance, 0 DLAA. You can also change it in the game's graphics options at any time.
 
-Press **Configure Settings for VR** at least once before playing. It applies the tested game profile and creates a backup that can be restored later with **Restore Original Settings**.
+5. **Set the launch options** in Steam: *The Witcher 3 > Properties > General > Launch Options*.
+   `launch-options` prints the OpenXR part for your runtime. This is the full line tested with
+   WiVRn installed as a system-wide Flatpak:
 
-On Remastered 5.x the button applies the 5.x VR settings to your existing game settings instead of
-the 4.04 profile: anti-aliasing **FXAA**; ray tracing, path tracing, light shafts (they veil the image
-whenever the sun is in view), frame generation, low-latency modes, HDR and motion blur/lens effects
-**off**. Everything else, such as texture quality, language and camera inversion, stays as you set it.
+   ```text
+   PRESSURE_VESSEL_IMPORT_OPENXR_1_RUNTIMES=1 PRESSURE_VESSEL_FILESYSTEMS_RW=/var/lib/flatpak/app/io.github.wivrn.wivrn WINEDLLOVERRIDES="dxgi=n,b" PROTON_ENABLE_NVAPI=1 %command% --launcher-skip
+   ```
 
-The launcher starts in **Stereo - No AA / FXAA** with **AUTO** resolution on both game versions. A
-fresh installation therefore only needs: start the launcher, press **Configure Settings for VR** once,
-then **Save & Launch**.
+   - The two `PRESSURE_VESSEL_*` variables let the game reach the OpenXR runtime on the host.
+     `PRESSURE_VESSEL_FILESYSTEMS_RW` is only needed for a Flatpak WiVRn; for a per-user Flatpak
+     install the path is under `~/.local/share/flatpak/app/`.
+   - `WINEDLLOVERRIDES` makes sure the mod's `dxgi.dll` is loaded, and `PROTON_ENABLE_NVAPI=1`
+     makes NVAPI available for DLSS. Proton Hotfix already sets both for this game on NVIDIA
+     systems, so there they are redundant but harmless.
+   - `--launcher-skip` starts the DirectX 12 game directly, without the REDlauncher window.
 
-### Resolution
+6. **Play:** with the headset connected, start the game from Steam or from WiVRn's app list in the
+   headset. Proton sets up VR once, at launch.
 
-`AUTO` follows the headset and runtime configuration. Use a fixed resolution when you want predictable image quality or need to reduce GPU load.
+**Uninstall:** with the game closed, run `python3 linux/w3vr-linux.py uninstall --restore-settings`
+and clear the launch options in Steam. Your saves are not touched. Deleting
+`bin/x64_dx12/dxgi.dll` alone also switches the mod off.
 
-Lower resolutions improve performance but reduce clarity. Very high resolutions can become GPU-limited even when the game itself appears to have spare performance.
+More details: [LINUX.md](LINUX.md).
 
-### Presentation Size
+### Windows (untested)
 
-Presentation Size now preserves the complete image instead of cropping it. Lowering the slider presents the same rendered pixel resolution in a smaller area of your view, increasing visible pixel density and improving perceived clarity without raising the render resolution.
+Nobody has run this project's build on Windows yet. These steps follow the Windows launcher's
+design; if you try them, please [report](#reporting-problems) what happens.
 
-`1.00` keeps the normal presentation unchanged. Lower values can leave unused space around the image; choose a value that is comfortable for your headset.
+> [!WARNING]
+> Known launcher problems on 5.01, to be fixed before the first release:
+>
+> - The HUD editor setup expects `dx12filelist.txt`, which the Steam 5.01 build does not have.
+>   This can stop **Save** and **Save & Launch**.
+> - Saving with the integration set to **Off** removes the game's own
+>   `amd_fidelityfx_framegeneration_dx12.dll` (used for FSR frame generation). *Verify integrity
+>   of game files* in Steam, or the same check in GOG Galaxy, restores it.
+> - The launcher's automatic (AUTO) render resolution is not usable on 5.01 yet. Set the per-eye
+>   render size by hand to your runtime's recommended size.
 
-**Alt resize is no longer needed and has been removed.** The standard slider works with both VDXR and SteamVR.
+1. Build `dxgi.dll` and the launcher with Visual Studio 2022, see
+   [Building from source](#windows-visual-studio-2022).
+2. Extract a Witcher 3 VR Remastered release zip from
+   [joschi127/witcher3-vr releases](https://github.com/joschi127/witcher3-vr/releases) into the game
+   folder (the folder that contains `bin`, `content` and `mods`) and merge the folders.
+3. Replace these files in the game folder with the ones you built:
+   - `bin\x64_dx12\witcher3vr-mod-reference\dxgi.dll`
+   - `bin\x64_dx12\Witcher3VRLauncher.exe`
+4. Replace
+   `mods\modWitcher3VRStateBridge\content\scripts\local\witcher3vr\first_person_state_bridge.ws`
+   with the 5.01 version from `support/remaster/modWitcher3VRStateBridge/`. The 4.04 version does
+   not compile on 5.01.
+5. Optional: copy `linux/extra-mods/modW3VRKeepHudFrameScale` into the game's `mods` folder. It is
+   not Linux-specific. It keeps the VR HUD frame scale when the game's *Rescale HUD* screen opens,
+   which matters when `hud_horizontal_scale` or `hud_vertical_scale` is below 0.9.
+6. Start `bin\x64_dx12\Witcher3VRLauncher.exe`, press **Configure Settings for VR** once (it backs
+   up your game settings first), choose a Stereo mode (**Stereo - DLSS** or **Stereo - No AA /
+   FXAA**) and press **Save & Launch**.
+7. Optional, to match the Linux preset: with the launcher and the game closed, set
+   `remaster_asymmetric_ndc=1` under `[engine]` in `bin\x64_dx12\witcher3vr.ini`. The
+   [optional settings](#optional-settings-not-yet-default) can be added the same way. The launcher
+   keeps keys that it does not manage itself.
 
-### World Detail Range
+**Uninstall:** press **Restore Original Settings** in the launcher, then delete
+`bin\x64_dx12\dxgi.dll`, `bin\x64_dx12\witcher3vr.ini` and the files the release zip added.
+Deleting `bin\x64_dx12\dxgi.dll` alone already switches the mod off. *Verify integrity of game
+files* does **not** remove the mod, because it only restores files that belong to the game.
 
-The default value is `100%`, preserving the normal extended world-detail range.
+### Planned releases
 
-Lowering it can recover performance in cities and other CPU-heavy areas by reducing how far detailed objects remain visible. At `40%`, the extended LOD/culling correction is effectively disabled. Use the highest value that gives stable performance on your headset.
+None of this is available yet. Each release on the
+[Releases page](https://github.com/kaarele/witcher3-remastered-vr/releases) is planned to have:
 
-### Asymmetric Projection
+- `Witcher3RemasteredVR-<version>.zip`: one package for both Windows and Linux.
+- `SHA256SUMS.txt`: checksums of the release files. Check them with
+  `sha256sum -c SHA256SUMS.txt --ignore-missing` on Linux, or `Get-FileHash` in PowerShell on
+  Windows.
 
-Asymmetric projection is enabled by default and provides the intended image and performance path. Press `F2` in game for a temporary switch to symmetric projection when diagnosing a visual problem.
+The package will need no other software: no Visual C++ Redistributable, no .NET, and no Python on
+Windows. Linux uses the system's Python 3. It will not include any NVIDIA files; DLSS uses the
+runtime that comes with the game and the graphics driver.
 
-### OFXR Frame Generation
+- **Windows:** extract the zip into the game folder, start `bin\x64_dx12\Witcher3VRLauncher.exe`,
+  press **Configure Settings for VR** once, then **Save & Launch**. A later release is meant to add
+  a single installer that finds the Steam or GOG game folder by itself. The files are not
+  code-signed, so Windows SmartScreen may warn: choose **More info**, then **Run anyway**.
+- **Linux, including SteamOS and Bazzite (desktop mode):** extract the zip anywhere and start
+  `install-linux.sh` (on KDE: double-click and choose **Execute**; elsewhere run
+  `./install-linux.sh` in a terminal). It is meant to find the game, back up your saves, install
+  the mod, write the tested preset, detect your OpenXR runtime and set up the Steam launch options.
+  SteamOS has not been tested yet.
+- **Uninstall** will be one step on both systems. It removes exactly the files the mod added,
+  restores your original settings and never touches saves.
+- **Game updates** change the game build, and the mod then switches itself off until a mod release
+  supports the new build.
 
-- **FidelityFX:** frame generation with more visible artifacts than NVIDIA Optical Flow.
-- **Nvidia:** legacy NVIDIA Optical Flow presentation. Medium with 50% optical-flow input resolution is a useful starting point; final output remains full resolution.
-- **Nvidia (new):** experimental OFXR 0.3.0 NVIDIA presentation, available only with OptiScaler. Try it if legacy motion is uneven below the headset refresh rate.
-- **FSR 3.1:** requires OptiScaler and a DLSS/DLAA rendering mode; uses the game's depth/motion inputs and separate eye histories.
-- **Off:** native game frames only.
+## Recommended settings
 
-Start the game from the VR Launcher whenever OFXR is enabled.
+### Headset and OpenXR runtime
 
-The separate OFXR DLL is v0.2.1. With OptiScaler enabled it bootstraps OpenXR
-for the embedded implementation; no tray application is needed. The launcher
-saves settings in both `ofxr_bridge.ini` and the persistent root `OptiScaler.ini`.
-OptiScaler's **OFXR VR Framegen** GUI can change them live, even with Neural
-Rendering switched off.
+- **Refresh rate:** set it in your runtime. With WiVRn (set in the headset app), 90 Hz worked best on
+  the test setup. At 120 Hz the video stream could not keep up there and the picture turned blocky.
+- **Stream quality:** WiVRn's bitrate, render scale and foveation settings decide how sharp the
+  streamed image is. On the test setup a higher bitrate made a visible difference.
+- Connect the headset **before** you start the game.
 
-Separate OFXR and OptiScaler logging checkboxes are in the launcher. Logging,
-RAM timing capture, cadence diagnostics and the purple synthetic marker are off
-by default. The optional purple rectangle helps check whether generated frames
-reach the headset; FPS counters alone do not guarantee headset scanout.
-
-### ReShade and OptiScaler
-
-The integration dropdown offers Off, OptiScaler, ReShade and OptiScaler + ReShade, in that order. The default is Off.
-
-ReShade is installed as a plain runtime. Its add-ons and their configuration are entirely user-managed: the launcher does not copy, modify or remove them. Existing unrelated add-ons and ReShade settings are preserved. OptiScaler settings use Delete; ReShade uses F4. AFW debug uses Ctrl+F6.
-
-Disable DLSS Override before enabling OptiScaler. OptiScaler selections need a DLSS/DLAA render route. The INI `config_version` is a settings-format migration marker, not a required mod build version; a different value does not block launch. The experimental controller-locked HUD option holds the gameplay HUD in the F9-recentered front direction instead of following headset turns.
-
-### Cinema
-
-Choose `5:4`, `4:3`, `16:10` or `16:9` according to the content and the amount of peripheral view you want.
-
-### Diagnostic Logging
-
-Enable **Diagnostic Logging** only while collecting detailed information for a bug report. It is heavy and can affect timing or performance measurements.
-
-Quick XR/HUD logs and optional route/pipeline recorders also require Diagnostic
-Logging. With the switches off, these writers and recorders stay inactive.
-
-## Recommended Game Settings
-
-These are starting points rather than strict requirements:
+### In-game graphics
 
 | Setting | Recommendation |
-| --- | --- |
-| DirectX | DX12 |
+|---|---|
+| Anti-aliasing | **DLSS** on an RTX GPU, otherwise **FXAA**. FSR, XeSS and TAA keep one history for both eyes and ghost in Stereo. |
+| DLSS mode | **DLAA** looks best; **Quality** is faster. Both were used on the test setup (RTX 3080). There the frame rate was mostly limited by the CPU, so the faster DLSS modes gained little. |
+| Sharpening | Off. It adds shimmer after the headset stream's resampling. |
+| Frame generation, Reflex, ray reconstruction | Off. The mod presents its own eye pairs. The launcher and the Linux tool switch them off. |
 | Ray tracing | Off |
-| Screen-space reflections | Off or Low |
-| NVIDIA Reflex | Off |
-| Motion blur | Off |
-| Blur | Off |
-| Bloom | Off if it causes discomfort or visual artifacts |
-| Lens effects | Off if they look detached in VR |
-| Shadows | High or lower when CPU-limited |
-| HairWorks | Off |
-| VSync | Off |
-| Frame-rate limit | Off, or set to suit the headset and frame-generation mode |
+| Light shafts | Off. With the sun in view they lay a bright veil over the whole image in VR. |
+| Exploration and combat camera | *Close* (set by the launcher and the Linux tool) |
+| Motion blur, blur, lens effects | Off |
+| Foliage visibility range, grass density | These cost the most CPU in VR. Lower them first if the frame rate drops in towns or forests. |
 
-### Texture Quality and LOD
+The launcher's **World Detail Range** setting only affects 4.04; it has no effect on 5.01.
 
-The Texture Quality setting also affects LOD behaviour. Higher values keep detailed geometry and textures visible farther away, but may increase distant shimmering.
+### Why the frame rate moves in steps
 
-Suggested values:
+A headset display refreshes at a fixed rate and has no variable refresh rate (VRR). Each refresh
+shows the newest finished stereo pair (both eyes), re-aimed to your current head pose by the
+runtime, so turning your head stays smooth even when the game is slower. But if the game delivers,
+say, 40 pairs per second at 90 Hz, some pairs stay on screen for two refreshes and others for
+three, and camera and animation motion look slightly uneven. Motion is smoothest when the game runs
+at or just below half the refresh rate (about 44-45 pairs per second at 90 Hz). In Stereo the game
+presents each eye separately, so the Steam FPS counter shows twice the pair rate.
 
-- **No AA / FXAA:** Medium
-- **TAAU / DLSS:** Medium or High
-- **DLAA:** Higher values may be practical if performance allows
+### Optional settings (not yet default)
 
-## Useful Shortcuts
+The Linux tool's `configure` writes the tested preset. Among other things it sets these keys
+(`temporal_backend=dlss` on NVIDIA; on other GPUs it writes `none`, which means FXAA):
+
+```ini
+[openxr]
+hud_size=0.500
+hud_stereo_shift_px=-72
+hud_controller_locked=1
+
+[engine]
+temporal_backend=dlss
+remaster_asymmetric_ndc=1
+camera_mode=1
+close_camera_offset=-1.000
+```
+
+The values below are **not the defaults** yet, because they still need more testing.
+`remaster_asymmetric_ndc_cascade_fix=0` has been used in the headset; the others have only been
+tested headless so far. To try them, add them to `bin/x64_dx12/witcher3vr.ini` with the game
+closed, ideally one at a time. See the [Configuration reference](#configuration-reference) for
+what each one does.
+
+```ini
+[engine]
+remaster_asymmetric_ndc_cascade_fix=0
+remaster_shadow_pair_reuse=1
+remaster_light_flicker_per_pair=1
+remaster_local_light_pair_lock=1
+
+[perf]
+pair_barrier_lag=1
+```
+
+Keep `[debug] logging_enabled` and `runtime_diagnostics` at `0` for playing; diagnostics cost a lot
+of performance.
+
+## Controls
+
+These keys come from the original mod. `F9` is used on the test setup. The other keys have not
+all been re-tested in the headset on 5.01 by this project; `F11` and the HUD editor have not been
+tested on 5.01 at all yet.
 
 | Key | Action |
-| --- | --- |
-| `F2` | Toggle asymmetric/symmetric projection temporarily |
-| `F3` | Write the recent Route Log and Performance Log events |
+|---|---|
+| `F9` | Recenter the view. Configurable with `[openxr] recenter_key` (for example `F5` or `Space`). |
+| `F8` | Switch between the game's shoulder camera and the near view. On 5.01 the near view centres Geralt in front of you. |
+| `F10` | Toggle Cinema mode (the game on a flat virtual screen) |
+| `F11` | Toggle first person |
 | `F7` | Switch between the VR and Cinema3D HUD layouts |
-| `F8` | Toggle Standard and Near views |
-| `F9` | Recenter the VR view (configurable: `[openxr] recenter_key`, e.g. `F5` or `Space`) |
-| `F10` | Toggle Cinema Mode |
-| `F11` | Toggle First Person |
+| `Insert` | Open the HUD editor, or save and close it |
+| `F3` | Write the recent route and performance log events (with diagnostics on) |
 
-Shortcuts may conflict with overlays or other mods. Disable or rebind conflicting software when a key does not respond.
+In the HUD editor: `Q` / `E` select a panel, the arrow keys move it, the mouse wheel resizes it,
+`R` resets the panel and `X` resets the whole layout.
 
-## HUD Editor
+`F2` switches the 4.04 projection path. It is not meant for 5.01, where the projection is set by
+`remaster_asymmetric_ndc`.
 
-| Control | Action |
-| --- | --- |
-| `Insert` | Open the editor, or save and close it |
-| `Q` / `E` | Select the previous or next panel |
-| Arrow keys | Move the selected panel |
-| Mouse wheel | Resize the selected panel |
-| `R` | Reset the selected panel |
-| `X` | Reset the active HUD layout |
-| `F7` | Switch between the VR and Cinema3D HUD layouts |
+## Configuration reference
 
-The editor can separately position gameplay and cutscene subtitles, dialogue text and choices. Keep separate backups of layouts you want to reuse after reinstalling the mod.
+All keys live in `bin/x64_dx12/witcher3vr.ini`. The table lists the keys this project added or
+changed. The `remaster_*` keys, `hud_fade_mode`, `world_marker_exact_projection`,
+`hud_centre_split_aim_only` and `[perf] pair_barrier_lag` only act on the 5.01 build. The others
+also apply to 4.04, where this project has not re-tested them. Change them with the game closed.
+The original mod's keys are documented in [witcher3vr.example.ini](witcher3vr.example.ini).
 
-## Known Issues
+### `[openxr]`
 
-- Intermittent crashes, hangs and black-screen starts when using OFXR and integrations remain under investigation, including with ReShade/AER. The bundled ReShade fork fixes one reproduced SteamVR startup crash, not every failure. If affected, try disabling OFXR and selecting **Off** in the integration dropdown, and report your exact settings and diagnostic logs.
-- OFXR has been tested with VDXR and partially with SteamVR OpenXR. Other runtimes need validation.
-- Some FPS overlays report half frame rate while OFXR is active.
-- Mono mode is preliminary. Some cutscenes may not retain DLSS/DLAA or TAAU.
-- Ray tracing is temporarily unsupported because it does not currently work correctly with asymmetric projection.
-- Screen-space reflections on High can produce distracting stereo artifacts.
-- Motion blur, bloom and lens effects can look uncomfortable or detached in VR.
-- Some terrain can still look incorrect in a few Full VR cutscenes.
-- First-person mode can expose animation and camera issues, especially while moving backward or during scripted sequences.
-- Very distant cameras and some cutscenes may still show visual inconsistencies.
+| Key | Default | What it does |
+|---|---|---|
+| `hud_fade_mode` | `remove` | The game draws its fade to black into the HUD texture, which shows as a black rectangle in VR. `remove`: drop that fill, the world stays visible. `uniform`: darken each whole eye image instead. `native`: the game's own draw. Menus, loading screens and Cinema panels always keep the native fade. |
+| `hud_filtered_sampling` | `1` | Filter the HUD when it is shrunk (`hud_size` below 1), so text stays readable. All builds. |
+| `hud_anchor_level` | `1` | The controller-locked HUD keeps only your heading from the recenter, not head pitch or roll. All builds. |
+| `hud_scale_origin` | `visible` | `visible`: `hud_size` shrinks the HUD toward the centre of the visible image. `render`: toward the straight-ahead axis (old behaviour). All builds. |
+| `menu_vertical_center` | `visible` | `visible`: menus and loading screens are centred on the visible image. `forward`: old behaviour. All builds. |
+| `world_marker_exact_projection` | `1` | Project interaction prompts and NPC or door markers exactly through the HUD plane. Needs the controller-locked level HUD (`hud_controller_locked=1`, `hud_anchor_level=1`) in Stereo. `0`: the game's markers. |
+| `hud_centre_split_aim_only` | `1` | Redraw the HUD's centre square (crosshair) about the render centre only while aiming. If the crosshair is off target while aiming, try `0`. |
+| `cinema_restore_gameplay_recenter` | `1` | After a cutscene, gameplay keeps the forward direction it had before the cutscene. |
+| `frame_wait_early` | `0` | Experimental. Strict Stereo: wait for the next OpenXR frame right after submitting, in standard OpenXR loop order. No gain measured in headless tests with a WiVRn-like pacer; not tried in the headset. |
+| `pair_rate_divisor` | `0` | Experimental, `0`-`6`. Strict Stereo: hold each stereo pair for exactly N refreshes (2 = 45 pairs/s at 90 Hz). In headless tests it was less even than running free; keep `0`. |
 
-You are free to use other mods, but third-party mod compatibility is not
-supported during this stage of development. Before reporting a Witcher 3 VR
-bug, disable all other mods and reproduce the problem on an otherwise supported
-installation. Please do not open issues for problems that occur only while
-another mod is installed. This is a temporary development-scope limitation, not
-a restriction on using mods.
+### `[engine]`
 
-## Troubleshooting
+| Key | Default | What it does |
+|---|---|---|
+| `temporal_backend` | `auto` (the launcher and the Linux tool always write it) | On 5.01: `dlss` = the game's DLSS with a separate history per eye (the game's anti-aliasing must be DLSS too; the setup sets both); `none` = FXAA. |
+| `remaster_sl_wine_bypass` | auto | The game skips its DLSS (Streamline) setup under Wine. The mod removes that check in memory, on the exact 5.01 build only. Auto = on when `temporal_backend=dlss`. `0` = never, `1` = always. No effect on Windows. |
+| `remaster_dlss_per_eye_motion` | `1` | Keep a separate motion-vector camera history for each eye with per-eye DLSS. |
+| `remaster_asymmetric_ndc` | `0` | `1` = render each eye with its own off-centre field of view and send the whole image to the headset (sharper). The Linux tool sets `1`. Switches itself off for the session if it keeps failing. |
+| `remaster_asymmetric_ndc_reproject` | `1` | With per-eye projection: correct the game's temporal reprojection for it. |
+| `remaster_asymmetric_ndc_cascade_fix` | `1` | With per-eye projection: `1` fits the sun shadows to each eye's own view; `0` uses the same centred fit for both eyes, so distant shadows match between the eyes. The test setup uses `0`. |
+| `remaster_shadow_pair_reuse` | `0` | `1` = render the sun-shadow maps once per stereo pair; the second eye reuses them. Switches itself off after repeated mismatches. `9` is for measurements only. |
+| `remaster_light_flicker_per_pair` | `0` | `1` = flickering lights advance once per stereo pair: the same flicker in both eyes, at the normal speed. |
+| `remaster_local_light_pair_lock` | `0` | `1` = choose and fade local shadows for both eyes from the first eye's position. |
+| `remaster_local_shadow_slices` | `1` | `1`-`4` local-shadow atlas slices of 2048x2048. More slices let more lights cast shadows (4 costs about 24-48 MB more VRAM). |
+| `remaster_local_shadow_sort_corrected` | `0` | `1` = pack the nearest shadowed lights first, so an overflow drops far lights. |
+| `remaster_local_light_diag` | `0` | Log local-light and local-shadow choices per eye (needs diagnostics). |
+| `camera_mode` | `0` | Camera at game start: `0` = the game's shoulder camera, `1` = the near view, `2` = first person. `F8` and `F11` switch while playing. The Linux tool sets `1`. |
+| `close_camera_offset` | `0.750` | Near-view distance along the heading. Negative values move the camera **back**; the Linux tool writes `-1.000`. |
+| `close_camera_level` | `1` on 5.01 | Move the near view along the level heading instead of the pitched camera axis. |
+| `camera_center` | `1.0` | Near view: centre Geralt in front of you. `0`-`1` is the strength; `0` keeps the game's lateral offset. Releases while aiming, because the game aims from its own camera. |
+| `camera_center_smoothing_seconds` | `0.30` | Smoothing time for the centring. |
+| `camera_center_max_m` | `1.5` | Larger sideways offsets are not trusted; the camera then stays at the game's position. |
+| `descriptor_metadata_store` | `shadow` | How the renderer fixes keep track of descriptors. `shadow` is the fast store; `legacy` is the previous one, kept for comparison and as a fallback. All builds. |
+| `pair_barrier_spin_pauses` | `4096` | Strict Stereo: how long the game thread spins before it sleeps while it waits for the render thread. `0` = the old timed spin. |
 
-### Windows Defender or SmartScreen blocks a file
+### `[perf]`
 
-The mod's `dxgi.dll` hooks into the game, and neither it nor the launcher is code-signed. Windows
-Defender can therefore flag the DLL as a false positive (for example `Trojan:Win32/Wacatac.C!ml`)
-and remove it, and SmartScreen can show "Windows protected your PC" when the launcher starts.
+| Key | Default | What it does |
+|---|---|---|
+| `pair_barrier_lag` | `0` | 5.01 strict Stereo. `1` = the game thread runs one stereo pair ahead of the render thread instead of waiting for it. More frames per second when CPU-limited; game input reacts about one pair later. |
+| `pair_pose_lead_adaptive` | `1` | With `pair_barrier_lag=1`: predict the head pose as far ahead as the pairs actually take. |
+| `shadow_profile`, `descriptor_shadow_verify` | `0` | Measurement switches; they need the `[vrs]` census log (`mode=3`, `log=1`). |
 
-- Only use packages from the [releases page](https://github.com/joschi127/witcher3-vr/releases);
-  each release lists the SHA256 checksum of its archive.
-- SmartScreen: choose **More info**, then **Run anyway**.
-- Defender: restore the file from **Protection history** and add an exclusion for the game's
-  `bin\x64_dx12` folder, or extract the package again after adding the exclusion.
+### `[vrs]` and `[test]` (developers)
 
-### The game crashes when ReShade is enabled
+| Key | Default | What it does |
+|---|---|---|
+| `[vrs] mode` | `0` | `3` = shade the scene at one uniform coarse rate and write census lines with frames per second. Measurement only, not for play. `uniform_rate`, `classes` and `log` tune it. |
+| `[test] openxr_loader` | empty | Load this DLL instead of `openxr_loader.dll`, for the headless runtime. Must be empty for headset play; the Linux tool's `configure` clears it. |
 
-- Select **Off** in the launcher's integration dropdown and save.
-- Use the ReShade build supplied with this package: it includes the validated SteamVR startup crash fix. An unmodified ReShade installation does not include our change. Other crashes may have a different cause.
-- When reporting it, include your selected integration, GPU/driver, headset/runtime, and the ReShade and Witcher3VR logs.
+## Platform support
 
-### The game does not enter VR
+| Platform | Status | Notes |
+|---|---|---|
+| Linux + Proton, NVIDIA | Tested | One setup, see the top of this page. |
+| Linux + Proton, AMD or Intel (including Steam Deck) | Untested | Stereo with FXAA should work. DLSS needs an NVIDIA RTX GPU. |
+| Windows 10/11 (native Direct3D 12) | Untested | The new code does not depend on Wine or vkd3d-proton, and the Remastered port this project builds on was developed on Windows. This project's build has not been run on Windows yet. |
+| WiVRn | Tested | |
+| SteamVR (Windows or Linux) | Untested | |
+| Virtual Desktop (VDXR), Meta Quest Link / Air Link, Pimax, Monado, other OpenXR runtimes | Untested | Headsets with canted displays (for example Pimax) use a camera path that has not been tried on 5.01; we suggest `remaster_asymmetric_ndc=0` there. |
+| GOG edition, patch 5.01 | Untested by this project | Expected to use the same game executable as the Steam edition. The mod checks the executable and the game code before it hooks anything. |
+| Epic edition | Unknown | Works only if its game executable is the same 5.01 build the mod knows; otherwise the mod leaves the game alone. |
+| Any patch other than 5.01 | Not supported | The mod recognises an unknown build and leaves the game alone. |
+| Next-Gen 4.04 | Not re-tested | This project changes code that 4.04 also uses. For 4.04, use the [original mod](https://github.com/tig3rmast3r/witcher3-vr). |
 
-- Confirm that the correct OpenXR runtime is active.
-- Turn off Windows HDR.
-- Close RivaTuner Statistics Server (RTSS), including any overlay using it.
-- Start the game through `bin\x64_dx12\Witcher3VRLauncher.exe`.
-- Temporarily disable overlays and other DLL injectors.
-- Reinstall the complete release package instead of replacing only the DLL.
+Feature status on the tested setup:
 
-### The image is distorted after changing Presentation Size
+| Feature | Default | Status |
+|---|---|---|
+| Per-eye DLSS, DLSS under Proton | With DLSS selected | Tested in the headset |
+| Per-eye projection (`remaster_asymmetric_ndc`) | Off (Linux tool: on) | Tested in the headset |
+| HUD filtering, level HUD, centred HUD and menus | On | Tested in the headset |
+| No black fade rectangle (`hud_fade_mode`) | On | Headless tests only |
+| Exact world markers | On, with the controller-locked HUD | Headless tests only |
+| Geralt centred in the near view | On in the near view | Headless tests only |
+| Forward direction kept after cutscenes | On | Not tested in the headset yet |
+| Descriptor store (`descriptor_metadata_store=shadow`) | On | Headless tests only |
+| Run-ahead (`pair_barrier_lag`) | Off | Headless tests only |
+| Shared sun shadows (`remaster_shadow_pair_reuse`) | Off | Headless tests only |
+| Per-pair flicker and local shadows | Off | Headless tests only |
+| `frame_wait_early`, `pair_rate_divisor` | Off | Experimental, no gain measured |
 
-- Restore Presentation Size to `1.00`.
+## Troubleshooting and known issues
 
-### Performance is poor in cities
+**The game does not enter VR (Linux)**
+- Connect the headset to WiVRn before you start the game. WiVRn only registers the active OpenXR
+  runtime while a headset is connected, and Proton sets up VR once, at launch.
+- Check the launch options (see [Linux installation](#linux-steam--proton)) and run
+  `python3 linux/w3vr-linux.py status`.
+- Make sure `[test] openxr_loader` in `witcher3vr.ini` is empty.
 
-The Witcher 3 is already CPU-bound in busy cities, and the VR mod increases CPU load further. A recent high-end CPU is required for consistently high frame rates in these areas.
+**The mod does nothing.** The game build is probably not 5.01, for example after a game update.
+`python3 linux/w3vr-linux.py status` shows the detected build.
 
-- Lower World Detail Range gradually.
-- Reduce shadows, crowd density and background characters.
-- Try AER + AFW instead of full stereo.
-- Reduce render resolution before reducing texture quality.
-- Test OFXR with VDXR if native performance is still insufficient.
+**Script compilation error when the game starts.** The 4.04 state-bridge script is installed. Use
+the 5.01 version from `support/remaster/` (the Linux tool does this for you).
 
-### OptiScaler does not work
+**DLSS is missing or has no effect under Proton.** Set `[engine] temporal_backend=dlss` (the Linux tool
+does this on NVIDIA) and select DLSS as the game's anti-aliasing. Make sure NVAPI is enabled
+(`PROTON_ENABLE_NVAPI=1`), that `[engine] remaster_sl_wine_bypass` is not `0`, and that you use an
+RTX GPU.
 
-- Disable DLSS Override.
+**Ghosting or blending between the eyes.** Use DLSS with `temporal_backend=dlss`, or FXAA. The
+game's FSR, XeSS and TAA are not supported in Stereo.
 
-## Bug Reports
+**The HUD is too big or sits at the edges of the view.** Use `hud_size=0.5` with
+`hud_controller_locked=1` (the Linux tool's default), then press `F9` while looking straight ahead.
 
-Report problems with this fork, and anything on Remastered 5.x, in
-[this fork's issues](https://github.com/joschi127/witcher3-vr/issues), not in the original
-repository.
+**The HUD jumps back toward the corners after visiting Options > Video.** The game's *Rescale HUD*
+screen resets a HUD frame scale below 0.9 (`hud_horizontal_scale`, `hud_vertical_scale`). Install
+the `modW3VRKeepHudFrameScale` script mod (the Linux tool does this).
 
-When reporting a problem, include:
+**Markers float above people.** Exact markers need the controller-locked HUD
+(`hud_controller_locked=1`).
 
-- Game version (Next-Gen 4.04 or Remastered 5.x)
+**The view points the wrong way after a runtime recenter** (SteamVR's *Reset seated position*, the
+Meta button). The mod does not follow runtime recenters yet; press `F9`.
 
-- Headset and OpenXR runtime
-- GPU and driver version
-- Render mode and anti-aliasing/upscaler mode
-- Resolution, Presentation Size and World Detail Range settings
-- Whether OFXR or OptiScaler is active
-- A short description of where the issue occurs
-- A diagnostic log only when requested or when it clearly captures the problem
+**Motion looks uneven.** See [Why the frame rate moves in steps](#why-the-frame-rate-moves-in-steps).
+Turn diagnostics off, lower the foliage and grass settings, or choose a faster DLSS mode.
 
-## Support
+**Windows Defender or SmartScreen blocks a file.** `dxgi.dll` hooks into the game and nothing is
+code-signed, so Defender may flag it as a false positive and SmartScreen may warn. Only use files
+you built yourself or downloaded from this repository's releases.
 
-The mod is free and publicly available. Donations are entirely optional and
-never provide exclusive builds, features, or support.
+Known issues:
 
-If you would like to support the original author's work on the mod, you can do so through
-[Ko-fi](https://ko-fi.com/tig3rmast3r) or by using the Sponsor button on the
-[original repository](https://github.com/tig3rmast3r/witcher3-vr).
+- Under Proton, the game loads more slowly than on Windows, and the automatic reload after
+  Geralt dies can hang. Both also happen without the mod; quit the game and load the save manually.
+- The desktop game window takes the per-eye size, so it can be taller than your monitor. This is
+  harmless.
+- Some dialogue cameras clip slightly through walls.
+- Distant water can switch between blue and white depending on your head pose (an open issue from
+  the Remastered port).
+- A few effects still differ slightly between the eyes: wind-blown foliage has no motion vectors in
+  the second eye, and eye adaptation and LOD fades advance once per eye.
+- Motion controllers are not supported. Use mouse and keyboard or a gamepad.
+- Not tested on 5.01 yet: first person (`F11`), the HUD editor, and aiming with the crossbow.
 
-## Credits
+## Building from source
 
-### ReShade, DLSS5 and upscaling
+The build needs the dependencies that `scripts/setup-dependencies.ps1` (Windows) or
+`linux/build/fetch-deps.sh` (Linux) download into `external/` at pinned revisions: MinHook, the
+OpenXR SDK, DirectX-Headers and the NVIDIA NGX headers from Streamline. The NGX headers are
+downloaded at build time and must never be committed.
 
-- [Patrick Mours (crosire) and ReShade contributors](https://github.com/crosire/reshade) — post-processing runtime, overlay and add-on API. The package uses [our unofficial ReShade VR fork](https://github.com/tig3rmast3r/ReShade_VR), based on 6.8.0, with a targeted DirectX 11/12 compatibility fix for the reproduced SteamVR startup crash. Original copyright and license notices are retained.
-- [The OptiScaler team and contributors](https://github.com/optiscaler/OptiScaler) — the original upscaling integration.
-- [Dagherbou / OptiScaler_DLSSNR](https://github.com/Dagherbou/OptiScaler_DLSSNR) — DLSS Neural Rendering support in OptiScaler. [Our VR fork](https://github.com/tig3rmast3r/OptiScaler_DLSSNR_VR) adds separate processing for each eye to prevent flickering and unstable colours.
-- [sadbee166](https://github.com/sadbee166) — author of [OptiScaler_DLSSNR PR #6](https://github.com/Dagherbou/OptiScaler_DLSSNR/pull/6), which introduced running DLSS Neural Rendering before DLSS upscaling and is the basis of the VR v2 pre-DLSS path.
-- [NVIDIA / Streamline and NGX](https://github.com/NVIDIA-RTX/Streamline) — DLSS technologies and integration interfaces. NVIDIA DLSS5 runtime DLLs are not distributed with Witcher3VR.
-- [AMD / FidelityFX](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK) — upscaling and optical-flow technology used by the integrations.
-- [Omar Cornut and contributors / Dear ImGui](https://github.com/ocornut/imgui) — interface components used by the overlays and add-ons.
+### Linux (clang-cl in a distrobox)
 
-### VR, frame generation and other components
+The Linux build produces `dxgi.dll` with clang-cl and lld-link against Microsoft's C runtime and
+Windows SDK, which [xwin](https://github.com/Jake-Shadle/xwin) downloads. Details:
+[linux/BUILD-LINUX.md](linux/BUILD-LINUX.md).
 
-- [PureDark](https://github.com/PureDark) — the AFW component used by AER + AFW.
-- [OFXR Bridge](https://github.com/tig3rmast3r/OFXR-Bridge) — optical-flow-based VR frame generation, with AMD and NVIDIA backends.
-- [praydog / REFramework](https://github.com/praydog/REFramework) — DX12
-  hooking and VR architecture reference
-- [praydog / UEVR](https://github.com/praydog/UEVR) — additional VR
-  implementation reference
-- [emoose / DLSSTweaks](https://github.com/emoose/DLSSTweaks) — ForceDLAA
-  parameter-query and resolution-override approach
-- [Next Gen Movement Input Lag Fix — Fumio Edition](https://www.nexusmods.com/witcher3/mods/7586)
-  — behavior-graph foundation for the optional Fast Transitions DLC
-- [MinHook](https://github.com/TsudaKageyu/minhook) — Windows API hooking
-  library
-- [Khronos OpenXR SDK](https://github.com/KhronosGroup/OpenXR-SDK)
-- [Microsoft DirectX-Headers](https://github.com/microsoft/DirectX-Headers)
-- [baldurk and contributors / RenderDoc](https://github.com/baldurk/renderdoc) — graphics diagnostics and capture tooling.
-- Testers who provided headset-specific feedback, logs and performance comparisons
+1. Create and enter an Ubuntu 24.04 container:
 
-See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for copyright notices and
-third-party licensing information.
+   ```bash
+   distrobox create --name w3vr-build --image ubuntu:24.04
+   distrobox enter w3vr-build
+   ```
 
-## Contributing
+2. Inside it, install LLVM/Clang 22 from [apt.llvm.org](https://apt.llvm.org/) (the build scripts
+   use `/usr/lib/llvm-22/bin`), plus CMake 3.24 or newer, Ninja and Git.
+3. Download xwin from its releases page and create the sysroot. xwin downloads Microsoft's CRT and
+   Windows SDK only after you accept
+   [Microsoft's licence terms](https://go.microsoft.com/fwlink/?LinkId=2086102); pass
+   `--accept-license` once you have read them. Never commit or redistribute the sysroot.
 
-Development information is available in [CONTRIBUTING.md](CONTRIBUTING.md). The README intentionally focuses on installing, configuring and playing the mod.
+   ```bash
+   export XWIN_SYSROOT="$HOME/xwin-sysroot"
+   xwin --accept-license --arch x86_64 splat --output "$XWIN_SYSROOT"
+   ```
 
-## License
+4. From the repository root, fetch the dependencies and build:
 
-Original Witcher 3 VR code is released under the [MIT License](LICENSE), unless
-otherwise stated.
+   ```bash
+   linux/build/fetch-deps.sh .
+   SRC="$PWD" OUT="$PWD/build/linux-clang-cl" LOGS="$PWD/build/linux-clang-cl/logs" \
+     XWIN_SYSROOT="$XWIN_SYSROOT" linux/build/build-dxgi.sh
+   ```
 
-Third-party software remains the property of its respective authors and is
-distributed under its own license terms. The project's MIT license does not
-relicense third-party components or NVIDIA SDK materials.
+   The result is `build/linux-clang-cl/dxgi.dll`. It links the C runtime statically. The launcher and
+   the tests are not part of the Linux build.
 
-## Disclaimer
+### Windows (Visual Studio 2022)
 
-> This is an unofficial fan work and is not approved or endorsed by
-> CD PROJEKT RED.
+You need Visual Studio 2022 with the *Desktop development with C++* workload, CMake 3.24 or newer
+and Git. In PowerShell, from the repository root:
 
-This project is not affiliated with CD PROJEKT RED, CD PROJEKT S.A., NVIDIA, or
-the authors of the third-party projects listed above.
+```powershell
+.\scripts\setup-dependencies.ps1
+cmake --preset release
+cmake --build --preset release
+ctest --preset release
+```
 
-All trademarks, game content, and related intellectual property belong to
-their respective owners. This project does not distribute game assets and
-requires a legally obtained copy of *The Witcher 3: Wild Hunt*.
+`dxgi.dll` is built as `build/release/Release/dxgi.dll` and the launcher as
+`build/release/launcher/Release/Witcher3VRLauncher.exe`. Both link the C runtime statically. More
+in [CONTRIBUTING.md](CONTRIBUTING.md).
 
-The software is provided as-is and without warranty. Use it at your own risk
-and keep backups of saves and configuration files.
+## Headless testing (for developers)
 
-This project is intended to comply with the
+`tools/w3vr-nullxr` is a minimal OpenXR runtime (Direct3D 12 only) that lets you run the whole VR
+path without a headset, also under Proton. It reports a static Quest 3-like headset (field of view
+and recommended size as reported by WiVRn), paces `xrWaitFrame`, accepts every submitted layer and
+can save the submitted eye images, including the HUD, as BMP files. It is a development tool, built
+separately from the mod, and not part of the release packages.
+
+> [!CAUTION]
+> A test run loads your latest save and the game may autosave. Back up your saves first, and don't
+> touch the mouse, keyboard or gamepad during a scripted run.
+
+1. Build it inside the build container: `XWIN_SYSROOT="$XWIN_SYSROOT" tools/w3vr-nullxr/build.sh`
+   (output: `build/w3vr-nullxr/w3vr_nullxr.dll`).
+2. Copy the DLL to `<game>/bin/x64_dx12/w3vr_nullxr/`.
+3. Point the mod at it in `witcher3vr.ini`, for test runs only:
+
+   ```ini
+   [test]
+   openxr_loader=w3vr_nullxr\w3vr_nullxr.dll
+   input_script=linux-capture-remaster.txt
+   ```
+
+   The mod loads the runtime DLL in place of `openxr_loader.dll`, so the test does not depend on
+   Proton's OpenXR bridge or a host runtime.
+4. Input scripts are in `scripts/test-input/`; copy one next to the game exe. Scripts drive a
+   virtual gamepad. On 5.01, if no real gamepad is connected, the mod reports a virtual one to the
+   game, so no controller is needed. The timings in the scripts depend on how fast the game loads
+   on your PC; adjust them if needed.
+5. **Clear `openxr_loader` again before playing with a headset.**
+
+Environment variables (for example in the Steam launch options):
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `W3VR_NULLXR_HZ` | `90` | Display rate |
+| `W3VR_NULLXR_PACER` | unset | Unset: fixed-rate pacing that never blocks a late frame (free-running throughput). `wivrn`: a model of WiVRn's application pacer, which shows the frame-rate steps you get in the headset. |
+| `W3VR_NULLXR_CAPTURE_START_MS`, `_EVERY_MS`, `_MAX`, `_AT_MS` | `30000`, `0`, `40`, unset | When to save captures, in ms after the session starts |
+| `W3VR_NULLXR_MOTION` | `off` | `yaw_sine` or `yaw_triangle`: scripted head turns |
+| `W3VR_NULLXR_IPD` | `0.063` | Eye distance in metres |
+| `W3VR_NULLXR_STATS_MS` | `5000` | Period of the `pacing` summary lines (unique frames per second and how many refreshes each frame stayed up) |
+
+A file named `capture.now` in the capture folder triggers one capture. The runtime's log is
+`w3vr_nullxr.log` next to its DLL. The full list of variables is in the header of
+`tools/w3vr-nullxr/w3vr_nullxr.cpp`.
+
+For mod logs, set `[debug] logging_enabled=1` and `runtime_diagnostics=1`; the log is written to
+`bin/x64_dx12/witcher3vr.log`. For frame-rate measurements, use the `[vrs]` census instead
+(`mode=3`, `uniform_rate=1x1`, `log=1`, diagnostics off).
+
+## Documentation
+
+- [LINUX.md](LINUX.md): Linux and Proton details, tuning and known issues.
+- [linux/BUILD-LINUX.md](linux/BUILD-LINUX.md): the Linux build in detail.
+- [docs/remaster-port-status.md](docs/remaster-port-status.md): the technical log of the 5.x port,
+  including how each feature in this project works.
+- [docs/remaster-open-issues.md](docs/remaster-open-issues.md): known problems on 5.01.
+- [The Remastered port's README](https://github.com/joschi127/witcher3-vr/blob/remaster/README.md):
+  the README of the port this project builds on, with the original mod's full feature
+  description, launcher guide and HUD editor.
+- [witcher3vr.example.ini](witcher3vr.example.ini): every mod setting with comments.
+- [CONTRIBUTING.md](CONTRIBUTING.md) and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+Upstream projects:
+
+- [tig3rmast3r/witcher3-vr](https://github.com/tig3rmast3r/witcher3-vr): the original Witcher 3 VR
+  mod (Next-Gen 4.04).
+- [joschi127/witcher3-vr, `remaster` branch](https://github.com/joschi127/witcher3-vr/tree/remaster):
+  the Remastered 5.x port.
+
+## Reporting problems
+
+Report problems with this project in
+[this repository's issues](https://github.com/kaarele/witcher3-remastered-vr/issues), not in the
+upstream repositories. Reports from other setups are very welcome, whether it works or not. Please
+include:
+
+- Operating system, GPU, headset and OpenXR runtime
+- Game store and patch
+- Render mode, anti-aliasing and DLSS mode
+- What happened and where in the game
+- If possible, `bin/x64_dx12/witcher3vr.log` from a run with diagnostics on. Logs can contain
+  local paths and system details; check them before you post them.
+
+Please reproduce problems without other mods installed first.
+
+## License and credits
+
+### License
+
+The source code of this project is released under the [MIT License](LICENSE):
+
+- Copyright (c) 2026 tig3rmast3r
+- Copyright (c) 2026 joschi127 (Remastered port)
+- Copyright (c) 2026 kaarele (Linux/Proton support and Remastered 5.x VR improvements)
+
+The MIT License covers only this project's own code. Third-party components keep their own
+licenses; they are listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md), and their license
+texts are reproduced there or in [licenses/](licenses/). NVIDIA SDK materials are not licensed
+under the MIT License.
+
+The headless test runtime in [`tools/w3vr-nullxr`](tools/w3vr-nullxr) contains frame-pacing logic
+adapted from [WiVRn](https://github.com/WiVRn/WiVRn) and is therefore licensed under the GNU
+General Public License v3.0 or later. It is a development tool, built separately from the mod, and
+is not part of the release packages.
+
+### Credits
+
+- **[tig3rmast3r](https://github.com/tig3rmast3r)** created
+  [Witcher 3 VR](https://github.com/tig3rmast3r/witcher3-vr), the original VR mod for patch 4.04:
+  the stereo renderer, OpenXR integration, launcher, VR HUD and HUD editor, first-person mode,
+  cinema modes, and the upscaling and frame-generation integrations. Most of the code in this
+  repository is his work.
+- **[joschi127](https://github.com/joschi127)** ported it to The Witcher 3 Remastered (patch 5.x)
+  in the [`remaster` branch of joschi127/witcher3-vr](https://github.com/joschi127/witcher3-vr/tree/remaster).
+  This project continues that port.
+- **djules75** and the other contributors to those repositories. Their commits are kept in this
+  repository's history.
+- **[kaarele](https://github.com/kaarele)** added Linux/Proton support with a setup tool and a
+  Linux build, DLSS on 5.01 under Proton with a separate history per eye, the per-eye projection,
+  the CPU and frame-pacing work, the HUD, marker and camera fixes, and the headless test runtime.
+- The testers of the upstream projects, who sent headset-specific feedback, logs and performance
+  comparisons.
+
+Third-party components used to build the mod or included in its packages:
+
+| Component | Authors | License | Used for |
+|---|---|---|---|
+| [MinHook](https://github.com/TsudaKageyu/minhook), with the Hacker Disassembler Engine | Tsuda Kageyu; Vyacheslav Patkov | BSD-2-Clause | Function hooking (built into `dxgi.dll`) |
+| [OpenXR SDK](https://github.com/KhronosGroup/OpenXR-SDK): headers and loader | The Khronos Group Inc., Valve Corporation, LunarG, Inc., Collabora, Ltd. | Apache-2.0 OR MIT (used under MIT) | The OpenXR API and `openxr_loader.dll` |
+| [JsonCpp](https://github.com/open-source-parsers/jsoncpp) | Baptiste Lepilleur and The JsonCpp Authors | MIT or Public Domain | Part of `openxr_loader.dll` |
+| [DirectX-Headers](https://github.com/microsoft/DirectX-Headers) | Microsoft Corporation | MIT | Direct3D 12 headers |
+| NVIDIA NGX SDK headers, from [NVIDIA Streamline](https://github.com/NVIDIA-RTX/Streamline) | NVIDIA Corporation | NVIDIA RTX SDKs License | DLSS interface definitions (downloaded at build time, not redistributed) |
+| [RenderDoc](https://github.com/baldurk/renderdoc) in-application API header | Baldur Karlsson | MIT | Optional frame-capture support |
+| [DLSSTweaks](https://github.com/emoose/DLSSTweaks) | emoose | MIT | The ForceDLAA approach |
+
+This software contains source code provided by NVIDIA Corporation. This project does not
+distribute any NVIDIA DLLs. DLSS uses the NVIDIA Streamline and DLSS runtime that come with the
+game and the NVIDIA graphics driver. Under Proton the mod disables one check in the game's own code
+that turns off the game's Streamline setup under Wine; it does not modify or redistribute any
+NVIDIA component.
+
+Not bundled with the mod:
+
+- [REFramework](https://github.com/praydog/REFramework) and [UEVR](https://github.com/praydog/UEVR)
+  by praydog were used as references for DX12 hooking and VR architecture.
+- [WiVRn](https://github.com/WiVRn/WiVRn) by Patrick Nicolas and contributors: its application
+  frame pacer is adapted in the headless test runtime (see [License](#license) above).
+
+The original Witcher 3 VR release also ships optional components that are not ported to 5.x:
+OptiScaler and its DLSS Neural Rendering fork (the OptiScaler team, Dagherbou, sadbee166), OFXR
+Bridge, ReShade VR (Patrick Mours (crosire) and contributors), PureDark's AFW plugin, AMD
+FidelityFX, Dear ImGui (Omar Cornut and contributors), the RenderDoc runtime, and the Fast
+Transitions DLC based on the
+[Next Gen Movement Input Lag Fix — Fumio Edition](https://www.nexusmods.com/witcher3/mods/7586).
+This project's release packages will not include any of them. You can get them, with their credits
+and licenses, from the [original release](https://github.com/tig3rmast3r/witcher3-vr/releases).
+
+If you would like to support the original author's work, see
+[tig3rmast3r's Ko-fi](https://ko-fi.com/tig3rmast3r) or the Sponsor button on the
+[original repository](https://github.com/tig3rmast3r/witcher3-vr). This project is free and
+non-commercial; there are no paid or supporter-only builds.
+
+### Disclaimer
+
+> This is an unofficial fan work and is not approved/endorsed by CD PROJEKT RED.
+
+This project is not affiliated with, sponsored by or endorsed by CD PROJEKT RED or CD PROJEKT
+S.A., NVIDIA Corporation, Meta Platforms, Inc., Valve Corporation, Microsoft, The Khronos Group
+Inc., or the authors of the third-party projects listed above. It is not an official release of
+the upstream Witcher 3 VR projects either. It aims to follow the
 [CD PROJEKT RED Fan Content Guidelines](https://www.cdprojektred.com/en/fan-content).
+
+This project's release packages will contain no game files or game assets. The mod changes the
+game's code only in memory while the game runs; apart from the
+[Windows launcher problem](#windows-untested) noted above, it does not modify game files on disk.
+The mod and its setup tools do edit the game's settings files (`dx12user.settings`,
+`input.settings`); the setup tools keep backups. To use the mod you need a legally obtained copy
+of *The Witcher 3: Wild Hunt*. All game content remains the property of CD PROJEKT RED.
+
+CD PROJEKT®, The Witcher® and REDengine® are registered trademarks of CD PROJEKT Capital Group.
+NVIDIA, GeForce RTX and DLSS are trademarks and/or registered trademarks of NVIDIA Corporation.
+Meta Quest is a trademark of Meta Platforms, Inc. Steam, SteamVR and SteamOS are trademarks and/or
+registered trademarks of Valve Corporation. OpenXR™ is a trademark owned by The Khronos Group Inc.
+Windows and DirectX are trademarks of the Microsoft group of companies. All other names belong to
+their respective owners and are used here only to describe compatibility.
+
+The software is provided "as is", without warranty of any kind (see [LICENSE](LICENSE)). Use it at
+your own risk, and back up your saves and settings before you install it.

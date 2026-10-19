@@ -1,5 +1,10 @@
 # Project guidelines
 
+> Inherited from [joschi127/witcher3-vr](https://github.com/joschi127/witcher3-vr/tree/remaster),
+> the Remastered port this repository continues. The local-notes, build and Git workflow sections
+> describe that fork's setup. This repository's own rules are in [CONTRIBUTING.md](../CONTRIBUTING.md),
+> and the Linux build is in [linux/BUILD-LINUX.md](../linux/BUILD-LINUX.md).
+
 Guidelines for everyone working on this fork: developers and AI coding agents alike. Agent
 entry files (`CLAUDE.md`, `AGENTS.md`, `.junie/guidelines.md`,
 `.github/copilot-instructions.md`) only point here; keep the content in this file.
@@ -220,7 +225,15 @@ same). The material they were derived from is not.
   5.x VR settings the button must write (verified so far; details in
   `docs/remaster-port-status.md`):
   - `[PostProcess] AAMode=1` (FXAA; 5.x values: 0 off, 1 FXAA, 5 FSR, 6 DLSS, 7 XeSS). The mod
-    runs the No-AA route on 5.x; TAAU does not exist there.
+    runs the No-AA route on 5.x; TAAU does not exist there. DLSS modes write `AAMode=6`,
+    `AllowDLSS=true`, `DLSSQuality` (5.x: 1 Quality, 2 Balanced, 3 Performance, 4 Ultra
+    Performance, 5 DLAA), `AllowDLSSG=false` and `AllowReflex=false`; the game runs its own DLSS
+    and the DLL gives each eye its own Streamline viewport (DLSS: verified under Proton on NVIDIA
+    only).
+  - Sharpening off (`[PostProcess] SharpenAmount=0`, `[Rendering/TAA] EnableCAS=false`).
+  - Close exploration and combat cameras (`[Gameplay] EnableAlternateExplorationCamera=1`,
+    `EnableAlternateCombatCamera=1`), as on 4.04: the 5.x Modern camera re-frames while walking,
+    which reads as zooming with the game pitch locked.
   - `[PostProcess] AllowShafts=false`: 5.x light shafts veil the whole image whenever the sun is
     in view, which the wide VR field of view makes almost permanent (washed-out colours).
   - Ray tracing off (`[Rendering/RT] EnableRT`, `RTAOEnabled`, `RTGIPreset`, `Shadows`,

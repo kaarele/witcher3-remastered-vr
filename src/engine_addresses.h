@@ -29,8 +29,15 @@ enum class Function : size_t {
     FrameBuilder,      // render-thread frame build (render_context, frame, extra)
     CameraEnableManualControl,  // native CCustomCamera.EnableManualControl
     CameraDirection,   // native CCameraDirector.GetCameraDirection (first of two copies)
+    WorldVectorToViewRatio,  // native CCameraDirector.WorldVectorToViewRatio
     ViewportResolution,  // (fullscreen, resolution setting, int* width, int* height)
     CameraLightPlacement,  // places one camera light from the render camera (pos + yaw)
+    DlssConstantsBuilder,  // fills Streamline constants + tags (state, frame_data, reset)
+    DlssInputPrepare,      // tags the DLSS inputs (state, frame_data, params)
+    DlssSrApply,           // sets DLSS options and evaluates SR (state, frame_data, params, pass, ...)
+    TemporalCameraBuild,   // builds the 0xB0 temporal camera record (motion-vector camera)
+    FrustumCornerHelper,   // view frustum corners for shadow cascades (view, ndc_z, out, rebuild)
+    GuiFillRect,           // 2D colour quad into the GUI target (_, x, y, w, h, const uint8_t rgba[4])
     Count,
 };
 
@@ -118,6 +125,16 @@ inline constexpr uint8_t kCameraDirection501Bytes[] = {
     0x48, 0xFF, 0x42, 0x30, 0xC5, 0xFA, 0x10, 0x81, 0x90, 0x07, 0x00, 0x00,
     0xC5, 0xFA, 0x10, 0x89, 0x94, 0x07, 0x00, 0x00};
 
+// Registered script native: decodes the world vector and the two out floats
+// through the script decoder table (the lea r14 in these bytes; null entries
+// are skipped), then calls the projection helper 0x02385EB0, which reads the
+// world-to-clip at director+0x2E0 like 4.04. 32 bytes because the first 24
+// occur twice in the exe.
+inline constexpr uint8_t kWorldVectorToViewRatio501Bytes[] = {
+    0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x6C, 0x24, 0x20, 0x56, 0x57,
+    0x41, 0x56, 0x48, 0x83, 0xEC, 0x40, 0x48, 0x8B, 0x42, 0x30, 0x4C, 0x8D,
+    0x35, 0x03, 0x2E, 0x6F, 0x03, 0xC5, 0xF9, 0xEF};
+
 // Same signature and logic as 4.04 (desktop size from DXGI, then the "WxH"
 // setting); 5.01 moved the DXGI part into a helper (0x0228E230).
 inline constexpr uint8_t kViewportResolution501Bytes[] = {
@@ -130,6 +147,50 @@ inline constexpr uint8_t kViewportResolution501Bytes[] = {
 inline constexpr uint8_t kCameraLightPlacement501Bytes[] = {
     0x48, 0x8B, 0xC4, 0x48, 0x89, 0x70, 0x10, 0x4C, 0x89, 0x60, 0x18, 0x55,
     0x41, 0x56, 0x41, 0x57, 0x48, 0x8D, 0xA8, 0xF8, 0xFE, 0xFF, 0xFF, 0x48};
+
+// DLSS SR on 5.01 (Streamline 2). Leading bytes, unique in the exe at these lengths.
+inline constexpr uint8_t kDlssConstantsBuilder501Bytes[] = {
+    0x44, 0x88, 0x44, 0x24, 0x18, 0x55, 0x53, 0x41, 0x56, 0x48, 0x8D, 0xAC,
+    0x24, 0xA0, 0xC2, 0xFF, 0xFF, 0xB8, 0x60, 0x3E, 0x00, 0x00, 0xE8, 0x55};
+inline constexpr uint8_t kDlssInputPrepare501Bytes[] = {
+    0x40, 0x55, 0x56, 0x41, 0x56, 0x48, 0x8D, 0x6C, 0x24, 0xB9, 0x48, 0x81,
+    0xEC, 0xF0, 0x00, 0x00, 0x00, 0x48, 0x83, 0x3A, 0x00, 0x48, 0x8B, 0xF2};
+inline constexpr uint8_t kDlssSrApply501Bytes[] = {
+    0x4C, 0x8B, 0xDC, 0x55, 0x53, 0x57, 0x41, 0x56, 0x41, 0x57, 0x48, 0x8D,
+    0x6C, 0x24, 0xA0, 0x48, 0x81, 0xEC, 0x60, 0x01, 0x00, 0x00, 0x80, 0x79};
+// Same code as 4.04 0x015FE010 apart from the AVX encoding; its 0x4E-byte
+// wrapper (5.01 0x02291BB0, 4.04 0x015FFA40) matches instruction for instruction.
+inline constexpr uint8_t kTemporalCameraBuild501Bytes[] = {
+    0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58, 0x08, 0x48, 0x89, 0x70, 0x10, 0x48,
+    0x89, 0x78, 0x18, 0x55, 0x48, 0x8D, 0xA8, 0x18, 0xFF, 0xFF, 0xFF, 0x48,
+    0x81, 0xEC, 0xE0, 0x01, 0x00, 0x00, 0xC5, 0xFC};
+
+// Prologue; called by the shadow cascade builder (0x01CD7500, rebuild=1 with
+// its private view copy) and 0x01D706B2 (rebuild=0). With rebuild set it
+// rebuilds the projection from FOV/aspect and applies only the centre block,
+// not the 5.01 NDC offset at view+0x520.
+inline constexpr uint8_t kFrustumCornerHelper501Bytes[] = {
+    0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58, 0x08, 0x48, 0x89, 0x78, 0x18, 0xC5,
+    0xFA, 0x11, 0x48, 0x10, 0x55, 0x48, 0x8D, 0xA8, 0xE8, 0xFD, 0xFF, 0xFF,
+    0x48, 0x81, 0xEC, 0x10, 0x03, 0x00, 0x00};
+
+// Fill-rect helper of the GUI pass (5.01 only): two vertex-coloured triangles
+// with the render state at 0x05C78BF0. Its only callers draw the screen fade
+// (GuiFadeFillReturn, FadeObjectFillReturn); the fill lands in the same target
+// as the Flash HUD.
+inline constexpr uint8_t kGuiFillRect501Bytes[] = {
+    0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x74, 0x24, 0x10, 0x48, 0x89,
+    0x7C, 0x24, 0x18, 0x55, 0x48, 0x8D, 0x6C, 0x24, 0xB9, 0x48, 0x81, 0xEC,
+    0xD0, 0x00, 0x00, 0x00, 0x8B, 0xDA, 0x41, 0x8B, 0xF1};
+// Code at the two fade sites, checked before the fill-rect detour is placed:
+// the GUI pass's "fade amount > 0" test (vcomiss xmm0,[rdi+0x48]; jae) and the
+// call instructions that end at the two return addresses.
+inline constexpr uint8_t kGuiFadeAmountTest501Bytes[] = {
+    0xC5, 0xF8, 0x2F, 0x47, 0x48, 0x0F, 0x83};
+inline constexpr uint8_t kGuiFadeFillCall501Bytes[] = {
+    0xE8, 0x5D, 0x28, 0x07, 0x00};
+inline constexpr uint8_t kFadeObjectFillCall501Bytes[] = {
+    0xE8, 0x33, 0xDE, 0x08, 0x00};
 
 inline constexpr Entry kEntries[] = {
     {"IsAnyMenu", 0x01F3C5C0, 0x01DF41A0, {kIsAnyMenuBytes, sizeof(kIsAnyMenuBytes)}},
@@ -159,10 +220,24 @@ inline constexpr Entry kEntries[] = {
         {kCameraEnableManualControl501Bytes, sizeof(kCameraEnableManualControl501Bytes)}},
     {"CameraDirector.GetCameraDirection", 0x0161BBC0, 0x023826F0,
         {kCameraDirection501Bytes, sizeof(kCameraDirection501Bytes)}},
+    {"CameraDirector.WorldVectorToViewRatio", 0x0161BDA0, 0x02382C50,
+        {kWorldVectorToViewRatio501Bytes, sizeof(kWorldVectorToViewRatio501Bytes)}},
     {"ViewportResolution", 0x01563DC0, 0x0228F3B0,
         {kViewportResolution501Bytes, sizeof(kViewportResolution501Bytes)}},
     {"CameraLightPlacement", 0x00718310, 0x0035B500,
         {kCameraLightPlacement501Bytes, sizeof(kCameraLightPlacement501Bytes)}},
+    {"DlssConstantsBuilder", 0x01CFE280, 0x01B80230,
+        {kDlssConstantsBuilder501Bytes, sizeof(kDlssConstantsBuilder501Bytes)}},
+    {"DlssInputPrepare", 0x01CFD760, 0x01B7F550,
+        {kDlssInputPrepare501Bytes, sizeof(kDlssInputPrepare501Bytes)}},
+    {"DlssSrApply", 0x01CFCF20, 0x01B7E720,
+        {kDlssSrApply501Bytes, sizeof(kDlssSrApply501Bytes)}},
+    {"TemporalCameraBuild", 0x015FE010, 0x02291600,
+        {kTemporalCameraBuild501Bytes, sizeof(kTemporalCameraBuild501Bytes)}},
+    {"FrustumCornerHelper", 0x015FC370, 0x02291CA0,
+        {kFrustumCornerHelper501Bytes, sizeof(kFrustumCornerHelper501Bytes)}},
+    {"GuiFillRect", 0, 0x01C99780,
+        {kGuiFillRect501Bytes, sizeof(kGuiFillRect501Bytes)}},
 };
 static_assert(sizeof(kEntries) / sizeof(kEntries[0]) ==
     static_cast<size_t>(Function::Count));
@@ -191,6 +266,26 @@ enum class Value : size_t {
     FrameInputExtentOffset,       // render input width, height
     FrameCameraTransformOffset,   // camera transform (row 3 = position); diagnostics only
     CustomCameraManualControlOffset,  // CCustomCamera manual-control flag byte
+    // Script VM and the WorldVectorToViewRatio projection helper, for the
+    // local marker projection that mirrors the native.
+    ScriptArgumentDecoderTable,   // RVA of the per-opcode argument decoder table
+    ScriptOutParameter,           // RVA of the global out-parameter pointer
+    ProjectionNearThreshold,      // RVA of the helper's minimum clip w (0.001f)
+    ProjectionNumerator,          // RVA of the helper's 1.0f numerator of 1/w
+    ProjectionYSignMask,          // RVA of the sign mask that negates the y ratio
+    TemporalCameraRecordOffset,   // bytes from a view to its previous-frame camera record
+    DlssStateViewport,            // DLSS state: Streamline viewport id (u32)
+    DlssStateConstantsFrame,      // DLSS state: frame index last given constants
+    DlssStateApplyFrame,          // DLSS state: render counter of the last SR apply
+    DlssStatePrepareFrame,        // DLSS state: render counter of the last input prepare
+    DlssStateResetFlag,           // DLSS state: this frame's constants request a history reset
+    DlssFrameRayReconstructionFlag,  // frame_data: Ray Reconstruction path active
+    DlssFrameDataFromFrame,       // frame_data = frame + this
+    ViewProjectionOffsetIndex,    // view-array float index of the NDC projection offset x, y (5.01 only)
+    ReprojectionMatrixIndex,      // view-array float index of the current-to-previous clip reprojection
+    GuiFadeAmountTest,            // RVA of the GUI pass's fade-amount test (5.01 only)
+    GuiFadeFillReturn,            // return address of the fill-rect call drawing the GUI-pass fade
+    FadeObjectFillReturn,         // return address of the fill-rect call in the standalone fade draw
     Count,
 };
 
@@ -221,6 +316,52 @@ inline constexpr ValueEntry kValues[] = {
     {"FrameCameraTransformOffset", 0x560, 0x630},
     // EnableManualControl: the custom-camera fields moved by +0x10 in 5.01.
     {"CustomCameraManualControlOffset", 0x259, 0x269},
+    // 5.01 values from the WorldVectorToViewRatio native (decoder table in its
+    // lea r14, out parameter read at +0x8D) and its helper's constants.
+    {"ScriptArgumentDecoderTable", 0x057ED890, 0x05A75A70},
+    {"ScriptOutParameter", 0x057F58E0, 0x05A7DA80},
+    {"ProjectionNearThreshold", 0x02D84B2C, 0x03AB7838},
+    {"ProjectionNumerator", 0x02D84EA0, 0x03AB7D00},
+    {"ProjectionYSignMask", 0x02D865B0, 0x03AB9900},
+    // Previous-frame camera record inside a view: the frame-data factory tests
+    // its valid byte at r8+0x470 (4.04 0x0162152D) / r8+0x540 (5.01 0x022C0888),
+    // with the view at descriptor+0x10.
+    {"TemporalCameraRecordOffset", 0x460, 0x530},
+    // DLSS state object (rcx of the three DLSS functions): the Streamline
+    // viewport id and the per-frame guards of the constants builder, the SR
+    // apply and the input prepare (compared with frame_data +0xC44/+0xC40).
+    {"DlssStateViewport", 0, 0x180},
+    {"DlssStateConstantsFrame", 0x6C, 0x120},
+    {"DlssStateApplyFrame", 0x70, 0x124},
+    {"DlssStatePrepareFrame", 0x74, 0x128},
+    // Byte the constants builder sets when this frame's constants request a
+    // history reset (stored 0x01B80513, read for Constants.reset 0x01B80552).
+    {"DlssStateResetFlag", 0, 0x110},
+    // frame_data byte the upscaler dispatch tests to take the Ray
+    // Reconstruction path instead of SR apply (0x01C09F7A).
+    {"DlssFrameRayReconstructionFlag", 0, 0xF73C},
+    // The DLSS functions receive frame + 0x10 (FrameBuilder: lea r14,[r12+0x10]).
+    {"DlssFrameDataFromFrame", 0x10, 0x10},
+    // 5.01 ViewRebuild (0x02294135) multiplies the projection (+0x180) and
+    // the previous projection (+0x1C0) by a translation with row 3 =
+    // (view+0x520, view+0x524, 0, 1): a raw NDC offset applied after the
+    // centre/jitter translation. Zeroed by the view constructors and copied
+    // by the copy routines; nothing else in the game writes it. 4.04 has no
+    // such field.
+    {"ViewProjectionOffsetIndex", 0, 0x148},
+    // Current-to-previous clip-space reprojection (4x4, view+0x400 on 5.01)
+    // that ViewRebuild computes from the projections before any centre or
+    // offset translation; the DLSS input prepare and other temporal passes
+    // read it from frame_data +0x410.
+    {"ReprojectionMatrixIndex", 0, 0x100},
+    // Screen fade (theGame.FadeOut/FadeIn, blackscreens) in the GUI pass
+    // 0x01C26A60: after the HUD movie lists, if the amount at fade block
+    // +0x48 is above 0, the colour (rgb*255, amount*255) goes to GuiFillRect
+    // (call 0x01C26F1E). 0x01C0B7E0 is a standalone copy of that draw
+    // (call 0x01C0B948). 4.04 has no such helper.
+    {"GuiFadeAmountTest", 0, 0x01C26DE4},
+    {"GuiFadeFillReturn", 0, 0x01C26F23},
+    {"FadeObjectFillReturn", 0, 0x01C0B94D},
 };
 static_assert(sizeof(kValues) / sizeof(kValues[0]) == static_cast<size_t>(Value::Count));
 
