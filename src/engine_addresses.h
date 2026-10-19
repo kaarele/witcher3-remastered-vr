@@ -204,7 +204,8 @@ inline constexpr uint8_t kRenderFenceWait501Bytes[] = {
     0x00, 0x00, 0x48, 0x8B, 0x49, 0x10};
 // ParallelRenderCommands::FlushCommands (named by the RTTI of its
 // FunctionTask lambda); only caller the frame builder (return 0x01C1A6F4).
-// 29 bytes because the first 24 occur ten times.
+// 29 bytes because the first 24 (a common prologue) occur 186 times in the
+// 5.01 .text; the 29 are unique.
 inline constexpr uint8_t kParallelFlushCommands501Bytes[] = {
     0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x74, 0x24, 0x10, 0x48, 0x89,
     0x7C, 0x24, 0x18, 0x55, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57,
