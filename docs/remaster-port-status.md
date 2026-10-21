@@ -1259,3 +1259,42 @@ thread, just before xrWaitFrame/xrEndFrame.
   - Main menu, loading screen and video share one anchor. In-game menus and cinema are unchanged.
 - Log: `OpenXR world menu screen anchored ... reason=entered|recenter|head_moved`.
 - Status: built, not run yet.
+
+### 360-degree picture around the loading screen (`[openxr] loading_background`, experimental)
+- Owner request: replace the black void around the loading screen with a 2D or stereo 3D picture,
+  rotating through several pictures.
+- How: equirectangular JPG/PNG files in `bin/x64_dx12/w3vr_backgrounds/`.
+  - Mono 2:1, for example straight from a 360 camera; top-bottom stereo 1:1 with the left eye on top
+    (or `_TB` in the name).
+  - Decoded with WIC on a worker thread. Large camera files are halved with a 2x2 box filter and
+    then resampled to `loading_background_max_width` (4096).
+  - Uploaded once as BGRA sRGB. Two pictures at most are resident (current + next for the 1.5 s
+    crossfade); everything is released when the loading screen ends.
+- Drawing: the mod renders the picture into a private stereo projection swapchain (default 1600
+  wide per eye, the eye swapchain's aspect).
+  - A fullscreen triangle per eye maps each pixel's view direction (eye FOV tangents, eye
+    orientation relative to the picture's yaw anchor) to equirect coordinates.
+  - The layer is submitted before the menu quad, so the runtime composites the menu on top. It works
+    on any OpenXR runtime, including the null runtime.
+  - With WiVRn the composition (both layers) happens on the PC before the video is encoded. The cost
+    is one texture lookup per eye pixel, well under a millisecond, and the headset only decodes the
+    stream as usual.
+- When it shows (only behind the fullscreen menu panel):
+  - the loading video is playing;
+  - REDengine's loading-screen object (game +0x198) exists, once that pointer has been seen switching
+    from null to set (the game object is known after the first script query of
+    IsLoadingScreenVideoPlaying);
+  - before the first gameplay camera of the session (`loading_background_frontend=1`), which covers
+    the first loading screen and the startup main menu;
+  - optionally around in-game menus while the world camera is stale
+    (`loading_background_in_game_menus=1`).
+
+  The pointer state is logged ("Loading background loading-screen object state") so a run can
+  confirm the signal.
+- Status: built, not run in the game yet. Untested: the loading-screen pointer signal, WIC JPEG
+  decoding under Wine, the second projection layer under WiVRn.
+- Tools in `tools/loading-backgrounds/`:
+  - `make_test_equirect.py` writes synthetic mono and stereo test pictures.
+  - `stitch_views_to_equirect.py` turns a ring of rectilinear captures (8 yaws per eye + up/down)
+    into a top-bottom stereo picture; its `--selftest` reaches 32.6 dB on a synthetic scene.
+
