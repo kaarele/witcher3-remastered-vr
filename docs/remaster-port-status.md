@@ -1246,3 +1246,16 @@ thread, just before xrWaitFrame/xrEndFrame.
   size (two RGBA16F upscaled histories, two lock-status and the luma history), about 100 MB at
   2476x2594.
 - Status (2026-10-22, 0.1.3): on in the release ini. Built-in FSR 2 path tested headless at 63 mm IPD (both eyes crisp with `remaster_pair_previous_transforms=1`) and tried in the headset on an RTX 3080 (works, large performance cost). The loader path (AMD) is untested.
+
+### World-locked main menu and loading screen (`[openxr] menu_world_locked`, 5.01)
+- Before: full-screen menus are one OpenXR quad layer showing the final backbuffer. In-game menus
+  are anchored in LOCAL space, but the startup frontend (main menu, loading screens, loading video;
+  `fullscreen_menu && !dual render`) stayed in VIEW space, so it followed the head.
+- With `menu_world_locked=1` those frames use one LOCAL-space screen at `menu_world_distance`
+  (2.5 m) with width `menu_world_width` (2.4 m), anchored where the player looks.
+  - It re-anchors on the recenter key or when the head moves more than
+    `menu_world_reanchor_distance` (0.5 m) from the anchor. The latter covers a headset put on
+    after startup.
+  - Main menu, loading screen and video share one anchor. In-game menus and cinema are unchanged.
+- Log: `OpenXR world menu screen anchored ... reason=entered|recenter|head_moved`.
+- Status: built, not run yet.
