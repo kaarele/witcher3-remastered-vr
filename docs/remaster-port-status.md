@@ -1071,3 +1071,31 @@ thread, just before xrWaitFrame/xrEndFrame.
   no regressions) and in the headset in a town, together with `UseWorkFreezing=false` in
   `bin/config/r4game/legacy/base/gameplay.ini`: people kept animating; a frozen character was seen
   once, in a cutscene.
+
+### Same jitter and noise in both eyes (`remaster_pair_jitter`, `remaster_pair_noise`, 5.01)
+- Symptom (owner, headset): fine detail such as Geralt's outfit looks noisy in VR, worse than on a
+  flat screen; very noisy at DLSS Balanced, barely acceptable at Quality.
+- Cause found statically:
+  - The frame builder (0x01C1A210) asks the jitter generator (0x01C0A9B0; Halton(3,2) of
+    index + 1, or the FidelityFX query for FSR) for the current jitter with the render counter
+    (render context +0x7F0) and for the previous jitter with counter - 1.
+  - The counter is advanced once per engine render (0x01BF85A2, `inc [extra+0x1B8]`), so in
+    strict Stereo the eyes take turns: each eye's own DLSS history only sees every other sample
+    (one half of the pixel in y), the two eyes never use the same offset, and the "previous"
+    jitter is the other eye's.
+  - The same counter, copied to frame_data +0xC40, is the GTAO noise index (& 63, 0x01D1A0AD)
+    and the screen-space shadow noise input (0x01C6D1AA), so each eye gets a different noise
+    pattern and each eye's GTAO history only 32 of the 64.
+- `remaster_pair_jitter=1` redirects the generator's two calls in the frame builder (call-site
+  redirect, code checked first): both eyes of a pair use the sample for the pair index, the
+  previous sample is the one for the pair before (what this eye used last), and each eye's
+  history steps through the whole sequence. The game builds the projection, the previous
+  projection and the DLSS constants from these values, so they stay consistent.
+- `remaster_pair_noise=1` replaces the two 7-byte loads of frame_data +0xC40 with a call into a
+  small stub that returns the pair index. Other users of +0xC40 are unchanged, in particular the
+  DLSS once-per-frame checks (0x01B7E0A0 and its siblings compare it with the last frame they
+  handled, so both eyes must keep distinct values there).
+- Pair index: the tag the mod gives every duplicate-render pair (same for both eyes, also with
+  run-ahead); renders without a tag keep the game's counter.
+- Status: built, not run yet. Census line `PERF pair temporal jitter_calls= jitter_pair=
+  previous_pair= noise_reads= noise_pair=`.

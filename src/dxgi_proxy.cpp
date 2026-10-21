@@ -604,6 +604,12 @@ struct Config {
     bool remaster_local_shadow_sort_corrected{};
     bool remaster_light_flicker_per_pair{};
     bool remaster_local_light_pair_lock{};
+    // 5.01 strict Stereo: _pair_jitter gives both eye renders of a pair the
+    // same temporal jitter sample, advancing once per pair, so each eye's own
+    // DLSS history sees the whole Halton sequence; _pair_noise does the same
+    // for the GTAO and screen-space shadow noise index.
+    bool remaster_pair_jitter{};
+    bool remaster_pair_noise{};
     // Controller-locked HUD faces the recentered heading only (no pitch/roll).
     bool hud_anchor_level{true};
     // A reduced HUD (hud_size < 1) shrinks toward the centre of the visible
@@ -16314,6 +16320,7 @@ void log_pair_rate_limit_census_locked(uint64_t window_presents, int64_t qpc_fre
 void log_shadow_census_locked(uint64_t window_presents, int64_t qpc_frequency);
 void log_descriptor_shadow_census_locked();
 void log_animated_visibility_census_locked(uint64_t window_presents);
+void log_pair_temporal_census_locked(uint64_t window_presents);
 
 // One line per kVrsCensusPresentInterval Presents, written by the first bind
 // after the boundary; the counters are window deltas.
@@ -16410,6 +16417,7 @@ void log_vrs_census_locked(uint64_t present) {
     log_descriptor_shadow_census_locked();
     // [FIX:REMASTER-ANIMATED-VISIBILITY 5/8]
     log_animated_visibility_census_locked(window_presents);
+    log_pair_temporal_census_locked(window_presents);
 }
 
 void apply_vrs_pipeline_rate(
@@ -17656,6 +17664,15 @@ void load_config() {
                 "engine", "remaster_light_flicker_per_pair", false);
             g_config.remaster_local_light_pair_lock = read_ini_bool(
                 "engine", "remaster_local_light_pair_lock", false);
+        }
+        // [FIX:REMASTER-PAIR-JITTER 2/6] [FIX:REMASTER-PAIR-NOISE 2/4]
+        g_config.remaster_pair_jitter = false;
+        g_config.remaster_pair_noise = false;
+        if (running_game_build() == w3vr::game_build::Build::Remaster501) {
+            g_config.remaster_pair_jitter =
+                read_ini_bool("engine", "remaster_pair_jitter", false);
+            g_config.remaster_pair_noise =
+                read_ini_bool("engine", "remaster_pair_noise", false);
         }
 
         if (clean_mono_transport_active()) {
@@ -39006,6 +39023,342 @@ void log_animated_visibility_census_locked(uint64_t window_presents) {
     previous = current;
 }
 
+// [FIX:REMASTER-PAIR-JITTER 3/6] Index of the stereo pair a render belongs
+// to, for frame_data (FrameBuilder's frame + 0x10, as the jitter generator
+// and the noise passes receive it) or, inside the frame builder, for the
+// render tag it applied. Pair ids advance by 1 per duplicate-render pair and
+// are the same for both eyes (run-ahead included: the tag belongs to the
+// factory that created the pair). Masked so the generator's int index and
+// index - 1 stay positive.
+bool stereo_pair_render_index(void* frame_data, bool tag_first, uint32_t& index) {
+    if (!g_engine_dual_render_active.load(std::memory_order_acquire)) {
+        return false;
+    }
+    uint64_t pair_id = 0;
+    const auto from_tag = [&pair_id]() {
+        if ((g_engine_render_eye == 0 || g_engine_render_eye == 1) &&
+            g_engine_render_pair_id != UINT64_MAX) {
+            pair_id = g_engine_render_pair_id;
+        }
+    };
+    if (tag_first) {
+        from_tag();
+    }
+    if (pair_id == 0 && frame_data != nullptr) {
+        void* frame = static_cast<uint8_t*>(frame_data) -
+            engine_frame_offset(
+                w3vr::engine_addresses::Value::DlssFrameDataFromFrame);
+        g_engine_dual_frame_mutex.lock();
+        auto found = g_engine_dual_frame_eyes.find(frame);
+        if (found == g_engine_dual_frame_eyes.end()) {
+            found = g_engine_dual_frame_eyes.find(frame_data);
+        }
+        if (found != g_engine_dual_frame_eyes.end() && found->second.eye <= 1 &&
+            found->second.pair_id != UINT64_MAX) {
+            pair_id = found->second.pair_id;
+        }
+        g_engine_dual_frame_mutex.unlock();
+    }
+    if (pair_id == 0 && !tag_first) {
+        from_tag();
+    }
+    if (pair_id == 0) {
+        return false;
+    }
+    index = static_cast<uint32_t>(pair_id & 0x3FFFFFFFu) + 1u;
+    return true;
+}
+
+using EngineTemporalJitterFunction =
+    void*(__fastcall*)(void*, float*, int, void*, int);
+EngineTemporalJitterFunction g_engine_temporal_jitter{};
+std::atomic<uint64_t> g_pair_jitter_current_calls{};
+std::atomic<uint64_t> g_pair_jitter_current_replaced{};
+std::atomic<uint64_t> g_pair_jitter_previous_replaced{};
+std::atomic<uint64_t> g_pair_noise_reads{};
+std::atomic<uint64_t> g_pair_noise_replaced{};
+// Set once both jitter calls are redirected; the detours replace nothing
+// before (or if the second redirect fails).
+std::atomic<bool> g_pair_jitter_active{};
+bool g_pair_noise_active{};
+
+// [FIX:REMASTER-PAIR-JITTER 4/6] Both eyes of a pair get the generator's
+// sample for the pair index, and the previous sample is the pair before:
+// what this eye itself used last time. The game builds the projection, the
+// previous projection and the DLSS constants from these two values, so they
+// stay consistent with each other.
+void* __fastcall hook_temporal_jitter_current(
+    void* context, float* out, int mode, void* frame_data, int counter) {
+    g_pair_jitter_current_calls.fetch_add(1, std::memory_order_relaxed);
+    uint32_t index{};
+    if (g_pair_jitter_active.load(std::memory_order_acquire) &&
+        stereo_pair_render_index(frame_data, true, index)) {
+        const uint64_t count = g_pair_jitter_current_replaced.fetch_add(
+            1, std::memory_order_relaxed) + 1;
+        if (count == 1) {
+            log_line("Pair jitter first replacement mode=%d counter=%d index=%u eye=%d",
+                mode, counter, index, g_engine_render_eye);
+        }
+        return g_engine_temporal_jitter(
+            context, out, mode, frame_data, static_cast<int>(index));
+    }
+    return g_engine_temporal_jitter(context, out, mode, frame_data, counter);
+}
+
+void* __fastcall hook_temporal_jitter_previous(
+    void* context, float* out, int mode, void* frame_data, int counter) {
+    uint32_t index{};
+    if (g_pair_jitter_active.load(std::memory_order_acquire) &&
+        stereo_pair_render_index(frame_data, true, index)) {
+        g_pair_jitter_previous_replaced.fetch_add(1, std::memory_order_relaxed);
+        return g_engine_temporal_jitter(
+            context, out, mode, frame_data, static_cast<int>(index - 1u));
+    }
+    return g_engine_temporal_jitter(context, out, mode, frame_data, counter);
+}
+
+// [FIX:REMASTER-PAIR-NOISE 3/4] Called from the noise-read stubs with
+// frame_data (r14) and the value the game was about to load; returns the
+// value to load instead. GTAO masks it with 63 and steps it per render, so
+// the pair index gives both eyes the same pattern and each eye's history
+// all 64 of them.
+uint32_t __fastcall pair_noise_counter(void* frame_data, uint32_t original) {
+    g_pair_noise_reads.fetch_add(1, std::memory_order_relaxed);
+    uint32_t index{};
+    if (!g_pair_noise_active ||
+        !stereo_pair_render_index(frame_data, false, index)) {
+        return original;
+    }
+    g_pair_noise_replaced.fetch_add(1, std::memory_order_relaxed);
+    return index;
+}
+
+// Replaces the 7-byte `mov edx|eax, [r14+0xC40]` at |site| with a call to a
+// stub (plus a 2-byte nop). The stub saves the flags and every volatile
+// register except the destination (xmm0-5 included: the passes keep values
+// in them across the load), calls pair_noise_counter(r14, [r14+0xC40]) and
+// puts its result in the destination, zero-extended like the original load.
+// It sits within rel32 reach of the site and has unwind data.
+bool install_frame_noise_read_stub(uint8_t* site, bool destination_edx) {
+    constexpr uint8_t kLoadEdx[] = {0x41, 0x8B, 0x96, 0x40, 0x0C, 0x00, 0x00};
+    constexpr uint8_t kLoadEax[] = {0x41, 0x8B, 0x86, 0x40, 0x0C, 0x00, 0x00};
+    const uint8_t* load = destination_edx ? kLoadEdx : kLoadEax;
+    if (site == nullptr ||
+        memcmp(site, load, w3vr::engine_addresses::kFrameNoiseReadBytes) != 0) {
+        return false;
+    }
+    // Saved besides rcx and r8-r11: rax when edx is the destination, rdx
+    // when eax is.
+    const uint8_t saved_push = destination_edx ? 0x50 : 0x52;
+    const uint8_t saved_pop = destination_edx ? 0x58 : 0x5A;
+    const uint8_t saved_unwind_reg = destination_edx ? 0x00 : 0x20;
+    const uint8_t result_move[] = {0x89, static_cast<uint8_t>(
+        destination_edx ? 0xC2 : 0xC0)};  // mov edx,eax | mov eax,eax
+    std::vector<uint8_t> code{
+        0x9C,                                      // pushfq
+        saved_push,                                // push rax | rdx
+        0x51, 0x41, 0x50, 0x41, 0x51, 0x41, 0x52, 0x41, 0x53,  // push rcx, r8-r11
+        0x48, 0x81, 0xEC, 0x80, 0x00, 0x00, 0x00,  // sub rsp,0x80 (prolog: 18 bytes)
+        0xF3, 0x0F, 0x7F, 0x44, 0x24, 0x20,        // movdqu [rsp+0x20],xmm0
+        0xF3, 0x0F, 0x7F, 0x4C, 0x24, 0x30,        // ... xmm1
+        0xF3, 0x0F, 0x7F, 0x54, 0x24, 0x40,        // ... xmm2
+        0xF3, 0x0F, 0x7F, 0x5C, 0x24, 0x50,        // ... xmm3
+        0xF3, 0x0F, 0x7F, 0x64, 0x24, 0x60,        // ... xmm4
+        0xF3, 0x0F, 0x7F, 0x6C, 0x24, 0x70,        // ... xmm5
+        0x4C, 0x89, 0xF1,                          // mov rcx,r14
+        0x41, 0x8B, 0x96, 0x40, 0x0C, 0x00, 0x00,  // mov edx,[r14+0xC40]
+        0xFF, 0x15, 0x00, 0x00, 0x00, 0x00,        // call [rip+rel32] (patched below)
+        0xF3, 0x0F, 0x6F, 0x44, 0x24, 0x20,        // movdqu xmm0,[rsp+0x20]
+        0xF3, 0x0F, 0x6F, 0x4C, 0x24, 0x30,
+        0xF3, 0x0F, 0x6F, 0x54, 0x24, 0x40,
+        0xF3, 0x0F, 0x6F, 0x5C, 0x24, 0x50,
+        0xF3, 0x0F, 0x6F, 0x64, 0x24, 0x60,
+        0xF3, 0x0F, 0x6F, 0x6C, 0x24, 0x70,
+        0x48, 0x81, 0xC4, 0x80, 0x00, 0x00, 0x00,  // add rsp,0x80
+        0x41, 0x5B, 0x41, 0x5A, 0x41, 0x59, 0x41, 0x58, 0x59,  // pop r11..r8, rcx
+        result_move[0], result_move[1],
+        saved_pop,                                 // pop rax | rdx
+        0x9D,                                      // popfq
+        0xC3};                                     // ret
+    constexpr size_t kPrologBytes = 18;
+    constexpr size_t kCallDisplacementOffset = 18 + 36 + 3 + 7 + 2;
+    constexpr size_t kHelperOffset = 0xA0;
+    constexpr size_t kUnwindOffset = 0xB0;
+    constexpr size_t kFunctionOffset = 0xD0;
+    constexpr size_t kStubBytes = 0x100;
+    if (code.size() > kHelperOffset || code[kCallDisplacementOffset - 2] != 0xFF ||
+        code[kCallDisplacementOffset - 1] != 0x15) {
+        log_line("Pair noise stub layout error size=%zu", code.size());
+        return false;
+    }
+    const int32_t helper_displacement = static_cast<int32_t>(
+        kHelperOffset - (kCallDisplacementOffset + sizeof(int32_t)));
+    memcpy(code.data() + kCallDisplacementOffset, &helper_displacement,
+        sizeof(helper_displacement));
+    // UNWIND_INFO v1, prolog 18 bytes, 8 codes (last prolog op first):
+    // alloc 0x80 at 18, push r11/r10/r9/r8/rcx at 11/9/7/5/3, push rax|rdx
+    // at 2, and pushfq as an 8-byte alloc at 1.
+    const uint8_t unwind[] = {
+        0x01, static_cast<uint8_t>(kPrologBytes), 0x08, 0x00,
+        0x12, 0xF2, 0x0B, 0xB0, 0x09, 0xA0, 0x07, 0x90,
+        0x05, 0x80, 0x03, 0x10, 0x02, saved_unwind_reg, 0x01, 0x02};
+    auto* stub = w3vr::call_site_hook::allocate_near(
+        reinterpret_cast<uintptr_t>(site), kStubBytes);
+    if (stub == nullptr) {
+        return false;
+    }
+    int32_t rel{};
+    if (!w3vr::call_site_hook::rel32_to(reinterpret_cast<uintptr_t>(site),
+            reinterpret_cast<uintptr_t>(stub), rel)) {
+        VirtualFree(stub, 0, MEM_RELEASE);
+        return false;
+    }
+    memcpy(stub, code.data(), code.size());
+    const auto helper = reinterpret_cast<uint64_t>(&pair_noise_counter);
+    memcpy(stub + kHelperOffset, &helper, sizeof(helper));
+    memcpy(stub + kUnwindOffset, unwind, sizeof(unwind));
+    auto* function = reinterpret_cast<RUNTIME_FUNCTION*>(stub + kFunctionOffset);
+    function->BeginAddress = 0;
+    function->EndAddress = static_cast<DWORD>(code.size());
+    function->UnwindData = static_cast<DWORD>(kUnwindOffset);
+    DWORD old_protect{};
+    if (!VirtualProtect(stub, kStubBytes, PAGE_EXECUTE_READ, &old_protect)) {
+        VirtualFree(stub, 0, MEM_RELEASE);
+        return false;
+    }
+    FlushInstructionCache(GetCurrentProcess(), stub, kStubBytes);
+    if (!RtlAddFunctionTable(function, 1, reinterpret_cast<DWORD64>(stub))) {
+        log_line("Pair noise stub unwind data not registered (stub still used)");
+    }
+    uint8_t patch[w3vr::engine_addresses::kFrameNoiseReadBytes] = {
+        0xE8, 0, 0, 0, 0, 0x66, 0x90};
+    memcpy(patch + 1, &rel, sizeof(rel));
+    DWORD protect{};
+    if (!VirtualProtect(site, sizeof(patch), PAGE_EXECUTE_READWRITE, &protect)) {
+        return false;
+    }
+    memcpy(site, patch, sizeof(patch));
+    VirtualProtect(site, sizeof(patch), protect, &protect);
+    FlushInstructionCache(GetCurrentProcess(), site, sizeof(patch));
+    return true;
+}
+
+// [FIX:REMASTER-PAIR-JITTER 5/6] [FIX:REMASTER-PAIR-NOISE 4/4] Installed at
+// startup, 5.01 only, after checking the code around every site. The
+// generator stays unpatched; only its two calls in the frame builder are
+// redirected. Each noise load is replaced only when its surroundings match.
+void install_remaster_pair_temporal_hooks() {
+    namespace addresses = w3vr::engine_addresses;
+    if (!g_config.remaster_pair_jitter && !g_config.remaster_pair_noise) {
+        return;
+    }
+    auto* module = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
+    if (running_game_build() != w3vr::game_build::Build::Remaster501 ||
+        module == nullptr) {
+        log_line("Pair jitter/noise off: build mismatch");
+        return;
+    }
+    const auto code_matches = [module](uintptr_t rva, const uint8_t* bytes,
+                                  size_t size) {
+        return addresses::signature_matches(
+            module + rva, addresses::Signature{bytes, size});
+    };
+    if (g_config.remaster_pair_jitter && g_engine_temporal_jitter == nullptr) {
+        auto* generator = module + addresses::kTemporalJitterGenerator501Rva;
+        auto* current = module + addresses::kTemporalJitterCurrentCall501Rva;
+        auto* previous = module + addresses::kTemporalJitterPreviousCall501Rva;
+        const bool generator_matches = code_matches(
+            addresses::kTemporalJitterGenerator501Rva,
+            addresses::kTemporalJitterGenerator501Bytes,
+            sizeof(addresses::kTemporalJitterGenerator501Bytes));
+        const bool current_matches = code_matches(
+            addresses::kTemporalJitterCurrentSite501Rva,
+            addresses::kTemporalJitterCurrentSite501Bytes,
+            sizeof(addresses::kTemporalJitterCurrentSite501Bytes)) &&
+            w3vr::call_site_hook::call_destination(current) ==
+                reinterpret_cast<uintptr_t>(generator);
+        const bool previous_matches = code_matches(
+            addresses::kTemporalJitterPreviousSite501Rva,
+            addresses::kTemporalJitterPreviousSite501Bytes,
+            sizeof(addresses::kTemporalJitterPreviousSite501Bytes)) &&
+            w3vr::call_site_hook::call_destination(previous) ==
+                reinterpret_cast<uintptr_t>(generator);
+        void* previous_original{};
+        if (!generator_matches || !current_matches || !previous_matches) {
+            log_line("Pair jitter off: code mismatch generator=%d current=%d previous=%d",
+                generator_matches ? 1 : 0, current_matches ? 1 : 0,
+                previous_matches ? 1 : 0);
+        } else if (w3vr::call_site_hook::install(current,
+                       reinterpret_cast<void*>(&hook_temporal_jitter_current),
+                       reinterpret_cast<void**>(&g_engine_temporal_jitter)) == nullptr) {
+            g_engine_temporal_jitter = nullptr;
+            log_line("Pair jitter hook failed: current call=%p not redirected", current);
+        } else if (w3vr::call_site_hook::install(previous,
+                       reinterpret_cast<void*>(&hook_temporal_jitter_previous),
+                       &previous_original) == nullptr) {
+            // The current call keeps its detour but, with
+            // g_pair_jitter_active false, passes the game's counter through.
+            log_line("Pair jitter hook failed: previous call=%p not redirected", previous);
+        } else {
+            g_pair_jitter_active.store(true, std::memory_order_release);
+            log_line("Pair jitter hooked generator=%p current_call=%p previous_call=%p",
+                generator, current, previous);
+        }
+    }
+    if (g_config.remaster_pair_noise) {
+        const bool gtao_matches = code_matches(
+            addresses::kGtaoNoiseReadContext501Rva,
+            addresses::kGtaoNoiseReadContext501Bytes,
+            sizeof(addresses::kGtaoNoiseReadContext501Bytes));
+        const bool shadow_matches = code_matches(
+            addresses::kScreenShadowNoiseReadContext501Rva,
+            addresses::kScreenShadowNoiseReadContext501Bytes,
+            sizeof(addresses::kScreenShadowNoiseReadContext501Bytes));
+        // Set before any stub can run.
+        g_pair_noise_active = true;
+        const bool gtao = gtao_matches && install_frame_noise_read_stub(
+            module + addresses::kGtaoNoiseRead501Rva, true);
+        const bool shadow = shadow_matches && install_frame_noise_read_stub(
+            module + addresses::kScreenShadowNoiseRead501Rva, false);
+        log_line("Pair noise gtao=%d (code %d) screen_shadows=%d (code %d)",
+            gtao ? 1 : 0, gtao_matches ? 1 : 0, shadow ? 1 : 0,
+            shadow_matches ? 1 : 0);
+    }
+}
+
+// [FIX:REMASTER-PAIR-JITTER 6/6] Census window deltas: current = current-jitter
+// generator calls, pair = of those given the pair sample, previous = previous
+// samples replaced; noise reads / replaced.
+void log_pair_temporal_census_locked(uint64_t window_presents) {
+    if (window_presents == 0 ||
+        (g_engine_temporal_jitter == nullptr && !g_pair_noise_active)) {
+        return;
+    }
+    static uint64_t previous_calls{};
+    static uint64_t previous_current{};
+    static uint64_t previous_previous{};
+    static uint64_t previous_reads{};
+    static uint64_t previous_noise{};
+    const uint64_t calls = g_pair_jitter_current_calls.load(std::memory_order_relaxed);
+    const uint64_t current = g_pair_jitter_current_replaced.load(std::memory_order_relaxed);
+    const uint64_t previous = g_pair_jitter_previous_replaced.load(std::memory_order_relaxed);
+    const uint64_t reads = g_pair_noise_reads.load(std::memory_order_relaxed);
+    const uint64_t noise = g_pair_noise_replaced.load(std::memory_order_relaxed);
+    log_vrs_line(
+        "PERF pair temporal jitter_calls=%llu jitter_pair=%llu previous_pair=%llu "
+        "noise_reads=%llu noise_pair=%llu",
+        static_cast<unsigned long long>(calls - previous_calls),
+        static_cast<unsigned long long>(current - previous_current),
+        static_cast<unsigned long long>(previous - previous_previous),
+        static_cast<unsigned long long>(reads - previous_reads),
+        static_cast<unsigned long long>(noise - previous_noise));
+    previous_calls = calls;
+    previous_current = current;
+    previous_previous = previous;
+    previous_reads = reads;
+    previous_noise = noise;
+}
+
 void capture_engine_original_temporal_matrix(float* view, uint64_t present) {
     std::array<float, 512> shadow{};
     if (view == nullptr || !safe_copy_engine_view_snapshot(view, shadow.data(), sizeof(shadow)) ||
@@ -55035,6 +55388,7 @@ void ensure_initialized() {
         initialize_engine_player_pose_helpers();
         install_engine_world_vector_to_view_ratio_hook();
         install_engine_animated_component_visibility_hook();
+        install_remaster_pair_temporal_hooks();
         install_engine_frame_factory_probe();
         // [FIX:PAIR-ENQUEUE-AFTER-FENCE 11/11]
         install_pair_enqueue_after_fence_hooks();
