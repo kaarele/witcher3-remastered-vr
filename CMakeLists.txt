@@ -61,6 +61,9 @@ target_include_directories(witcher3vr_dxgi PRIVATE
     "${W3VR_DIRECTX_HEADERS_DIR}/include"
     "${W3VR_STREAMLINE_DIR}/external/ngx-sdk/include"
     "${W3VR_RENDERDOC_DIR}"
+    # Vendored AMD FidelityFX API declarations (MIT), see external/fidelityfx-api.
+    "${CMAKE_CURRENT_SOURCE_DIR}/external/fidelityfx-api/api/include"
+    "${CMAKE_CURRENT_SOURCE_DIR}/external/fidelityfx-api/upscalers/include"
 )
 target_link_libraries(witcher3vr_dxgi PRIVATE
     minhook

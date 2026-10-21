@@ -77,13 +77,16 @@ HUD_EDITOR_BINDINGS = [('IK_Insert', 'W3VRHudEditorToggle'), ('IK_Q', 'W3VRHudEd
 HUD_XML_LINE = b'modWitcher3VRHUDEditor.xml;'
 DLSS_QUALITY_NAMES = {0: 'DLAA', 1: 'Quality', 2: 'Balanced', 3: 'Performance', 4: 'Ultra Performance'}
 # Remastered 5.01: the game runs DLSS itself (Streamline 2; the mod gives each eye its own DLSS history) and has
-# no TAAU. "none" uses FXAA. AER is not available there. Values: openxr mode, dual render, AER, backend, AAMode,
-# AllowDLSS.
+# no TAAU. "none" uses FXAA. "fsr" is the game's FSR (FSR 4 on RDNA4, the older FSR elsewhere, any GPU); in Stereo
+# the mod gives each eye its own FSR context ([engine] remaster_fsr_per_eye, experimental). AER is not available
+# there. Values: openxr mode, dual render, AER, backend, AAMode, AllowDLSS.
 MODES_501 = {
     'mono_noaa': (1, False, False, 'none', 1, False),
     'mono_dlss': (1, False, False, 'dlss', 6, True),
+    'mono_fsr': (1, False, False, 'none', 5, False),
     'stereo_noaa': (3, True, False, 'none', 1, False),
     'stereo_dlss': (3, True, False, 'dlss', 6, True),
+    'stereo_fsr': (3, True, False, 'none', 5, False),
 }
 
 
@@ -594,7 +597,7 @@ def cmd_configure(args):
     if mode_name not in modes:
         die('unsupported combination on %s: --mode %s --aa %s (%s)' % (
             'Remastered 5.01' if remaster else '4.04', args.mode, aa,
-            'stereo/mono with dlss or none' if remaster else 'AER needs taau or dlss'))
+            'stereo/mono with dlss, fsr or none' if remaster else 'AER needs taau or dlss; fsr is 5.01 only'))
     openxr_mode, dual, aer, backend, aa_mode, allow_dlss = modes[mode_name]
     w, h = (int(v) for v in args.res.lower().split('x'))
     if args.res.lower() == '2476x2594':
@@ -619,6 +622,7 @@ def cmd_configure(args):
     ini.set('openxr', 'native_stereo', '0' if remaster else '1')
     if remaster:
         ini.set('engine', 'remaster_asymmetric_ndc', '0' if args.symmetric else '1')
+        ini.set('engine', 'remaster_fsr_per_eye', '1' if aa == 'fsr' else '0')
     ini.set('openxr', 'world_detail_range', '%.3f' % args.world_detail)
     ini.set('openxr', 'hud_horizontal_scale', '%.3f' % args.hud_frame)
     ini.set('openxr', 'hud_vertical_scale', '%.3f' % args.hud_frame)
@@ -706,7 +710,10 @@ def cmd_configure(args):
             '1' if os.path.isdir(os.path.join(g['game'], 'dlc', 'dlcmovementinputfix')) else '0')
     doc.set('Hidden', 'uiHorizontalFrameScale', '%g' % args.hud_frame)
     doc.set('Hidden', 'uiVerticalFrameScale', '%g' % args.hud_frame)
-    print('dx12user.settings (AAMode=%d, DLSS %s):' % (aa_mode, DLSS_QUALITY_NAMES.get(quality, quality)))
+    if aa == 'fsr':
+        print('dx12user.settings (AAMode=%d, FSR; pick its quality in the game\'s graphics menu):' % aa_mode)
+    else:
+        print('dx12user.settings (AAMode=%d, DLSS %s):' % (aa_mode, DLSS_QUALITY_NAMES.get(quality, quality)))
     write_with_backup(settings_path, doc.text().encode('ascii'), args.dry_run)
 
     # HUD editor registration (launcher EnsureHudEditorReady).
@@ -856,8 +863,9 @@ def main():
     sp = sub.add_parser('configure', help='write the VR config (defaults tuned for Quest 3 with WiVRn)')
     sp.add_argument('--mode', choices=['stereo', 'aer', 'mono'], default='stereo',
                     help='stereo = both eyes from one game tick (default, cleanest); aer = AER+AFW (faster, can shimmer)')
-    sp.add_argument('--aa', choices=['dlss', 'taau', 'none'],
-                    help='default: dlss on NVIDIA, otherwise taau (4.04) or none = FXAA (5.01, which has no TAAU)')
+    sp.add_argument('--aa', choices=['dlss', 'taau', 'fsr', 'none'],
+                    help='default: dlss on NVIDIA, otherwise taau (4.04) or none = FXAA (5.01, which has no TAAU); '
+                         'fsr = the game\'s FSR with one FSR history per eye (5.01, experimental)')
     sp.add_argument('--dlss-quality', type=int, default=2, choices=range(0, 5),
                     help='0 DLAA, 1 Quality, 2 Balanced (default), 3 Performance, 4 Ultra Performance')
     sp.add_argument('--res', default='2476x2594',

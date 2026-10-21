@@ -18,6 +18,8 @@
 #define XR_NO_PROTOTYPES
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
+#include <ffx_api.h>
+#include <ffx_upscale.h>
 
 #include "aer_scheduler.h"
 #include "cbv_descriptor_cache_policy.h"
@@ -575,6 +577,12 @@ struct Config {
     // keeps the No-AA presentation transport.
     bool remaster_engine_dlss{};
     bool remaster_dlss_per_eye_motion{true};
+    // 5.01 only: [engine] remaster_fsr_per_eye=1 gives the game's own FSR
+    // (Anti-aliasing = FSR in the game) a second ffxContext, so each eye of
+    // strict Stereo keeps its own FSR history. Independent of
+    // temporal_backend; the per-eye motion record follows
+    // remaster_dlss_per_eye_motion as it does for DLSS.
+    bool remaster_fsr_per_eye{};
     // 5.01 only: render each eye with its own asymmetric frustum through the
     // engine's NDC projection offset (view+0x520) and submit the full image,
     // instead of the symmetric envelope and a cropped subimage. _reproject
@@ -1018,10 +1026,25 @@ bool remaster_engine_dlss_stereo_active() {
         g_config.openxr_mode == 3;
 }
 
+// [FEATURE:REMASTER-FSR-PER-EYE 4/7] strict Stereo with the 5.01 engine FSR
+// on one ffxContext per eye.
+bool remaster_engine_fsr_per_eye_running();
+bool remaster_engine_fsr_stereo_active() {
+    return g_config.remaster_fsr_per_eye && g_config.openxr_enabled &&
+        g_config.openxr_mode == 3;
+}
+
+// The game's own upscaler (DLSS or FSR) currently keeps one history per eye.
+bool remaster_engine_upscaler_per_eye_running() {
+    return remaster_engine_dlss_per_eye_running() ||
+        remaster_engine_fsr_per_eye_running();
+}
+
 bool engine_native_per_eye_temporal_history_active() {
     return dlss_sequential_mode_active() ||
         mode3_taau_native_full_motion_active() ||
-        (remaster_engine_dlss_stereo_active() &&
+        ((remaster_engine_dlss_stereo_active() ||
+                remaster_engine_fsr_stereo_active()) &&
             g_config.remaster_dlss_per_eye_motion);
 }
 
@@ -3275,6 +3298,8 @@ std::atomic<uint64_t> g_randc_latched_pair{};
 std::atomic<bool> g_randc_latched_value{};
 // Eyes (bit 0 left, bit 1 right) whose per-eye DLSS history must restart.
 std::atomic<uint8_t> g_remaster_dlss_external_reset_mask{};
+// The same for the per-eye FSR contexts.
+std::atomic<uint8_t> g_remaster_fsr_external_reset_mask{};
 
 bool remaster_asymmetric_ndc_configured() {
     return g_config.remaster_asymmetric_ndc &&
@@ -3299,11 +3324,12 @@ bool remaster_asymmetric_ndc_active() {
 
 // A per-eye frustum needs each eye's temporal history to be its own: the
 // previous projection the engine reprojects with carries the current eye's
-// offset. That holds with the mod's per-eye DLSS, and trivially without any
-// temporal AA (FXAA/off: no jitter). The game's own TAA/FSR/XeSS keep one
-// history alternating between the eyes, which would miss by twice the offset.
+// offset. That holds with the mod's per-eye DLSS or FSR, and trivially
+// without any temporal AA (FXAA/off: no jitter). The game's own TAA/XeSS, and
+// FSR without remaster_fsr_per_eye, keep one history alternating between the
+// eyes, which would miss by twice the offset.
 bool remaster_asymmetric_ndc_history_ok() {
-    if (remaster_engine_dlss_per_eye_running()) {
+    if (remaster_engine_upscaler_per_eye_running()) {
         return true;
     }
     const uint64_t last =
@@ -3313,13 +3339,15 @@ bool remaster_asymmetric_ndc_history_ok() {
 }
 
 // Decided once per stereo pair (by its first eye). A change restarts both
-// per-eye DLSS histories, whose previous frame used the other projection.
+// per-eye DLSS or FSR histories, whose previous frame used the other
+// projection.
 bool remaster_asymmetric_ndc_pair_gate(uint64_t pair_id) {
     if (pair_id != 0 &&
         g_randc_latched_pair.load(std::memory_order_acquire) == pair_id) {
         return g_randc_latched_value.load(std::memory_order_relaxed);
     }
     const bool per_eye_dlss = remaster_engine_dlss_per_eye_running();
+    const bool per_eye_fsr = remaster_engine_fsr_per_eye_running();
     const bool value = remaster_asymmetric_ndc_active() &&
         remaster_asymmetric_ndc_history_ok() &&
         g_engine_menu_state.load(std::memory_order_relaxed) == 0;
@@ -3329,16 +3357,19 @@ bool remaster_asymmetric_ndc_pair_gate(uint64_t pair_id) {
     if (previous != value) {
         g_remaster_dlss_external_reset_mask.fetch_or(
             0x3u, std::memory_order_release);
+        g_remaster_fsr_external_reset_mask.fetch_or(
+            0x3u, std::memory_order_release);
         static std::atomic<uint32_t> gate_logs{};
         if (gate_logs.fetch_add(1, std::memory_order_relaxed) < 64) {
             const uint64_t last_jitter =
                 g_randc_last_jitter_present.load(std::memory_order_relaxed);
             log_line(
                 "RANDC pair gate %d -> %d pair=%llu active=%d per_eye_dlss=%d "
-                "jitter_age=%lld menu=%d",
+                "per_eye_fsr=%d jitter_age=%lld menu=%d",
                 previous ? 1 : 0, value ? 1 : 0,
                 static_cast<unsigned long long>(pair_id),
                 remaster_asymmetric_ndc_active() ? 1 : 0, per_eye_dlss ? 1 : 0,
+                per_eye_fsr ? 1 : 0,
                 last_jitter == UINT64_MAX ? -1LL : static_cast<long long>(
                     g_present_count.load(std::memory_order_relaxed) - last_jitter),
                 g_engine_menu_state.load(std::memory_order_relaxed));
@@ -17591,6 +17622,19 @@ void load_config() {
                 g_config.remaster_engine_dlss ? 1 : 0,
                 g_config.remaster_dlss_per_eye_motion ? 1 : 0);
             g_config.temporal_backend = TemporalBackend::None;
+        }
+        // [FEATURE:REMASTER-FSR-PER-EYE 3/7] Read on 5.01 whatever the
+        // temporal backend; FSR is the game's choice (AAMode 5).
+        g_config.remaster_fsr_per_eye = false;
+        if (running_game_build() == w3vr::game_build::Build::Remaster501) {
+            g_config.remaster_fsr_per_eye =
+                read_ini_bool("engine", "remaster_fsr_per_eye", false);
+            if (g_config.remaster_fsr_per_eye) {
+                g_config.remaster_dlss_per_eye_motion = read_ini_bool(
+                    "engine", "remaster_dlss_per_eye_motion", true);
+                log_line("FSR per-eye contexts requested on 5.01: per_eye_motion=%d",
+                    g_config.remaster_dlss_per_eye_motion ? 1 : 0);
+            }
         }
 
         // [FEATURE:REMASTER-ASYMMETRIC-NDC 1/6] Per-eye asymmetric frusta on
@@ -34591,9 +34635,10 @@ bool prepare_full_vr_fallback_dlss_temporal_history(
     uint64_t pair_id,
     bool& continued) {
     continued = false;
-    const bool remaster_per_eye = remaster_engine_dlss_stereo_active() &&
+    const bool remaster_per_eye = (remaster_engine_dlss_stereo_active() ||
+            remaster_engine_fsr_stereo_active()) &&
         g_config.remaster_dlss_per_eye_motion &&
-        remaster_engine_dlss_per_eye_running();
+        remaster_engine_upscaler_per_eye_running();
     if (view == nullptr || eye < 0 || eye > 1 || pair_id == 0 ||
         pair_id == UINT64_MAX ||
         (!dlss_sequential_mode_active() && !remaster_per_eye) ||
@@ -42512,9 +42557,10 @@ bool prepare_engine_per_eye_native_temporal_history(
         return false;
     }
 
-    // 5.01 engine DLSS: only while the game's DLSS really runs per eye.
+    // 5.01 engine DLSS or FSR: only while the game's upscaler really runs
+    // per eye.
     if (!dlss_sequential_mode_active() && !mode3_taau_full_motion &&
-        !remaster_engine_dlss_per_eye_running()) {
+        !remaster_engine_upscaler_per_eye_running()) {
         return false;
     }
     const int eye = g_engine_factory_eye;
@@ -46924,6 +46970,310 @@ uintptr_t __fastcall hook_remaster_dlss_sr_apply(
         "apply", state, frame_data, params, pass, fifth);
 }
 
+// [FEATURE:REMASTER-FSR-PER-EYE 5/7] With Anti-aliasing = FSR, 5.01
+// dispatches its single upscale ffxContext for every render, so strict Stereo
+// alternates one FSR history between the eyes (ghosting). With
+// remaster_fsr_per_eye the game's upscale context gets a twin, created with
+// the game's own description right after it (the exe's ffxCreateContext
+// import is redirected). For the duration of the engine's upscale dispatch the
+// right eye's frames find the twin in the state's context field; the game's
+// code builds and dispatches the description as usual, and the field is
+// restored. Configure and destroy calls on the game's context are mirrored to
+// the twin. Nothing depends on the FSR version the FidelityFX loader picks
+// (FSR 2/3.1 on most GPUs, FSR 4.x on RDNA4). Resets follow the DLSS rules: a
+// fresh or long-interrupted eye starts over, a reset the game requests for
+// the first eye of a pair is repeated for the second, and a projection change
+// restarts both. A dual-render frame without an eye tag runs on the game's
+// context with a reset and restarts both eyes afterwards, so it never mixes
+// into an eye's history.
+struct RemasterFsrTwin {
+    ffxContext game{};
+    ffxContext right{};
+};
+std::mutex g_remaster_fsr_twin_mutex;
+std::vector<RemasterFsrTwin> g_remaster_fsr_twins;
+std::atomic<bool> g_remaster_fsr_guards_stale{};
+PfnFfxCreateContext g_ffx_create_context{};
+PfnFfxDestroyContext g_ffx_destroy_context{};
+PfnFfxConfigure g_ffx_configure{};
+PfnFfxQuery g_ffx_query{};
+
+using EngineFsrUpscaleDispatchFunction =
+    uintptr_t(__fastcall*)(void*, void*, void*, uintptr_t, uintptr_t);
+EngineFsrUpscaleDispatchFunction g_engine_fsr_upscale_dispatch{};
+constexpr size_t kRemasterFsrUntaggedSlot = 2;
+struct RemasterFsrEyeGuards {
+    uint32_t last_frame_index{};
+    bool valid{};
+};
+std::mutex g_remaster_fsr_mutex;
+void* g_remaster_fsr_state{};
+std::array<RemasterFsrEyeGuards, 2> g_remaster_fsr_eye_guards{};
+bool g_remaster_fsr_reset_pending{};
+uint32_t g_remaster_fsr_reset_frame{};
+size_t g_remaster_fsr_reset_source{};
+std::array<std::atomic<uint64_t>, 3> g_remaster_fsr_eye_calls{};
+std::atomic<uint64_t> g_remaster_fsr_passthrough_calls{};
+std::atomic<uint64_t> g_remaster_fsr_forced_resets{};
+std::atomic<uint64_t> g_remaster_fsr_last_tagged_present{UINT64_MAX};
+std::atomic<uint32_t> g_remaster_fsr_log_count{};
+std::atomic<uint8_t> g_remaster_fsr_first_eye_logged{};
+
+bool remaster_engine_fsr_per_eye_running() {
+    const uint64_t last =
+        g_remaster_fsr_last_tagged_present.load(std::memory_order_acquire);
+    const uint64_t now = g_present_count.load(std::memory_order_relaxed);
+    return last != UINT64_MAX && now >= last && now - last <= 8;
+}
+
+ffxContext remaster_fsr_twin_for(ffxContext game) {
+    if (game == nullptr) {
+        return nullptr;
+    }
+    std::scoped_lock lock{g_remaster_fsr_twin_mutex};
+    for (const auto& twin : g_remaster_fsr_twins) {
+        if (twin.game == game) {
+            return twin.right;
+        }
+    }
+    return nullptr;
+}
+
+const char* remaster_fsr_provider_name(ffxContext context, uint64_t* id) {
+    if (g_ffx_query == nullptr || context == nullptr) {
+        return "unknown";
+    }
+    ffxQueryGetProviderVersion query{};
+    query.header.type = FFX_API_QUERY_DESC_TYPE_GET_PROVIDER_VERSION;
+    ffxContext copy = context;
+    if (g_ffx_query(&copy, &query.header) != FFX_API_RETURN_OK ||
+        query.versionName == nullptr) {
+        return "unknown";
+    }
+    if (id != nullptr) {
+        *id = query.versionId;
+    }
+    return query.versionName;
+}
+
+ffxReturnCode_t hook_ffx_create_context(
+    ffxContext* context,
+    ffxCreateContextDescHeader* desc,
+    const ffxAllocationCallbacks* allocation) {
+    const ffxReturnCode_t result =
+        g_ffx_create_context(context, desc, allocation);
+    if (result != FFX_API_RETURN_OK || context == nullptr ||
+        *context == nullptr || desc == nullptr ||
+        desc->type != FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE ||
+        !remaster_engine_fsr_stereo_active()) {
+        return result;
+    }
+    // The description (and its backend chain) is still the game's here.
+    ffxContext twin{};
+    const ffxReturnCode_t twin_result =
+        g_ffx_create_context(&twin, desc, allocation);
+    const auto* upscale =
+        reinterpret_cast<const ffxCreateContextDescUpscale*>(desc);
+    uint64_t game_id{};
+    uint64_t twin_id{};
+    const char* game_provider = remaster_fsr_provider_name(*context, &game_id);
+    const char* twin_provider = twin_result == FFX_API_RETURN_OK
+        ? remaster_fsr_provider_name(twin, &twin_id) : "none";
+    FfxApiEffectMemoryUsage twin_memory{};
+    if (twin_result == FFX_API_RETURN_OK && g_ffx_query != nullptr) {
+        ffxQueryDescUpscaleGetGPUMemoryUsage query{};
+        query.header.type = FFX_API_QUERY_DESC_TYPE_UPSCALE_GPU_MEMORY_USAGE;
+        query.gpuMemoryUsageUpscaler = &twin_memory;
+        ffxContext copy = twin;
+        if (g_ffx_query(&copy, &query.header) != FFX_API_RETURN_OK) {
+            twin_memory = {};
+        }
+    }
+    if (twin_result == FFX_API_RETURN_OK && twin != nullptr) {
+        std::scoped_lock lock{g_remaster_fsr_twin_mutex};
+        g_remaster_fsr_twins.push_back({*context, twin});
+    }
+    g_remaster_fsr_guards_stale.store(true, std::memory_order_release);
+    log_line("FSR per-eye: game upscale context %p %s (id 0x%llX) render<=%ux%u "
+        "upscale<=%ux%u flags=0x%X; right-eye twin %p result=%u %s (id 0x%llX) "
+        "vram=%.1f MB",
+        *context, game_provider, static_cast<unsigned long long>(game_id),
+        upscale->maxRenderSize.width, upscale->maxRenderSize.height,
+        upscale->maxUpscaleSize.width, upscale->maxUpscaleSize.height,
+        upscale->flags, twin, twin_result, twin_provider,
+        static_cast<unsigned long long>(twin_id),
+        static_cast<double>(twin_memory.totalUsageInBytes) / (1024.0 * 1024.0));
+    return result;
+}
+
+ffxReturnCode_t hook_ffx_destroy_context(
+    ffxContext* context, const ffxAllocationCallbacks* allocation) {
+    ffxContext twin{};
+    if (context != nullptr && *context != nullptr) {
+        std::scoped_lock lock{g_remaster_fsr_twin_mutex};
+        for (auto it = g_remaster_fsr_twins.begin();
+             it != g_remaster_fsr_twins.end(); ++it) {
+            if (it->game == *context) {
+                twin = it->right;
+                g_remaster_fsr_twins.erase(it);
+                break;
+            }
+        }
+    }
+    const ffxContext game = context != nullptr ? *context : nullptr;
+    const ffxReturnCode_t result = g_ffx_destroy_context(context, allocation);
+    if (twin != nullptr) {
+        const ffxReturnCode_t twin_result =
+            g_ffx_destroy_context(&twin, allocation);
+        g_remaster_fsr_guards_stale.store(true, std::memory_order_release);
+        log_line("FSR per-eye: game context %p destroyed (result=%u), twin "
+            "destroyed (result=%u)", game, result, twin_result);
+    }
+    return result;
+}
+
+ffxReturnCode_t hook_ffx_configure(
+    ffxContext* context, const ffxConfigureDescHeader* desc) {
+    const ffxReturnCode_t result = g_ffx_configure(context, desc);
+    const ffxContext twin =
+        context != nullptr ? remaster_fsr_twin_for(*context) : nullptr;
+    if (twin != nullptr) {
+        ffxContext copy = twin;
+        g_ffx_configure(&copy, desc);
+    }
+    return result;
+}
+
+uintptr_t __fastcall hook_remaster_fsr_upscale_dispatch(
+    void* state, void* frame_data, void* params, uintptr_t index,
+    uintptr_t fifth) {
+    namespace addresses = w3vr::engine_addresses;
+    if (state == nullptr || frame_data == nullptr ||
+        !remaster_engine_fsr_stereo_active() ||
+        !g_engine_dual_render_active.load(std::memory_order_acquire)) {
+        g_remaster_fsr_passthrough_calls.fetch_add(1, std::memory_order_relaxed);
+        return g_engine_fsr_upscale_dispatch(
+            state, frame_data, params, index, fifth);
+    }
+    auto* bytes = static_cast<uint8_t*>(state);
+    const size_t context_offset =
+        engine_frame_offset(addresses::Value::FsrStateContext);
+    const size_t reset_offset =
+        engine_frame_offset(addresses::Value::FsrStateResetFlag);
+    ffxContext game_context{};
+    memcpy(&game_context, bytes + context_offset, sizeof(game_context));
+    const ffxContext twin = remaster_fsr_twin_for(game_context);
+    if (twin == nullptr) {
+        g_remaster_fsr_passthrough_calls.fetch_add(1, std::memory_order_relaxed);
+        return g_engine_fsr_upscale_dispatch(
+            state, frame_data, params, index, fifth);
+    }
+    const int eye = remaster_dlss_eye_for_frame_data(frame_data);
+    const size_t slot = eye == 0 || eye == 1
+        ? static_cast<size_t>(eye)
+        : kRemasterFsrUntaggedSlot;
+    uint32_t frame_index{};
+    memcpy(&frame_index, static_cast<uint8_t*>(frame_data) + 0xC44,
+        sizeof(frame_index));
+
+    std::scoped_lock lock{g_remaster_fsr_mutex};
+    if (g_remaster_fsr_state != state ||
+        g_remaster_fsr_guards_stale.exchange(false, std::memory_order_acq_rel)) {
+        g_remaster_fsr_state = state;
+        g_remaster_fsr_eye_guards = {};
+        g_remaster_fsr_reset_pending = false;
+    }
+    const uint8_t game_reset = bytes[reset_offset];
+    bool force_reset = slot == kRemasterFsrUntaggedSlot;
+    if (slot != kRemasterFsrUntaggedSlot) {
+        const auto& guards = g_remaster_fsr_eye_guards[slot];
+        // A fresh or long-interrupted eye history (first use, menus,
+        // cutscenes) starts over; the eyes of a pair may or may not share a
+        // frame index (+1 or +2 per pair).
+        force_reset = !guards.valid ||
+            frame_index - guards.last_frame_index > 4;
+        // The game's reset was consumed by the other eye of this pair
+        // (same frame index, or the next one).
+        if (g_remaster_fsr_reset_pending &&
+            frame_index - g_remaster_fsr_reset_frame <= 1 &&
+            g_remaster_fsr_reset_source != slot) {
+            force_reset = true;
+            g_remaster_fsr_reset_pending = false;
+        }
+        const uint8_t bit = static_cast<uint8_t>(1u << slot);
+        if ((g_remaster_fsr_external_reset_mask.fetch_and(
+                static_cast<uint8_t>(~bit), std::memory_order_acq_rel) & bit) != 0) {
+            force_reset = true;
+        }
+    }
+    if (force_reset) {
+        bytes[reset_offset] = 1;
+    }
+    if (slot == 1) {
+        memcpy(bytes + context_offset, &twin, sizeof(twin));
+    }
+    const uintptr_t result = g_engine_fsr_upscale_dispatch(
+        state, frame_data, params, index, fifth);
+    if (slot == 1) {
+        memcpy(bytes + context_offset, &game_context, sizeof(game_context));
+    }
+    // The dispatch clears the byte itself unless frame generation owns it;
+    // never leave a reset of ours behind for the game's next dispatch.
+    if (force_reset && game_reset == 0) {
+        bytes[reset_offset] = 0;
+    }
+    if (slot != kRemasterFsrUntaggedSlot) {
+        auto& guards = g_remaster_fsr_eye_guards[slot];
+        const auto& other_guards = g_remaster_fsr_eye_guards[slot == 0 ? 1 : 0];
+        const bool first_eye_of_pair = !other_guards.valid ||
+            other_guards.last_frame_index != frame_index;
+        if (game_reset != 0 && first_eye_of_pair) {
+            g_remaster_fsr_reset_pending = true;
+            g_remaster_fsr_reset_frame = frame_index;
+            g_remaster_fsr_reset_source = slot;
+        }
+        guards.last_frame_index = frame_index;
+        guards.valid = true;
+        g_remaster_fsr_last_tagged_present.store(
+            g_present_count.load(std::memory_order_relaxed),
+            std::memory_order_release);
+        const uint8_t eye_bit = static_cast<uint8_t>(1u << slot);
+        if ((g_remaster_fsr_first_eye_logged.fetch_or(
+                eye_bit, std::memory_order_relaxed) & eye_bit) == 0) {
+            log_line("FSR per-eye: first %s-eye dispatch on %s context %p",
+                slot == 0 ? "left" : "right", slot == 0 ? "game" : "twin",
+                slot == 0 ? game_context : twin);
+        }
+    } else {
+        // It ran on the game's (left) context: restart both eye histories.
+        g_remaster_fsr_external_reset_mask.fetch_or(
+            0x3u, std::memory_order_release);
+    }
+    if (force_reset) {
+        g_remaster_fsr_forced_resets.fetch_add(1, std::memory_order_relaxed);
+    }
+    g_remaster_fsr_eye_calls[slot].fetch_add(1, std::memory_order_relaxed);
+    if (g_config.runtime_diagnostics &&
+        (g_remaster_fsr_log_count.fetch_add(1, std::memory_order_relaxed) < 96 ||
+            force_reset) &&
+        g_remaster_fsr_log_count.load(std::memory_order_relaxed) < 2000) {
+        log_line("FSR per-eye dispatch eye=%d slot=%zu tid=%lu present=%llu "
+            "frame_index=%u reset=%d/%d calls=%llu/%llu/%llu passthrough=%llu "
+            "forced=%llu",
+            eye, slot, GetCurrentThreadId(),
+            static_cast<unsigned long long>(g_present_count.load()),
+            frame_index, force_reset ? 1 : 0, game_reset != 0 ? 1 : 0,
+            static_cast<unsigned long long>(g_remaster_fsr_eye_calls[0].load()),
+            static_cast<unsigned long long>(g_remaster_fsr_eye_calls[1].load()),
+            static_cast<unsigned long long>(g_remaster_fsr_eye_calls[2].load()),
+            static_cast<unsigned long long>(
+                g_remaster_fsr_passthrough_calls.load()),
+            static_cast<unsigned long long>(
+                g_remaster_fsr_forced_resets.load()));
+    }
+    return result;
+}
+
 // [FEATURE:REMASTER-ASYMMETRIC-NDC 6/6] Shadow cascades: the 5.01 frustum
 // corner helper rebuilds the projection from FOV/aspect plus the centre block
 // only, so with a per-eye frustum it would fit cascades to a centred frustum
@@ -48436,6 +48786,131 @@ void install_remaster_engine_dlss_hooks() {
     log_line("V20001 remaster DLSS per-eye viewports hooked (right eye viewport +0x%X, "
         "per-eye guards, per_eye_motion=%d)",
         kRemasterDlssRightEyeViewportOffset,
+        g_config.remaster_dlss_per_eye_motion ? 1 : 0);
+}
+
+// Slot of the game exe's import |dll|!|name| (by-name imports only).
+void** find_exe_import_slot(const char* dll, const char* name) {
+    auto* image = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
+    if (image == nullptr) {
+        return nullptr;
+    }
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(image);
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(
+        image + dos->e_lfanew);
+    const auto& directory =
+        nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (directory.VirtualAddress == 0) {
+        return nullptr;
+    }
+    for (auto* desc = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(
+             image + directory.VirtualAddress);
+         desc->Name != 0; ++desc) {
+        if (_stricmp(reinterpret_cast<const char*>(image + desc->Name), dll) != 0 ||
+            desc->OriginalFirstThunk == 0) {
+            continue;
+        }
+        auto* names = reinterpret_cast<IMAGE_THUNK_DATA64*>(
+            image + desc->OriginalFirstThunk);
+        auto* slots = reinterpret_cast<IMAGE_THUNK_DATA64*>(
+            image + desc->FirstThunk);
+        for (; names->u1.AddressOfData != 0; ++names, ++slots) {
+            if (IMAGE_SNAP_BY_ORDINAL64(names->u1.Ordinal)) {
+                continue;
+            }
+            const auto* by_name = reinterpret_cast<const IMAGE_IMPORT_BY_NAME*>(
+                image + names->u1.AddressOfData);
+            if (strcmp(reinterpret_cast<const char*>(by_name->Name), name) == 0) {
+                return reinterpret_cast<void**>(&slots->u1.Function);
+            }
+        }
+    }
+    return nullptr;
+}
+
+bool write_import_slot(void** slot, void* value) {
+    DWORD protection{};
+    if (!VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &protection)) {
+        return false;
+    }
+    InterlockedExchangePointer(slot, value);
+    DWORD ignored{};
+    VirtualProtect(slot, sizeof(void*), protection, &ignored);
+    return true;
+}
+
+// [FEATURE:REMASTER-FSR-PER-EYE 6/7] The exe imports the FidelityFX API from
+// amd_fidelityfx_loader_dx12.dll. Only the exe's own import slots are
+// redirected; the AMD DLLs are left untouched. The engine dispatch hook is
+// enabled only once the slots are in place, so a twin is never dispatched
+// without the lifetime hooks that destroy it.
+void install_remaster_engine_fsr_hooks() {
+    if (!remaster_engine_fsr_stereo_active() ||
+        running_game_build() != w3vr::game_build::Build::Remaster501 ||
+        g_engine_fsr_upscale_dispatch != nullptr) {
+        return;
+    }
+    constexpr const char* kLoader = "amd_fidelityfx_loader_dx12.dll";
+    HMODULE loader = GetModuleHandleA(kLoader);
+    if (loader == nullptr) {
+        log_line("FSR per-eye disabled: %s is not loaded", kLoader);
+        return;
+    }
+    g_ffx_query = reinterpret_cast<PfnFfxQuery>(
+        GetProcAddress(loader, "ffxQuery"));
+    struct ImportSpec {
+        const char* name;
+        void* detour;
+        void** original;
+        void** slot;
+    };
+    ImportSpec imports[] = {
+        {"ffxCreateContext", reinterpret_cast<void*>(&hook_ffx_create_context),
+            reinterpret_cast<void**>(&g_ffx_create_context), nullptr},
+        {"ffxDestroyContext", reinterpret_cast<void*>(&hook_ffx_destroy_context),
+            reinterpret_cast<void**>(&g_ffx_destroy_context), nullptr},
+        {"ffxConfigure", reinterpret_cast<void*>(&hook_ffx_configure),
+            reinterpret_cast<void**>(&g_ffx_configure), nullptr},
+    };
+    for (auto& import : imports) {
+        import.slot = find_exe_import_slot(kLoader, import.name);
+        if (import.slot == nullptr || *import.slot == nullptr) {
+            log_line("FSR per-eye disabled: import %s!%s not found", kLoader,
+                import.name);
+            return;
+        }
+    }
+    auto* target = engine_function_target(
+        w3vr::engine_addresses::Function::FsrUpscaleDispatch);
+    if (target == nullptr ||
+        MH_CreateHook(target,
+            reinterpret_cast<void*>(&hook_remaster_fsr_upscale_dispatch),
+            reinterpret_cast<void**>(&g_engine_fsr_upscale_dispatch)) != MH_OK) {
+        g_engine_fsr_upscale_dispatch = nullptr;
+        log_line("FSR per-eye disabled: upscale dispatch hook unavailable");
+        return;
+    }
+    size_t patched = 0;
+    for (auto& import : imports) {
+        // Whatever the slot holds now (the loader's export, or another
+        // tool's wrapper) stays the next link of the chain.
+        *import.original = *import.slot;
+        if (!write_import_slot(import.slot, import.detour)) {
+            break;
+        }
+        ++patched;
+    }
+    if (patched != std::size(imports) || MH_EnableHook(target) != MH_OK) {
+        for (size_t i = 0; i < patched; ++i) {
+            write_import_slot(imports[i].slot, *imports[i].original);
+        }
+        MH_RemoveHook(target);
+        g_engine_fsr_upscale_dispatch = nullptr;
+        log_line("FSR per-eye disabled: import redirect or hook enable failed");
+        return;
+    }
+    log_line("FSR per-eye hooked: right-eye twin context per game upscale "
+        "context, per-eye resets, per_eye_motion=%d",
         g_config.remaster_dlss_per_eye_motion ? 1 : 0);
 }
 
@@ -55022,6 +55497,7 @@ void ensure_initialized() {
         install_engine_scene_enqueue_probe();
         install_engine_temporal_camera_builder_hook();
         install_remaster_engine_dlss_hooks();
+        install_remaster_engine_fsr_hooks();
         install_remaster_gui_fade_fill_hook();
         install_remaster_asymmetric_ndc_hooks();
         install_remaster_shadow_pair_hooks();

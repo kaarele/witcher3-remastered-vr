@@ -1071,3 +1071,46 @@ thread, just before xrWaitFrame/xrEndFrame.
   no regressions) and in the headset in a town, together with `UseWorkFreezing=false` in
   `bin/config/r4game/legacy/base/gameplay.ini`: people kept animating; a frozen character was seen
   once, in a cutscene.
+
+### Per-eye FSR history in Stereo (`[engine] remaster_fsr_per_eye`, 5.01)
+
+- Problem: with Anti-aliasing = FSR (AAMode 5), 5.01 dispatches one upscale ffxContext for every
+  render. Strict Stereo renders both eyes through it, so one FSR history alternates between the
+  eyes and blends them (ghosting); the per-eye frustum gate also stays on the envelope route
+  because temporal jitter runs without a per-eye history.
+- Game path (Steam 5.01): the exe imports `ffxCreateContext`, `ffxConfigure`, `ffxQuery`,
+  `ffxDestroyContext` and `ffxDispatch` from `amd_fidelityfx_loader_dx12.dll` (FidelityFX SDK 2.x
+  API; the game ships loader 2.3.0, upscaler 4.1.1, frame generation 4.0.1). 0x01C64D20 creates
+  the upscale context into FSR state +0x40 (description: `FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE`,
+  flags 0x28 depth inverted + auto exposure, +1 HDR, +0x40 dynamic resolution, max render size =
+  max upscale size = the output size, chained to the DX12 backend description; no allocation
+  callbacks). The upscaler selection 0x01C09E73 calls the FSR dispatch 0x01C665B0 (state =
+  renderer +0xD0, the same frame_data as the DLSS functions); it fills
+  `FFX_API_DISPATCH_DESC_TYPE_UPSCALE` (jitter from frame_data +0x4D0, render/output sizes from
+  +0xBDC..+0xBE8, near/far +0x40/+0x44, vertical FOV from +0x2C) and dispatches on `&state->ctx`
+  (call 0x01C66C3D). The history reset is the byte at state +0x26, cleared after the dispatch
+  unless frame generation owns it (state +0x24). Jitter comes from the context's jitter queries
+  (0x10004/0x10005) in 0x01C0A9B0, indexed by the render counter.
+- Fix (`remaster_fsr_per_eye=1`, off by default): the mod redirects the exe's import slots for
+  `ffxCreateContext`, `ffxDestroyContext` and `ffxConfigure` (the AMD DLLs are not patched).
+  When the game creates an upscale context, the mod creates a twin with the game's own
+  description for the right eye; destroy and configure calls on the game's context are repeated
+  on the twin. The FSR dispatch 0x01C665B0 is hooked (signature checked): for a right-eye frame
+  (eye from the dual-render frame tag) the state's context field holds the twin for the duration
+  of the call, so the game's own code dispatches it. Resets follow the per-eye DLSS rules: a new
+  or long-interrupted eye restarts (frame index gap > 4), a reset the game asks for on the first
+  eye of a pair is repeated on the second (same frame index or the next), and a per-eye frustum
+  change restarts both. An untagged dual-render frame runs on the game's context with a reset and
+  restarts both eyes afterwards. With the key on, per-eye FSR also enables the per-eye
+  motion-vector camera record (`remaster_dlss_per_eye_motion`) and counts as a per-eye history for
+  the per-eye frustum gate.
+- Nothing depends on the FSR version: the twin is created through the same loader, so it gets the
+  provider the game's context gets (FSR 2/3.1 on most GPUs, FSR 4.x where the driver offers it).
+  The log names both providers and the twin's VRAM at creation:
+  `FSR per-eye: game upscale context ... right-eye twin ... vram=... MB`, then
+  `FSR per-eye: first left-eye dispatch` / `first right-eye dispatch`. With
+  `runtime_diagnostics=1`, `FSR per-eye dispatch eye= slot= frame_index= reset= calls=` lines.
+- Not covered: FSR frame generation (off in VR; disabled by the game under Wine); the jitter
+  sequence is still indexed by the render counter, so each eye sees every other sample (as with
+  DLSS). XeSS keeps one history for both eyes.
+- Status: built, not yet run in the game.

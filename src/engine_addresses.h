@@ -41,6 +41,7 @@ enum class Function : size_t {
     RenderFenceWait,       // CRenderFence wait, vtable +0x18 (fence): blocks until it is signalled
     ParallelFlushCommands, // ParallelRenderCommands::FlushCommands (commands): staged batches -> ready, apply
     FrustumAabbTest,       // (frustum, world box {min, max}): 1 = box fully outside the frustum
+    FsrUpscaleDispatch,    // FSR upscale dispatch (state, frame_data, params, index, ...)
     Count,
 };
 
@@ -242,6 +243,17 @@ inline constexpr uint8_t kAnimatedComponentFrustumCall501Bytes[] = {
 inline constexpr uint8_t kAnimatedComponentFrustumStore501Bytes[] = {
     0x49, 0x8D, 0x8F, 0x50, 0x0F, 0x00, 0x00, 0x41, 0x88, 0x87, 0x74, 0x0F,
     0x00, 0x00};
+// [FEATURE:REMASTER-FSR-PER-EYE 1/7] 5.01 FSR upscale dispatch, the only
+// caller of ffxDispatch with FFX_API_DISPATCH_DESC_TYPE_UPSCALE (0x01C66C3D).
+// The upscaler selection (0x01C09F57) passes the FSR state (renderer +0xD0)
+// and the same frame_data as the DLSS functions. It dispatches on the
+// ffxContext at state +0x40 (created by 0x01C64D20, one per game) and takes
+// the history reset from the byte at state +0x26, which it clears afterwards
+// unless frame generation owns it (state +0x24). Leading bytes up to the
+// RIP-relative compare, unique in the exe.
+inline constexpr uint8_t kFsrUpscaleDispatch501Bytes[] = {
+    0x40, 0x55, 0x53, 0x57, 0x41, 0x56, 0x48, 0x8D, 0xAC, 0x24, 0x68, 0xFE,
+    0xFF, 0xFF, 0x48, 0x81, 0xEC, 0x98, 0x02, 0x00, 0x00, 0x80, 0x3D};
 
 inline constexpr Entry kEntries[] = {
     {"IsAnyMenu", 0x01F3C5C0, 0x01DF41A0, {kIsAnyMenuBytes, sizeof(kIsAnyMenuBytes)}},
@@ -295,6 +307,8 @@ inline constexpr Entry kEntries[] = {
         {kParallelFlushCommands501Bytes, sizeof(kParallelFlushCommands501Bytes)}},
     {"FrustumAabbTest", 0x0031E050, 0x0099B2B0,
         {kFrustumAabbTest501Bytes, sizeof(kFrustumAabbTest501Bytes)}},
+    {"FsrUpscaleDispatch", 0, 0x01C665B0,
+        {kFsrUpscaleDispatch501Bytes, sizeof(kFsrUpscaleDispatch501Bytes)}},
 };
 static_assert(sizeof(kEntries) / sizeof(kEntries[0]) ==
     static_cast<size_t>(Function::Count));
@@ -351,6 +365,8 @@ enum class Value : size_t {
     ParallelBucketCount,          // buckets per list (hashed by proxy address)
     AnimatedComponentVisibilityReturn,  // return address of the frustum test call in the
                                         // animated-component visibility update
+    FsrStateContext,              // FSR state: the game's upscale ffxContext
+    FsrStateResetFlag,            // FSR state: byte requesting a history reset for the next dispatch
     Count,
 };
 
@@ -452,6 +468,9 @@ inline constexpr ValueEntry kValues[] = {
     // keeps its last pose, or the bind pose if it was never updated) and only
     // moves plain child transforms such as a held weapon.
     {"AnimatedComponentVisibilityReturn", 0x015E186C, 0x02437A90},
+    // [FEATURE:REMASTER-FSR-PER-EYE 2/7] See kFsrUpscaleDispatch501Bytes.
+    {"FsrStateContext", 0, 0x40},
+    {"FsrStateResetFlag", 0, 0x26},
 };
 static_assert(sizeof(kValues) / sizeof(kValues[0]) == static_cast<size_t>(Value::Count));
 

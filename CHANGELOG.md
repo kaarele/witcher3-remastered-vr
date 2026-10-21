@@ -4,6 +4,12 @@ Versions below 1.0 are alpha releases. Downloads are on the
 [Releases page](https://github.com/kaarele/witcher3-remastered-vr/releases). Release notes of the
 original mod and of the Remastered port this project builds on are in [docs/releases](docs/releases/).
 
+## Unreleased
+
+- Experimental, off by default: FSR in Stereo with a separate FSR history for each eye
+  (`[engine] remaster_fsr_per_eye=1`, Linux tool `configure --aa fsr`). Works with whatever FSR
+  version the game picks (FSR 4 on RDNA4, the older FSR elsewhere). Not tested in the game yet.
+
 ## 0.1.2 (2026-10-20)
 
 - Linux: `w3vr-linux.py configure` now works on a fresh install from the release zip. In 0.1.1 it
