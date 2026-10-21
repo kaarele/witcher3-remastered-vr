@@ -458,6 +458,7 @@ The original mod's keys are documented in [witcher3vr.example.ini](witcher3vr.ex
 | `remaster_local_light_pair_lock` | `0` | `1` = choose and fade local shadows for both eyes from the first eye's position. |
 | `remaster_pair_jitter` | `0` | `1` = both eyes use the same DLSS jitter sample, advancing once per stereo pair, so each eye's DLSS history sees the whole jitter pattern (the game steps it per eye render, which gives each eye only half of it). Experimental, not tested in the game yet. |
 | `remaster_pair_noise` | `0` | `1` = the same GTAO and screen-space shadow noise pattern in both eyes, advancing once per stereo pair. Experimental, not tested in the game yet. |
+| `remaster_pair_previous_transforms` | `0` | `1` = moving characters and objects keep their motion vectors in the second-rendered (left) eye, so DLSS and FSR do not smear them there. Experimental, not tested in the game yet. |
 | `animated_component_visible` | `1` | Keep animating characters the headset sees but the game camera does not (outside its view). 4.04 and 5.01. |
 | `remaster_local_shadow_slices` | `1` | `1`-`4` local-shadow atlas slices of 2048x2048. More slices let more lights cast shadows (4 costs about 24-48 MB more VRAM). |
 | `remaster_local_shadow_sort_corrected` | `0` | `1` = pack the nearest shadowed lights first, so an overflow drops far lights. |
