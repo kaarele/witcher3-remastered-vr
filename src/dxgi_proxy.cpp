@@ -662,6 +662,9 @@ struct Config {
     float menu_world_distance{2.5f};
     float menu_world_width{2.4f};
     float menu_world_reanchor_distance{0.5f};
+    // Width/height of the picture shown on the world screen (the game draws
+    // its frontend letterboxed into the eye render size); 0 = the whole image.
+    float menu_world_aspect{16.0f / 9.0f};
     float cinema_render_stereo_strength{1.0f};
     int cinema_hud_stereo_shift_px{-72};
     float manual_cinema_hud_scale{1.25f};
@@ -17226,6 +17229,12 @@ void load_config() {
         g_config.menu_world_reanchor_distance = std::clamp(
             read_ini_float("openxr", "menu_world_reanchor_distance", 0.5f),
             0.1f, 5.0f);
+        g_config.menu_world_aspect = read_ini_float(
+            "openxr", "menu_world_aspect", 16.0f / 9.0f);
+        if (!(g_config.menu_world_aspect >= 0.5f &&
+                g_config.menu_world_aspect <= 4.0f)) {
+            g_config.menu_world_aspect = 0.0f;
+        }
         log_line(
             "Config menu world screen locked=%d distance=%.3f width=%.3f "
             "reanchor_distance=%.3f",
@@ -66489,6 +66498,22 @@ void render_openxr_test_frame(
     // In-game menus (kind 1) and cinema (kind 2) keep their own anchoring.
     const bool world_menu_screen = g_config.menu_world_locked &&
         fullscreen_menu && (startup_frontend_panel || loading_video);
+    // The frontend picture is letterboxed inside the eye render size; on the
+    // world screen show only its centred menu_world_aspect part, so the black
+    // bars do not become part of the screen.
+    if (world_menu_screen && g_config.menu_world_aspect > 0.0f &&
+        menu_image_rect.extent.width > 0 && menu_image_rect.extent.height > 0) {
+        const int32_t cropped_height = static_cast<int32_t>(
+            static_cast<float>(menu_image_rect.extent.width) /
+                g_config.menu_world_aspect + 0.5f);
+        if (cropped_height > 0 &&
+            cropped_height < menu_image_rect.extent.height) {
+            menu_image_rect.offset.y +=
+                (menu_image_rect.extent.height - cropped_height) / 2;
+            menu_image_rect.extent.height = cropped_height;
+            menu_layer.subImage.imageRect = menu_image_rect;
+        }
+    }
     const int spatial_panel_kind = world_menu_screen
         ? 3
         : (startup_frontend_panel
