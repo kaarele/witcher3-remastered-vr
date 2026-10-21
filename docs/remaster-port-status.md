@@ -1298,3 +1298,38 @@ thread, just before xrWaitFrame/xrEndFrame.
   - `stitch_views_to_equirect.py` turns a ring of rectilinear captures (8 yaws per eye + up/down)
     into a top-bottom stereo picture; its `--selftest` reaches 32.6 dB on a synthetic scene.
 
+
+### See-through graphics options (`[openxr] options_menu_see_through`, 5.01)
+- Goal: while the in-game Graphics or Display options page is open, show the live stereo world
+  behind the menu, so graphics changes are visible as they are made.
+- What the game does:
+  - The pause menu definition `gameplay\gui_new\guirsrc\r4ingamecommonmenu.menu` (blob.bundle) has
+    `CMenuPauseParam pauseType=MPT_FullPause` and a `CMenuRenderBackgroundParam` without
+    properties, so `renderGameWorld` keeps its default. `r4loading.menu` and
+    `r4commonmainmenu.menu` set it explicitly to false, so the default is to render the world.
+  - There is no `CMenuBackgroundEffectParam` (engine blur) on the pause menu. The Flash
+    `setBackgroundEffect` blur (`CR4MenuBase.BlurLayer`) is only used by popups and overlays.
+  - The mod itself hid the world: any open menu stopped stereo and showed the final mono
+    backbuffer (world plus menu) as one panel.
+- Signal: the 5.01 native `theGame.SetHDRMenuFadePercentage` (0x142273A20, registered at
+  0x14087CF7B) evaluates its float argument through the script opcode table and discards it on PC.
+  - The DLL replaces it with the same evaluation (whole-function signature, opcode table read from
+    the lea at +0x0A) and consumes two sentinel values: 7701 = on, 7700 = off.
+  - The script `support/remaster/modWitcher3VRStateBridge/.../options_see_through.ws` wraps
+    `CR4IngameMenu.OnShowOptionSubmenu(actionType, menuTag, id)`: on for ids `general`
+    (`video.general`, Graphics) and `display`, only when `!isMainMenu`. It sends off from
+    `OnOptionPanelNavigateBack`, `OnNavigatedBack` and `OnClosingMenu`. IsAnyMenu false also
+    clears the request.
+- While on: `publish_engine_menu_state` reports the effective menu state as 0, the same route the
+  ReShade overlay uses. Stereo arming resumes at the next HMD world camera, the projection layer is
+  submitted, and the game's GUI target (now the menu) goes through the retained-HUD route onto the
+  HUD plane.
+- Fallback: if no HMD world camera arrives within 135 Presents (~1.5 s) of the request, the
+  request is latched off for that page and the normal menu panel returns
+  (`Options see-through fallback ...`).
+- Logs: `Options see-through signal hooked ...`, `Options see-through request=...`, and
+  `REDengine menu state ... options_see_through=1`.
+- Status: built, not run yet. Open questions for the first test:
+  - whether the world keeps rendering while the menu has the game fully paused;
+  - how dark the menu's own Flash background makes the world;
+  - whether the menu is readable at HUD size.

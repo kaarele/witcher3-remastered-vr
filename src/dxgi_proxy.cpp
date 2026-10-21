@@ -662,6 +662,12 @@ struct Config {
     float menu_world_distance{2.5f};
     float menu_world_width{2.4f};
     float menu_world_reanchor_distance{0.5f};
+    // [FEATURE:OPTIONS-SEE-THROUGH 2/6] [openxr] options_menu_see_through=1:
+    // while the in-game graphics, post-processing or display options page is
+    // open (signalled by the 5.01 state-bridge script mod), keep stereo
+    // rendering and draw the menu on the HUD plane over the live world instead
+    // of the flat menu panel, so changes are visible as they are made.
+    bool options_menu_see_through{false};
     float cinema_render_stereo_strength{1.0f};
     int cinema_hud_stereo_shift_px{-72};
     float manual_cinema_hud_scale{1.25f};
@@ -3136,6 +3142,26 @@ using EngineIsAnyMenuFn = void(__fastcall*)(void*, void*, uint8_t*);
 EngineIsAnyMenuFn g_engine_is_any_menu{};
 std::atomic<int> g_engine_menu_state{-1};
 std::atomic<int> g_engine_raw_menu_state{-1};
+// [FEATURE:OPTIONS-SEE-THROUGH 4/6] Request from the script mod (sentinel
+// values passed to the no-op native SetHDRMenuFadePercentage), the Present it
+// arrived on, and a per-request latch that gives up when no world camera
+// follows (the game did not render the world behind that menu).
+using ScriptOpcodeHandlerFn = void(__fastcall*)(void*, void*, void*);
+const ScriptOpcodeHandlerFn* g_script_opcode_handlers{};
+void* g_engine_set_hdr_menu_fade_original{};
+std::atomic<bool> g_options_see_through_requested{};
+std::atomic<uint64_t> g_options_see_through_since_present{UINT64_MAX};
+std::atomic<bool> g_options_see_through_fallback{};
+constexpr float kOptionsSeeThroughOnValue = 7701.0f;
+constexpr float kOptionsSeeThroughOffValue = 7700.0f;
+// About 1.5 s at the usual 80-90 Presents/s.
+constexpr uint64_t kOptionsSeeThroughArmPresents = 135;
+
+bool options_see_through_active() {
+    return g_config.options_menu_see_through &&
+        g_options_see_through_requested.load(std::memory_order_acquire) &&
+        !g_options_see_through_fallback.load(std::memory_order_acquire);
+}
 
 // [FIX:AER-AFW-CINEMA-HUD-RESTORE V1190 1/4] AFW is suspended in normal or
 // manual Cinema, so its HUD must remain on the already validated per-eye
@@ -17244,6 +17270,11 @@ void load_config() {
             g_config.menu_world_locked ? 1 : 0,
             g_config.menu_world_distance, g_config.menu_world_width,
             g_config.menu_world_reanchor_distance);
+        // [FEATURE:OPTIONS-SEE-THROUGH 3/6]
+        g_config.options_menu_see_through =
+            read_ini_bool("openxr", "options_menu_see_through", false);
+        log_line("Config options menu see-through=%d",
+            g_config.options_menu_see_through ? 1 : 0);
         // Missing keys preserve the pre-V865 cinema exactly: full REDengine
         // baseline and the original zero-shift HUD composite.
         g_config.cinema_render_stereo_strength = std::clamp(
@@ -52101,9 +52132,24 @@ void publish_engine_menu_state(
     g_engine_raw_menu_state.store(raw_menu_open, std::memory_order_relaxed);
     const bool reshade_overlay_open =
         g_reshade_overlay_open.load(std::memory_order_acquire);
-    const int menu_open =
+    // [FEATURE:OPTIONS-SEE-THROUGH 5/6] No menu at all ends any see-through
+    // request, even if the script's closing signal was missed.
+    if (raw_menu_open == 0 &&
+        g_options_see_through_requested.exchange(
+            false, std::memory_order_acq_rel)) {
+        g_options_see_through_fallback.store(false, std::memory_order_release);
+        log_line("Options see-through request cleared: no menu open present=%llu",
+            static_cast<unsigned long long>(g_present_count.load()));
+    }
+    int menu_open =
         w3vr::reshade_overlay::effective_engine_menu_state(
             raw_menu_open, reshade_overlay_open);
+    // A see-through options page is presented like gameplay (stereo world plus
+    // the GUI on the HUD plane), the same route the ReShade overlay uses.
+    const bool see_through = menu_open != 0 && options_see_through_active();
+    if (see_through) {
+        menu_open = 0;
+    }
     const int previous = g_engine_menu_state.exchange(menu_open);
     if (menu_open != 0) {
         g_engine_dual_gameplay_armed.store(false, std::memory_order_relaxed);
@@ -52111,11 +52157,61 @@ void publish_engine_menu_state(
     if (previous != menu_open) {
         log_line(
             "REDengine menu state %s raw=%d effective=%d "
-            "reshade_overlay=%d gui_manager=%p present=%llu",
+            "reshade_overlay=%d options_see_through=%d gui_manager=%p present=%llu",
             source, raw_menu_open, menu_open,
-            reshade_overlay_open ? 1 : 0, gui_manager,
+            reshade_overlay_open ? 1 : 0, see_through ? 1 : 0, gui_manager,
             static_cast<unsigned long long>(g_present_count.load()));
     }
+}
+
+void set_options_see_through_request(bool on) {
+    const bool previous = g_options_see_through_requested.exchange(
+        on, std::memory_order_acq_rel);
+    if (previous == on) {
+        return;
+    }
+    g_options_see_through_fallback.store(false, std::memory_order_release);
+    g_options_see_through_since_present.store(
+        on ? g_present_count.load(std::memory_order_relaxed) : UINT64_MAX,
+        std::memory_order_release);
+    const int raw = g_engine_raw_menu_state.load(std::memory_order_relaxed);
+    log_line("Options see-through request=%d enabled=%d raw_menu=%d present=%llu",
+        on ? 1 : 0, g_config.options_menu_see_through ? 1 : 0, raw,
+        static_cast<unsigned long long>(g_present_count.load()));
+    if (raw >= 0) {
+        publish_engine_menu_state(raw, g_engine_gui_manager.load(),
+            on ? "see-through-on" : "see-through-off");
+    }
+}
+
+// Falls back to the flat menu panel when no new HMD world camera arrives soon
+// after the request: the world is not being rendered behind that menu.
+void service_options_see_through_fallback() {
+    if (!options_see_through_active() ||
+        g_engine_raw_menu_state.load(std::memory_order_relaxed) <= 0) {
+        return;
+    }
+    const uint64_t since =
+        g_options_see_through_since_present.load(std::memory_order_acquire);
+    const uint64_t now = g_present_count.load(std::memory_order_relaxed);
+    const uint64_t last_world_camera =
+        g_engine_hmd_camera_last_present.load(std::memory_order_relaxed);
+    if (since == UINT64_MAX ||
+        (last_world_camera != UINT64_MAX && last_world_camera >= since) ||
+        now < since + kOptionsSeeThroughArmPresents) {
+        return;
+    }
+    if (g_options_see_through_fallback.exchange(true, std::memory_order_acq_rel)) {
+        return;
+    }
+    log_line("Options see-through fallback: no world camera since present=%llu "
+        "now=%llu last_world_camera=%llu; showing the flat menu panel",
+        static_cast<unsigned long long>(since),
+        static_cast<unsigned long long>(now),
+        static_cast<unsigned long long>(last_world_camera));
+    publish_engine_menu_state(
+        g_engine_raw_menu_state.load(std::memory_order_relaxed),
+        g_engine_gui_manager.load(), "see-through-fallback");
 }
 
 // [FIX:RESHADE-OVERLAY-MENU-ISOLATION V23036 1/4] The ReShade overlay owns
@@ -52123,6 +52219,7 @@ void publish_engine_menu_state(
 // menu even though no game menu was opened. Publish the raw value separately
 // and derive the route-facing state from the official overlay state.
 void poll_engine_menu_state() {
+    service_options_see_through_fallback();
     auto* gui_manager = g_engine_gui_manager.load();
     if (gui_manager == nullptr) {
         return;
@@ -53044,6 +53141,65 @@ void install_engine_menu_state_probe() {
         log_line("Engine IsAnyMenu probe hooked target=%p", target);
     } else {
         log_line("Engine IsAnyMenu probe hook failed target=%p", target);
+    }
+}
+
+// [FEATURE:OPTIONS-SEE-THROUGH 6/6] Replacement for the 5.01 native
+// SetHDRMenuFadePercentage, which only evaluates its float argument and
+// discards it (whole function signature-checked). This reproduces that
+// evaluation through the script opcode table and consumes the two sentinel
+// values sent by the state-bridge script mod; every other value stays a no-op.
+void __fastcall hook_engine_set_hdr_menu_fade_percentage(
+    void* context, uint8_t* stack, void* result) {
+    (void)context;
+    (void)result;
+    namespace addresses = w3vr::engine_addresses;
+    float value = 0.0f;
+    auto** code = reinterpret_cast<uint8_t**>(
+        stack + addresses::kScriptStackFrameCodeOffset);
+    const uint8_t opcode = **code;
+    ++*code;
+    const auto handler = g_script_opcode_handlers[opcode];
+    if (handler != nullptr) {
+        handler(*reinterpret_cast<void**>(stack), stack, &value);
+    }
+    ++*code;
+    if (value == kOptionsSeeThroughOnValue) {
+        set_options_see_through_request(true);
+    } else if (value == kOptionsSeeThroughOffValue) {
+        set_options_see_through_request(false);
+    }
+}
+
+void install_options_see_through_signal_hook() {
+    if (!g_config.options_menu_see_through ||
+        g_engine_set_hdr_menu_fade_original != nullptr) {
+        return;
+    }
+    namespace addresses = w3vr::engine_addresses;
+    auto* target = engine_function_target(
+        addresses::Function::GameSetHdrMenuFadePercentage);
+    if (target == nullptr) {
+        log_line("Options see-through disabled: signal native unavailable");
+        return;
+    }
+    int32_t rel{};
+    memcpy(&rel, target + addresses::kScriptNativeOpcodeTableRel32Offset,
+        sizeof(rel));
+    g_script_opcode_handlers = reinterpret_cast<const ScriptOpcodeHandlerFn*>(
+        target + addresses::kScriptNativeOpcodeTableNextIp + rel);
+    if (MH_CreateHook(target,
+            reinterpret_cast<void*>(&hook_engine_set_hdr_menu_fade_percentage),
+            &g_engine_set_hdr_menu_fade_original) == MH_OK &&
+        MH_EnableHook(target) == MH_OK) {
+        log_line("Options see-through signal hooked target=%p opcode_table=%p "
+            "on=%.0f off=%.0f",
+            target, static_cast<const void*>(g_script_opcode_handlers),
+            kOptionsSeeThroughOnValue, kOptionsSeeThroughOffValue);
+    } else {
+        g_script_opcode_handlers = nullptr;
+        g_engine_set_hdr_menu_fade_original = nullptr;
+        log_line("Options see-through signal hook failed target=%p", target);
     }
 }
 
@@ -57213,6 +57369,7 @@ void ensure_initialized() {
         install_engine_dlss_command_route_hook();
         install_engine_upscaler_pipeline_hook();
         install_engine_menu_state_probe();
+        install_options_see_through_signal_hook();
         install_engine_viewport_resolution_hook();
         install_engine_camera_light_placement_hook();
         install_remaster_local_light_hooks();

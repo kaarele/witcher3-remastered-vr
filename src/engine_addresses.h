@@ -45,6 +45,7 @@ enum class Function : size_t {
     EntityGetBoneWorldMatrixByIndex, // native CEntity.GetBoneWorldMatrixByIndex
     DlssMipBias,           // (frame_data, _, float* bias): texture LOD bias for the frame's samplers
     FsrUpscaleDispatch,    // FSR upscale dispatch (state, frame_data, params, index, ...)
+    GameSetHdrMenuFadePercentage,  // native theGame.SetHDRMenuFadePercentage (ignores its float)
     Count,
 };
 
@@ -368,6 +369,24 @@ inline constexpr size_t kFrameNoiseReadBytes = 7;
 inline constexpr uint8_t kFsrUpscaleDispatch501Bytes[] = {
     0x40, 0x55, 0x53, 0x57, 0x41, 0x56, 0x48, 0x8D, 0xAC, 0x24, 0x68, 0xFE,
     0xFF, 0xFF, 0x48, 0x81, 0xEC, 0x98, 0x02, 0x00, 0x00, 0x80, 0x3D};
+// [FEATURE:OPTIONS-SEE-THROUGH 1/6] 5.01 native theGame.SetHDRMenuFadePercentage
+// (registered at 0x14087CF7B, the only reference). On PC it evaluates its float
+// argument through the script opcode table (lea r9 at +0x0A) and discards it.
+// The options see-through script mod calls it with sentinel values that the
+// DLL consumes; without the DLL the call stays a no-op. Whole function.
+inline constexpr uint8_t kGameSetHdrMenuFadePercentage501Bytes[] = {
+    0x40, 0x53, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x8B, 0x42, 0x30, 0x4C, 0x8D,
+    0x0D, 0x3F, 0x20, 0x80, 0x03, 0xC5, 0xF8, 0x57, 0xC0, 0xC5, 0xFA, 0x11,
+    0x44, 0x24, 0x38, 0x48, 0x8B, 0xDA, 0x0F, 0xB6, 0x08, 0x48, 0xFF, 0xC0,
+    0x48, 0x89, 0x42, 0x30, 0x4D, 0x8B, 0x0C, 0xC9, 0x4D, 0x85, 0xC9, 0x74,
+    0x15, 0x48, 0x8B, 0x0A, 0x4C, 0x8D, 0x44, 0x24, 0x38, 0x41, 0xFF, 0xD1,
+    0x48, 0xFF, 0x43, 0x30, 0x48, 0x83, 0xC4, 0x20, 0x5B, 0xC3};
+// lea r9, [rip + rel32] of the opcode handler table: rel32 at +0x0D, next
+// instruction at +0x11. The script stack frame keeps its code pointer at +0x30
+// and its context object at +0x00.
+inline constexpr size_t kScriptNativeOpcodeTableRel32Offset = 0x0D;
+inline constexpr size_t kScriptNativeOpcodeTableNextIp = 0x11;
+inline constexpr size_t kScriptStackFrameCodeOffset = 0x30;
 // [FEATURE:REMASTER-FSR2-PER-EYE 1/4] The built-in FSR 2 (GPUs the FidelityFX
 // loader does not serve with FSR 4, e.g. NVIDIA, Intel, RX 6000): the upscale
 // dispatch above starts with cmp byte [flag], 0 (disp32 right after these
@@ -486,6 +505,9 @@ inline constexpr Entry kEntries[] = {
         {kDlssMipBias501Bytes, sizeof(kDlssMipBias501Bytes)}},
     {"FsrUpscaleDispatch", 0, 0x01C665B0,
         {kFsrUpscaleDispatch501Bytes, sizeof(kFsrUpscaleDispatch501Bytes)}},
+    {"Game.SetHDRMenuFadePercentage", 0, 0x02273A20,
+        {kGameSetHdrMenuFadePercentage501Bytes,
+            sizeof(kGameSetHdrMenuFadePercentage501Bytes)}},
 };
 static_assert(sizeof(kEntries) / sizeof(kEntries[0]) ==
     static_cast<size_t>(Function::Count));
