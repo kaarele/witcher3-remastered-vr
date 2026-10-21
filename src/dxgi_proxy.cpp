@@ -668,6 +668,9 @@ struct Config {
     // rendering and draw the menu on the HUD plane over the live world instead
     // of the flat menu panel, so changes are visible as they are made.
     bool options_menu_see_through{false};
+    // Opacity of the veil that replaces the options page's black backdrop
+    // while see-through is active (0 = invisible, 1 = the game's black).
+    float options_menu_see_through_veil{0.35f};
     float cinema_render_stereo_strength{1.0f};
     int cinema_hud_stereo_shift_px{-72};
     float manual_cinema_hud_scale{1.25f};
@@ -17261,8 +17264,12 @@ void load_config() {
         // [FEATURE:OPTIONS-SEE-THROUGH 3/6]
         g_config.options_menu_see_through =
             read_ini_bool("openxr", "options_menu_see_through", false);
-        log_line("Config options menu see-through=%d",
-            g_config.options_menu_see_through ? 1 : 0);
+        g_config.options_menu_see_through_veil = std::clamp(
+            read_ini_float("openxr", "options_menu_see_through_veil", 0.35f),
+            0.0f, 1.0f);
+        log_line("Config options menu see-through=%d veil=%.2f",
+            g_config.options_menu_see_through ? 1 : 0,
+            g_config.options_menu_see_through_veil);
         // Missing keys preserve the pre-V865 cinema exactly: full REDengine
         // baseline and the original zero-shift HUD composite.
         g_config.cinema_render_stereo_strength = std::clamp(
@@ -57952,6 +57959,19 @@ float4 bilinear_premultiplied(float2 position) {
         load_premultiplied(base + int2(1, 1)), f.x);
     return lerp(top, bottom, f.y);
 }
+// [FEATURE:OPTIONS-SEE-THROUGH 7/7] Bit 1 of filtered_sampling: the options
+// page draws an opaque black backdrop; key it into a veil (bits 8-15 = veil
+// opacity), so the live world shows through while text and widgets stay solid.
+float4 options_backdrop_key(float4 c) {
+    if ((filtered_sampling & 2u) == 0u) {
+        return c;
+    }
+    float veil = float((filtered_sampling >> 8) & 255u) / 255.0;
+    float level = max(max(c.r, c.g), c.b);
+    float keep = saturate((level - 0.002) / 0.02);
+    c.a *= lerp(veil, 1.0, keep);
+    return c;
+}
 float4 ps_main(PixelInput input) : SV_Target0 {
     uint source_width, source_height;
     hud_texture.GetDimensions(source_width, source_height);
@@ -58027,7 +58047,7 @@ float4 ps_main(PixelInput input) : SV_Target0 {
         }
     }
 #endif
-    if (filtered_sampling != 0u && geometry_owns_hud_transform != 0u) {
+    if ((filtered_sampling & 1u) != 0u && geometry_owns_hud_transform != 0u) {
         // Box-filter the pixel footprint with up to 4x4 bilinear taps in
         // premultiplied linear light. A single nearest Load drops 3 of 4 HUD
         // texels at 2:1, which breaks glyph strokes and crawls with the head.
@@ -58043,7 +58063,7 @@ float4 ps_main(PixelInput input) : SV_Target0 {
         }
         sum /= float(taps * taps);
         return sum.a > (1.0 / 1024.0)
-            ? float4(sum.rgb / sum.a, sum.a)
+            ? options_backdrop_key(float4(sum.rgb / sum.a, sum.a))
             : float4(0.0, 0.0, 0.0, 0.0);
     }
     // [FIX:MODE3-HUD-SRGB 1/1] REDengine stores display-encoded HUD RGB in an
@@ -58051,7 +58071,7 @@ float4 ps_main(PixelInput input) : SV_Target0 {
     // target, whose RTV performs the matching output encoding.
     float4 hud = hud_texture.Load(int3(coordinate, 0));
     hud.rgb = srgb_to_linear(hud.rgb);
-    return hud;
+    return options_backdrop_key(hud);
 }
 )";
 
@@ -58910,7 +58930,12 @@ bool composite_mode3_hud_into_projection_image(
             headset_projection ? 1u : 0u,
             (distance_converged_reticle || centre_split_draw) ? 1u : 0u,
             0,
-            g_config.hud_filtered_sampling ? 1u : 0u};
+            (g_config.hud_filtered_sampling ? 1u : 0u) |
+                (options_see_through_active()
+                    ? 2u | (static_cast<uint32_t>(std::lround(std::clamp(
+                          g_config.options_menu_see_through_veil, 0.0f, 1.0f) *
+                          255.0f)) << 8)
+                    : 0u)};
         memcpy(&sampling_constants[2], &hud_scale_x, sizeof(hud_scale_x));
         memcpy(&sampling_constants[3], &hud_scale_y, sizeof(hud_scale_y));
         memcpy(
