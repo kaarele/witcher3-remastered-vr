@@ -47144,6 +47144,311 @@ ffxReturnCode_t hook_ffx_configure(
     return result;
 }
 
+// Per-dispatch eye bookkeeping shared by the FidelityFX loader path and the
+// built-in FSR 2 path. Both run with g_remaster_fsr_mutex held; |reset_byte|
+// is the byte the respective dispatch takes its history reset from.
+struct RemasterFsrDispatch {
+    int eye{};
+    size_t slot{};
+    uint32_t frame_index{};
+    uint8_t game_reset{};
+    bool force_reset{};
+};
+
+RemasterFsrDispatch remaster_fsr_begin_dispatch_locked(
+    void* state, void* frame_data, uint8_t* reset_byte) {
+    RemasterFsrDispatch d{};
+    d.eye = remaster_dlss_eye_for_frame_data(frame_data);
+    d.slot = d.eye == 0 || d.eye == 1
+        ? static_cast<size_t>(d.eye)
+        : kRemasterFsrUntaggedSlot;
+    memcpy(&d.frame_index, static_cast<uint8_t*>(frame_data) + 0xC44,
+        sizeof(d.frame_index));
+    if (g_remaster_fsr_state != state ||
+        g_remaster_fsr_guards_stale.exchange(false, std::memory_order_acq_rel)) {
+        g_remaster_fsr_state = state;
+        g_remaster_fsr_eye_guards = {};
+        g_remaster_fsr_reset_pending = false;
+    }
+    d.game_reset = *reset_byte;
+    d.force_reset = d.slot == kRemasterFsrUntaggedSlot;
+    if (d.slot != kRemasterFsrUntaggedSlot) {
+        const auto& guards = g_remaster_fsr_eye_guards[d.slot];
+        // A fresh or long-interrupted eye history (first use, menus,
+        // cutscenes) starts over; the eyes of a pair may or may not share a
+        // frame index (+1 or +2 per pair).
+        d.force_reset = !guards.valid ||
+            d.frame_index - guards.last_frame_index > 4;
+        // The game's reset was consumed by the other eye of this pair
+        // (same frame index, or the next one).
+        if (g_remaster_fsr_reset_pending &&
+            d.frame_index - g_remaster_fsr_reset_frame <= 1 &&
+            g_remaster_fsr_reset_source != d.slot) {
+            d.force_reset = true;
+            g_remaster_fsr_reset_pending = false;
+        }
+        const uint8_t bit = static_cast<uint8_t>(1u << d.slot);
+        if ((g_remaster_fsr_external_reset_mask.fetch_and(
+                static_cast<uint8_t>(~bit), std::memory_order_acq_rel) & bit) != 0) {
+            d.force_reset = true;
+        }
+    }
+    if (d.force_reset) {
+        *reset_byte = 1;
+    }
+    return d;
+}
+
+void remaster_fsr_end_dispatch_locked(const RemasterFsrDispatch& d,
+    uint8_t* reset_byte, const char* path, const void* left,
+    const void* right) {
+    // The dispatch clears the byte itself unless frame generation owns it;
+    // never leave a reset of ours behind for the game's next dispatch.
+    if (d.force_reset && d.game_reset == 0) {
+        *reset_byte = 0;
+    }
+    if (d.slot != kRemasterFsrUntaggedSlot) {
+        auto& guards = g_remaster_fsr_eye_guards[d.slot];
+        const auto& other_guards =
+            g_remaster_fsr_eye_guards[d.slot == 0 ? 1 : 0];
+        const bool first_eye_of_pair = !other_guards.valid ||
+            other_guards.last_frame_index != d.frame_index;
+        if (d.game_reset != 0 && first_eye_of_pair) {
+            g_remaster_fsr_reset_pending = true;
+            g_remaster_fsr_reset_frame = d.frame_index;
+            g_remaster_fsr_reset_source = d.slot;
+        }
+        guards.last_frame_index = d.frame_index;
+        guards.valid = true;
+        g_remaster_fsr_last_tagged_present.store(
+            g_present_count.load(std::memory_order_relaxed),
+            std::memory_order_release);
+        const uint8_t eye_bit = static_cast<uint8_t>(1u << d.slot);
+        if ((g_remaster_fsr_first_eye_logged.fetch_or(
+                eye_bit, std::memory_order_relaxed) & eye_bit) == 0) {
+            log_line("FSR per-eye: first %s-eye dispatch on %s %s %p",
+                d.slot == 0 ? "left" : "right", path,
+                d.slot == 0 ? "game" : "twin", d.slot == 0 ? left : right);
+        }
+    } else {
+        // It ran on the game's (left) history: restart both eye histories.
+        g_remaster_fsr_external_reset_mask.fetch_or(
+            0x3u, std::memory_order_release);
+    }
+    if (d.force_reset) {
+        g_remaster_fsr_forced_resets.fetch_add(1, std::memory_order_relaxed);
+    }
+    g_remaster_fsr_eye_calls[d.slot].fetch_add(1, std::memory_order_relaxed);
+    if (g_config.runtime_diagnostics &&
+        (g_remaster_fsr_log_count.fetch_add(1, std::memory_order_relaxed) < 96 ||
+            d.force_reset) &&
+        g_remaster_fsr_log_count.load(std::memory_order_relaxed) < 2000) {
+        log_line("FSR per-eye dispatch path=%s eye=%d slot=%zu tid=%lu "
+            "present=%llu frame_index=%u reset=%d/%d calls=%llu/%llu/%llu "
+            "passthrough=%llu forced=%llu",
+            path, d.eye, d.slot, GetCurrentThreadId(),
+            static_cast<unsigned long long>(g_present_count.load()),
+            d.frame_index, d.force_reset ? 1 : 0, d.game_reset != 0 ? 1 : 0,
+            static_cast<unsigned long long>(g_remaster_fsr_eye_calls[0].load()),
+            static_cast<unsigned long long>(g_remaster_fsr_eye_calls[1].load()),
+            static_cast<unsigned long long>(g_remaster_fsr_eye_calls[2].load()),
+            static_cast<unsigned long long>(
+                g_remaster_fsr_passthrough_calls.load()),
+            static_cast<unsigned long long>(
+                g_remaster_fsr_forced_resets.load()));
+    }
+}
+
+// [FEATURE:REMASTER-FSR2-PER-EYE 3/4] On GPUs the FidelityFX loader does not
+// serve with FSR 4 (NVIDIA, Intel, RX 6000, Steam Deck) 5.01 runs its own,
+// statically linked FSR 2 inside the same upscale dispatch, so the loader
+// twin above never exists there. That FSR 2 keeps its history in five
+// engine render targets (two ping-pong pairs and the luma history) and its
+// per-frame state in a small object. The right eye gets five twin render
+// targets: copies of the game's CRenderTarget objects that own their own
+// textures, created with the objects' own vtable slot 2 from the same
+// description and released with slot 1. For the duration of a right-eye
+// dispatch the surfaces' table points at the twins and the object carries
+// the right eye's counter and frame index; the game's pointers and values
+// are put back afterwards. The other RTN_FSR2_* targets are written and read
+// within one dispatch and stay shared. Resets follow the loader path's rules
+// (the reset byte is the object's +0x14).
+constexpr uint32_t kRemasterFsr2HistoryTargets[] = {0x5A, 0x5B, 0x5C, 0x5D, 0x5F};
+constexpr const char* kRemasterFsr2HistoryNames[] = {"LockStatus1",
+    "LockStatus2", "InternalUpscaled1", "InternalUpscaled2", "LumaHistory"};
+constexpr size_t kRemasterFsr2TargetCount = std::size(kRemasterFsr2HistoryTargets);
+constexpr size_t kRemasterFsr2TwinBytes = 0x80;
+struct alignas(16) RemasterFsr2TwinObject {
+    uint8_t bytes[kRemasterFsr2TwinBytes];
+};
+struct RemasterFsr2Twin {
+    const uint8_t* original{};
+    uint32_t original_texture{};
+    std::array<uint32_t, 3> original_shape{};  // width, height, format
+    RemasterFsr2TwinObject* twin{};
+};
+using EngineRenderTargetVirtual = void(__fastcall*)(void*);
+EngineRenderTargetVirtual g_engine_render_target_create{};
+EngineRenderTargetVirtual g_engine_render_target_release{};
+const void* g_engine_render_target_vtable{};
+const volatile uint8_t* g_engine_fsr_builtin_flag{};
+std::array<RemasterFsr2Twin, kRemasterFsr2TargetCount> g_remaster_fsr2_twins{};
+uint32_t g_remaster_fsr2_right_counter{};
+uint32_t g_remaster_fsr2_right_frame_index{};
+std::atomic<uint32_t> g_remaster_fsr2_twin_builds{};
+std::atomic<bool> g_remaster_fsr2_twin_failure_logged{};
+
+std::array<uint32_t, 3> remaster_fsr2_target_shape(const uint8_t* target) {
+    std::array<uint32_t, 3> shape{};
+    memcpy(&shape[0], target + 0xC, sizeof(uint32_t));
+    memcpy(&shape[1], target + 0x10, sizeof(uint32_t));
+    memcpy(&shape[2], target + 0x18, sizeof(uint32_t));
+    return shape;
+}
+
+void remaster_fsr2_release_twin_locked(RemasterFsr2Twin& entry) {
+    if (entry.twin != nullptr) {
+        g_engine_render_target_release(entry.twin->bytes);
+        delete entry.twin;
+    }
+    entry = {};
+}
+
+// Twins for the five history targets of |surfaces|, (re)built when the game
+// (re)created a target (new texture id or shape). Returns false when a target
+// is missing or a twin cannot be made; the caller then runs the dispatch as
+// the game does. Called with g_remaster_fsr_mutex held, on the render thread.
+bool remaster_fsr2_twins_ready_locked(uint8_t* surfaces) {
+    namespace addresses = w3vr::engine_addresses;
+    const size_t table = engine_frame_offset(addresses::Value::RenderSurfacesTargets);
+    const size_t texture = engine_frame_offset(addresses::Value::RenderTargetTexture);
+    const size_t object_size =
+        engine_frame_offset(addresses::Value::RenderTargetObjectSize);
+    bool rebuilt = false;
+    for (size_t i = 0; i < kRemasterFsr2TargetCount; ++i) {
+        const uint8_t* original{};
+        memcpy(&original,
+            surfaces + table + sizeof(void*) * kRemasterFsr2HistoryTargets[i],
+            sizeof(original));
+        const void* vtable{};
+        uint32_t original_texture{};
+        if (original != nullptr) {
+            memcpy(&vtable, original, sizeof(vtable));
+            memcpy(&original_texture, original + texture, sizeof(original_texture));
+        }
+        if (original == nullptr || vtable != g_engine_render_target_vtable ||
+            original_texture == 0) {
+            if (!g_remaster_fsr2_twin_failure_logged.exchange(true)) {
+                log_line("FSR per-eye: built-in FSR2 target RTN_FSR2_%s unusable "
+                    "(object %p vtable %p texture %u); this eye pair shares one "
+                    "history", kRemasterFsr2HistoryNames[i], original, vtable,
+                    original_texture);
+            }
+            return false;
+        }
+        auto& entry = g_remaster_fsr2_twins[i];
+        const auto shape = remaster_fsr2_target_shape(original);
+        if (entry.twin != nullptr && entry.original == original &&
+            entry.original_texture == original_texture &&
+            entry.original_shape == shape) {
+            continue;
+        }
+        remaster_fsr2_release_twin_locked(entry);
+        auto* twin = new RemasterFsr2TwinObject{};
+        memcpy(twin->bytes, original, object_size);
+        const uint32_t none = 0;
+        memcpy(twin->bytes + texture, &none, sizeof(none));
+        g_engine_render_target_create(twin->bytes);
+        uint32_t twin_texture{};
+        memcpy(&twin_texture, twin->bytes + texture, sizeof(twin_texture));
+        if (twin_texture == 0) {
+            delete twin;
+            if (!g_remaster_fsr2_twin_failure_logged.exchange(true)) {
+                log_line("FSR per-eye: built-in FSR2 twin of RTN_FSR2_%s could "
+                    "not be created (%ux%u format %u); this eye pair shares one "
+                    "history", kRemasterFsr2HistoryNames[i], shape[0], shape[1],
+                    shape[2]);
+            }
+            return false;
+        }
+        entry.original = original;
+        entry.original_texture = original_texture;
+        entry.original_shape = shape;
+        entry.twin = twin;
+        rebuilt = true;
+        log_line("FSR per-eye: built-in FSR2 twin RTN_FSR2_%s %ux%u format %u "
+            "texture %u (game %p texture %u)", kRemasterFsr2HistoryNames[i],
+            shape[0], shape[1], shape[2], twin_texture, original,
+            original_texture);
+    }
+    if (rebuilt) {
+        // The right eye starts a fresh history on the new twins.
+        g_remaster_fsr_eye_guards[1].valid = false;
+        g_remaster_fsr2_right_counter = 0;
+        g_remaster_fsr2_right_frame_index = 0;
+        g_remaster_fsr2_twin_builds.fetch_add(1, std::memory_order_relaxed);
+    }
+    return true;
+}
+
+uintptr_t remaster_fsr2_builtin_dispatch(void* state, void* frame_data,
+    void* params, uintptr_t index, uintptr_t fifth) {
+    namespace addresses = w3vr::engine_addresses;
+    uint8_t* fsr2{};
+    memcpy(&fsr2,
+        static_cast<uint8_t*>(state) +
+            engine_frame_offset(addresses::Value::FsrStateBuiltinFsr2),
+        sizeof(fsr2));
+    auto* surfaces = static_cast<uint8_t*>(params);
+    std::scoped_lock lock{g_remaster_fsr_mutex};
+    if (fsr2 == nullptr || surfaces == nullptr ||
+        !remaster_fsr2_twins_ready_locked(surfaces)) {
+        g_remaster_fsr_passthrough_calls.fetch_add(1, std::memory_order_relaxed);
+        return g_engine_fsr_upscale_dispatch(
+            state, frame_data, params, index, fifth);
+    }
+    uint8_t* reset_byte =
+        fsr2 + engine_frame_offset(addresses::Value::Fsr2ResetFlag);
+    auto* counter = fsr2 + engine_frame_offset(addresses::Value::Fsr2FrameCounter);
+    auto* frame_index = fsr2 + engine_frame_offset(addresses::Value::Fsr2FrameIndex);
+    auto* table = surfaces +
+        engine_frame_offset(addresses::Value::RenderSurfacesTargets);
+    const RemasterFsrDispatch d =
+        remaster_fsr_begin_dispatch_locked(state, frame_data, reset_byte);
+    uintptr_t result{};
+    if (d.slot == 1) {
+        std::array<void*, kRemasterFsr2TargetCount> game_targets{};
+        for (size_t i = 0; i < kRemasterFsr2TargetCount; ++i) {
+            auto* slot = table + sizeof(void*) * kRemasterFsr2HistoryTargets[i];
+            memcpy(&game_targets[i], slot, sizeof(void*));
+            void* twin = g_remaster_fsr2_twins[i].twin->bytes;
+            memcpy(slot, &twin, sizeof(void*));
+        }
+        uint32_t game_counter{};
+        uint32_t game_frame_index{};
+        memcpy(&game_counter, counter, sizeof(game_counter));
+        memcpy(&game_frame_index, frame_index, sizeof(game_frame_index));
+        memcpy(counter, &g_remaster_fsr2_right_counter, sizeof(uint32_t));
+        memcpy(frame_index, &g_remaster_fsr2_right_frame_index, sizeof(uint32_t));
+        result = g_engine_fsr_upscale_dispatch(
+            state, frame_data, params, index, fifth);
+        memcpy(&g_remaster_fsr2_right_counter, counter, sizeof(uint32_t));
+        memcpy(&g_remaster_fsr2_right_frame_index, frame_index, sizeof(uint32_t));
+        memcpy(counter, &game_counter, sizeof(game_counter));
+        memcpy(frame_index, &game_frame_index, sizeof(game_frame_index));
+        for (size_t i = 0; i < kRemasterFsr2TargetCount; ++i) {
+            memcpy(table + sizeof(void*) * kRemasterFsr2HistoryTargets[i],
+                &game_targets[i], sizeof(void*));
+        }
+    } else {
+        result = g_engine_fsr_upscale_dispatch(
+            state, frame_data, params, index, fifth);
+    }
+    remaster_fsr_end_dispatch_locked(d, reset_byte, "built-in FSR2 targets",
+        surfaces, g_remaster_fsr2_twins[0].twin);
+    return result;
+}
+
 uintptr_t __fastcall hook_remaster_fsr_upscale_dispatch(
     void* state, void* frame_data, void* params, uintptr_t index,
     uintptr_t fifth) {
@@ -47153,6 +47458,10 @@ uintptr_t __fastcall hook_remaster_fsr_upscale_dispatch(
         !g_engine_dual_render_active.load(std::memory_order_acquire)) {
         g_remaster_fsr_passthrough_calls.fetch_add(1, std::memory_order_relaxed);
         return g_engine_fsr_upscale_dispatch(
+            state, frame_data, params, index, fifth);
+    }
+    if (g_engine_fsr_builtin_flag != nullptr && *g_engine_fsr_builtin_flag != 0) {
+        return remaster_fsr2_builtin_dispatch(
             state, frame_data, params, index, fifth);
     }
     auto* bytes = static_cast<uint8_t*>(state);
@@ -47168,109 +47477,20 @@ uintptr_t __fastcall hook_remaster_fsr_upscale_dispatch(
         return g_engine_fsr_upscale_dispatch(
             state, frame_data, params, index, fifth);
     }
-    const int eye = remaster_dlss_eye_for_frame_data(frame_data);
-    const size_t slot = eye == 0 || eye == 1
-        ? static_cast<size_t>(eye)
-        : kRemasterFsrUntaggedSlot;
-    uint32_t frame_index{};
-    memcpy(&frame_index, static_cast<uint8_t*>(frame_data) + 0xC44,
-        sizeof(frame_index));
 
     std::scoped_lock lock{g_remaster_fsr_mutex};
-    if (g_remaster_fsr_state != state ||
-        g_remaster_fsr_guards_stale.exchange(false, std::memory_order_acq_rel)) {
-        g_remaster_fsr_state = state;
-        g_remaster_fsr_eye_guards = {};
-        g_remaster_fsr_reset_pending = false;
-    }
-    const uint8_t game_reset = bytes[reset_offset];
-    bool force_reset = slot == kRemasterFsrUntaggedSlot;
-    if (slot != kRemasterFsrUntaggedSlot) {
-        const auto& guards = g_remaster_fsr_eye_guards[slot];
-        // A fresh or long-interrupted eye history (first use, menus,
-        // cutscenes) starts over; the eyes of a pair may or may not share a
-        // frame index (+1 or +2 per pair).
-        force_reset = !guards.valid ||
-            frame_index - guards.last_frame_index > 4;
-        // The game's reset was consumed by the other eye of this pair
-        // (same frame index, or the next one).
-        if (g_remaster_fsr_reset_pending &&
-            frame_index - g_remaster_fsr_reset_frame <= 1 &&
-            g_remaster_fsr_reset_source != slot) {
-            force_reset = true;
-            g_remaster_fsr_reset_pending = false;
-        }
-        const uint8_t bit = static_cast<uint8_t>(1u << slot);
-        if ((g_remaster_fsr_external_reset_mask.fetch_and(
-                static_cast<uint8_t>(~bit), std::memory_order_acq_rel) & bit) != 0) {
-            force_reset = true;
-        }
-    }
-    if (force_reset) {
-        bytes[reset_offset] = 1;
-    }
-    if (slot == 1) {
+    const RemasterFsrDispatch d =
+        remaster_fsr_begin_dispatch_locked(state, frame_data, bytes + reset_offset);
+    if (d.slot == 1) {
         memcpy(bytes + context_offset, &twin, sizeof(twin));
     }
     const uintptr_t result = g_engine_fsr_upscale_dispatch(
         state, frame_data, params, index, fifth);
-    if (slot == 1) {
+    if (d.slot == 1) {
         memcpy(bytes + context_offset, &game_context, sizeof(game_context));
     }
-    // The dispatch clears the byte itself unless frame generation owns it;
-    // never leave a reset of ours behind for the game's next dispatch.
-    if (force_reset && game_reset == 0) {
-        bytes[reset_offset] = 0;
-    }
-    if (slot != kRemasterFsrUntaggedSlot) {
-        auto& guards = g_remaster_fsr_eye_guards[slot];
-        const auto& other_guards = g_remaster_fsr_eye_guards[slot == 0 ? 1 : 0];
-        const bool first_eye_of_pair = !other_guards.valid ||
-            other_guards.last_frame_index != frame_index;
-        if (game_reset != 0 && first_eye_of_pair) {
-            g_remaster_fsr_reset_pending = true;
-            g_remaster_fsr_reset_frame = frame_index;
-            g_remaster_fsr_reset_source = slot;
-        }
-        guards.last_frame_index = frame_index;
-        guards.valid = true;
-        g_remaster_fsr_last_tagged_present.store(
-            g_present_count.load(std::memory_order_relaxed),
-            std::memory_order_release);
-        const uint8_t eye_bit = static_cast<uint8_t>(1u << slot);
-        if ((g_remaster_fsr_first_eye_logged.fetch_or(
-                eye_bit, std::memory_order_relaxed) & eye_bit) == 0) {
-            log_line("FSR per-eye: first %s-eye dispatch on %s context %p",
-                slot == 0 ? "left" : "right", slot == 0 ? "game" : "twin",
-                slot == 0 ? game_context : twin);
-        }
-    } else {
-        // It ran on the game's (left) context: restart both eye histories.
-        g_remaster_fsr_external_reset_mask.fetch_or(
-            0x3u, std::memory_order_release);
-    }
-    if (force_reset) {
-        g_remaster_fsr_forced_resets.fetch_add(1, std::memory_order_relaxed);
-    }
-    g_remaster_fsr_eye_calls[slot].fetch_add(1, std::memory_order_relaxed);
-    if (g_config.runtime_diagnostics &&
-        (g_remaster_fsr_log_count.fetch_add(1, std::memory_order_relaxed) < 96 ||
-            force_reset) &&
-        g_remaster_fsr_log_count.load(std::memory_order_relaxed) < 2000) {
-        log_line("FSR per-eye dispatch eye=%d slot=%zu tid=%lu present=%llu "
-            "frame_index=%u reset=%d/%d calls=%llu/%llu/%llu passthrough=%llu "
-            "forced=%llu",
-            eye, slot, GetCurrentThreadId(),
-            static_cast<unsigned long long>(g_present_count.load()),
-            frame_index, force_reset ? 1 : 0, game_reset != 0 ? 1 : 0,
-            static_cast<unsigned long long>(g_remaster_fsr_eye_calls[0].load()),
-            static_cast<unsigned long long>(g_remaster_fsr_eye_calls[1].load()),
-            static_cast<unsigned long long>(g_remaster_fsr_eye_calls[2].load()),
-            static_cast<unsigned long long>(
-                g_remaster_fsr_passthrough_calls.load()),
-            static_cast<unsigned long long>(
-                g_remaster_fsr_forced_resets.load()));
-    }
+    remaster_fsr_end_dispatch_locked(d, bytes + reset_offset, "loader",
+        game_context, twin);
     return result;
 }
 
@@ -48844,6 +49064,108 @@ bool write_import_slot(void** slot, void* value) {
 // redirected; the AMD DLLs are left untouched. The engine dispatch hook is
 // enabled only once the slots are in place, so a twin is never dispatched
 // without the lifetime hooks that destroy it.
+// [FEATURE:REMASTER-FSR2-PER-EYE 4/4] Checks every piece of the built-in FSR 2
+// path the per-eye code relies on (the upscale dispatch's flag test and call,
+// the FSR 2 dispatch's use of the reset byte, counter, frame index and the
+// three history table reads, and the CRenderTarget vtable slots) and arms it.
+// Reads code only; |dispatch| is the still unpatched upscale dispatch. Returns
+// the reason when the path stays off (then FSR 2 runs as the game does).
+const char* resolve_remaster_fsr2_builtin_path(const uint8_t* dispatch) {
+    namespace addresses = w3vr::engine_addresses;
+    const auto build = running_game_build();
+    auto* module = reinterpret_cast<const uint8_t*>(GetModuleHandleW(nullptr));
+    if (module == nullptr || dispatch == nullptr) {
+        return "no module";
+    }
+    const auto at = [&](addresses::Value which) {
+        return module + addresses::value(build, which);
+    };
+    const auto matches = [](const uint8_t* code, const uint8_t* bytes,
+                             size_t size) {
+        return addresses::signature_matches(code, addresses::Signature{bytes, size});
+    };
+    // cmp byte [rip+disp32], 0 at +0x15 (the last two signature bytes), then
+    // mov rdi,r8; mov r14,rdx; mov rbx,rcx and the branch at +0x25.
+    constexpr uint8_t kAfterFlagTest[] = {
+        0x00, 0x49, 0x8B, 0xF8, 0x4C, 0x8B, 0xF2, 0x48, 0x8B, 0xD9};
+    constexpr size_t kFlagDisp = sizeof(addresses::kFsrUpscaleDispatch501Bytes);
+    if (!matches(dispatch + kFlagDisp + 4, kAfterFlagTest, sizeof(kAfterFlagTest))) {
+        return "flag test";
+    }
+    const uint8_t* branch = at(addresses::Value::FsrBuiltinBranch);
+    if (branch != dispatch + kFlagDisp + 4 + sizeof(kAfterFlagTest) ||
+        !matches(branch, addresses::kFsrBuiltinBranch501Bytes,
+            sizeof(addresses::kFsrBuiltinBranch501Bytes))) {
+        return "built-in branch";
+    }
+    const uint8_t* fsr2 = at(addresses::Value::Fsr2BuiltinDispatch);
+    const uint8_t* call = branch + sizeof(addresses::kFsrBuiltinBranch501Bytes) - 1;
+    if (w3vr::call_site_hook::call_destination(call) !=
+            reinterpret_cast<uintptr_t>(fsr2) ||
+        !matches(fsr2, addresses::kFsr2BuiltinDispatch501Bytes,
+            sizeof(addresses::kFsr2BuiltinDispatch501Bytes))) {
+        return "built-in FSR2 dispatch";
+    }
+    const struct {
+        addresses::Value site;
+        const uint8_t* bytes;
+        size_t size;
+        const char* name;
+    } sites[] = {
+        {addresses::Value::Fsr2DispatchResetSite, addresses::kFsr2DispatchReset501Bytes,
+            sizeof(addresses::kFsr2DispatchReset501Bytes), "reset byte"},
+        {addresses::Value::Fsr2DispatchParitySite, addresses::kFsr2DispatchParity501Bytes,
+            sizeof(addresses::kFsr2DispatchParity501Bytes), "parity/LockStatus"},
+        {addresses::Value::Fsr2DispatchUpscaledSite,
+            addresses::kFsr2DispatchUpscaled501Bytes,
+            sizeof(addresses::kFsr2DispatchUpscaled501Bytes), "InternalUpscaled"},
+        {addresses::Value::Fsr2DispatchLumaSite, addresses::kFsr2DispatchLuma501Bytes,
+            sizeof(addresses::kFsr2DispatchLuma501Bytes), "LumaHistory"},
+        {addresses::Value::Fsr2DispatchFrameIndexSite,
+            addresses::kFsr2DispatchFrameIndex501Bytes,
+            sizeof(addresses::kFsr2DispatchFrameIndex501Bytes), "frame index"},
+        {addresses::Value::Fsr2DispatchCounterSite,
+            addresses::kFsr2DispatchCounter501Bytes,
+            sizeof(addresses::kFsr2DispatchCounter501Bytes), "counter"},
+        {addresses::Value::RenderTargetReleaseFunction,
+            addresses::kRenderTargetRelease501Bytes,
+            sizeof(addresses::kRenderTargetRelease501Bytes), "render target release"},
+        {addresses::Value::RenderTargetCreateFunction,
+            addresses::kRenderTargetCreate501Bytes,
+            sizeof(addresses::kRenderTargetCreate501Bytes), "render target create"},
+        {addresses::Value::RenderTargetIdStoreSite,
+            addresses::kRenderTargetIdStore501Bytes,
+            sizeof(addresses::kRenderTargetIdStore501Bytes), "texture id store"},
+    };
+    for (const auto& site : sites) {
+        if (!matches(at(site.site), site.bytes, site.size)) {
+            return site.name;
+        }
+    }
+    const uint8_t* vtable = at(addresses::Value::RenderTargetVtable);
+    uintptr_t release{};
+    uintptr_t create{};
+    memcpy(&release, vtable + sizeof(void*), sizeof(release));
+    memcpy(&create, vtable + 2 * sizeof(void*), sizeof(create));
+    if (release != reinterpret_cast<uintptr_t>(
+            at(addresses::Value::RenderTargetReleaseFunction)) ||
+        create != reinterpret_cast<uintptr_t>(
+            at(addresses::Value::RenderTargetCreateFunction))) {
+        return "render target vtable";
+    }
+    if (engine_frame_offset(addresses::Value::RenderTargetObjectSize) >
+        kRemasterFsr2TwinBytes) {
+        return "render target size";
+    }
+    int32_t disp{};
+    memcpy(&disp, dispatch + kFlagDisp, sizeof(disp));
+    g_engine_fsr_builtin_flag = dispatch + kFlagDisp + 5 + disp;
+    g_engine_render_target_vtable = vtable;
+    g_engine_render_target_release = reinterpret_cast<EngineRenderTargetVirtual>(release);
+    g_engine_render_target_create = reinterpret_cast<EngineRenderTargetVirtual>(create);
+    return nullptr;
+}
+
 void install_remaster_engine_fsr_hooks() {
     if (!remaster_engine_fsr_stereo_active() ||
         running_game_build() != w3vr::game_build::Build::Remaster501 ||
@@ -48882,6 +49204,8 @@ void install_remaster_engine_fsr_hooks() {
     }
     auto* target = engine_function_target(
         w3vr::engine_addresses::Function::FsrUpscaleDispatch);
+    const char* builtin_off =
+        target != nullptr ? resolve_remaster_fsr2_builtin_path(target) : "no dispatch";
     if (target == nullptr ||
         MH_CreateHook(target,
             reinterpret_cast<void*>(&hook_remaster_fsr_upscale_dispatch),
@@ -48906,12 +49230,21 @@ void install_remaster_engine_fsr_hooks() {
         }
         MH_RemoveHook(target);
         g_engine_fsr_upscale_dispatch = nullptr;
+        g_engine_fsr_builtin_flag = nullptr;
         log_line("FSR per-eye disabled: import redirect or hook enable failed");
         return;
     }
     log_line("FSR per-eye hooked: right-eye twin context per game upscale "
         "context, per-eye resets, per_eye_motion=%d",
         g_config.remaster_dlss_per_eye_motion ? 1 : 0);
+    if (builtin_off == nullptr) {
+        log_line("FSR per-eye: built-in FSR2 path armed (flag %p, %zu right-eye "
+            "history targets)", g_engine_fsr_builtin_flag,
+            kRemasterFsr2TargetCount);
+    } else {
+        log_line("FSR per-eye: built-in FSR2 path off (%s mismatch); FSR 2 keeps "
+            "one history for both eyes", builtin_off);
+    }
 }
 
 // [FIX:HUD-FADE-FILL 2/5] The 5.01 screen fade (FadeOut/FadeIn, blackscreens)

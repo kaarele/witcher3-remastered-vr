@@ -1112,5 +1112,37 @@ thread, just before xrWaitFrame/xrEndFrame.
   `runtime_diagnostics=1`, `FSR per-eye dispatch eye= slot= frame_index= reset= calls=` lines.
 - Not covered: FSR frame generation (off in VR; disabled by the game under Wine); the jitter
   sequence is still indexed by the render counter, so each eye sees every other sample (as with
-  DLSS). XeSS keeps one history for both eyes.
-- Status: built, not yet run in the game.
+  DLSS; `remaster_pair_jitter` changes that). XeSS keeps one history for both eyes.
+- Built-in FSR 2 (headless run 2026-10-21 on an RTX 3080, AAMode 5): the loader hooks never fired
+  (no `ffxCreateContext`, the RANDC line said `per_eye_fsr=0`). The exe has its own FidelityFX FSR 2
+  (shaders `ffx_fsr2_*_pass.hlsl`, render targets `RTN_FSR2_*`), CDPR's "FSR 2 on unsupported GPUs".
+  The FSR dispatch 0x01C665B0 starts with `cmp byte [0x04068A8C], 0`; when the byte is set it
+  calls 0x01CD4A20 on the object at state +8 with the same frame_data and the render surfaces
+  (`CRenderSurfaces`, a `CRenderTarget*` table at +0x30 indexed by the render-target name) and
+  returns before any ffx call. The jitter generator 0x01C0A9B0 tests the same byte and then builds
+  the FSR 2 phase count and Halton sequence itself.
+  - State in the object: +0x10 a counter (`inc; and 0xF` per dispatch) whose low bit picks the
+    ping-pong pair, +0x14 the reset byte (read and cleared on entry), +0x3C the constants' frame
+    index (0 on reset, +1 per dispatch); +4/+8/+0xC are its constant buffers, refilled every
+    dispatch.
+  - History: `RTN_FSR2_LockStatus1/2` (0x5A/0x5B, table +0x300/+0x308), `InternalUpscaled1/2`
+    (0x5C/0x5D, +0x310/+0x318) and `LumaHistory` (0x5F, +0x328). The other `RTN_FSR2_*` targets
+    (prepared input colour, dilated depth/velocity, reconstructed previous depth, depth clip,
+    reactive masks, exposure and its mips, SPD counter) are written and read within one dispatch.
+  - `CRenderTarget` (0x50 bytes, vtable 0x036EBA80): +8 the GpuApi texture id, +0xC/+0x10 size,
+    +0x14 type, +0x18 format; vtable slot 1 (0x01BEF260) releases the texture and clears +8,
+    slot 2 (0x01BEF2C0) creates it from the object's description and stores the id at +8.
+- Fix for the built-in path (same key): the dispatch hook sees the byte. For the right eye it
+  makes five twin render targets once (copies of the game's objects, texture id cleared, slot 2
+  creates their own textures; rebuilt when the game recreates a target, released with slot 1)
+  and, for the duration of each right-eye dispatch, points the five table entries at the twins
+  and gives the object the right eye's counter and frame index; the game's pointers and values
+  are restored afterwards. Resets and the per-eye bookkeeping are the loader path's (reset byte
+  = object +0x14). Every piece is signature checked at startup (the flag test and call, the FSR 2
+  prologue, its reset/parity/table/frame-index/counter code, the vtable slots and the id store);
+  on a mismatch only the built-in path stays off. Logs: `FSR per-eye: built-in FSR2 path armed`,
+  one `built-in FSR2 twin RTN_FSR2_<name> WxH format F texture T` line per twin, then
+  `first left/right-eye dispatch on built-in FSR2 targets`. VRAM: five textures at the output
+  size (two RGBA16F upscaled histories, two lock-status and the luma history), about 100 MB at
+  2476x2594.
+- Status (loader and built-in paths): built for the loader path only; the built-in path is implemented but not built or run yet.
