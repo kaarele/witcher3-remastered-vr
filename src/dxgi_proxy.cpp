@@ -582,6 +582,9 @@ struct Config {
     // dlss_mip_bias_offset: added to the engine's DLSS texture LOD bias.
     uint32_t dlss_preset{};
     float dlss_mip_bias_offset{};
+    // 5.01 diagnostic: [debug] dlss_eye_constants_log=1 logs the sl::Constants
+    // each eye's DLSS receives (camera motion, jitter, mvec scale, flags).
+    bool dlss_eye_constants_log{};
     // 5.01 only: [engine] remaster_fsr_per_eye=1 gives the game's own FSR
     // (Anti-aliasing = FSR in the game) a second ffxContext, so each eye of
     // strict Stereo keeps its own FSR history. Independent of
@@ -17742,6 +17745,8 @@ void load_config() {
             g_config.dlss_preset = parse_dlss_preset(dlss_preset);
             g_config.dlss_mip_bias_offset = std::clamp(
                 read_ini_float("engine", "dlss_mip_bias_offset", 0.0f), -2.0f, 3.0f);
+            g_config.dlss_eye_constants_log =
+                read_ini_bool("debug", "dlss_eye_constants_log", false);
             log_line("Temporal backend %s on 5.01: transport=none engine_dlss=%d per_eye_motion=%d "
                 "dlss_preset=%s(%u) dlss_mip_bias_offset=%.3f",
                 temporal_backend.c_str(),
@@ -47577,6 +47582,94 @@ int remaster_dlss_eye_for_frame_data(void* frame_data) {
     return eye;
 }
 
+// [DIAG:REMASTER-DLSS-EYE-CONSTANTS 1/2] [debug] dlss_eye_constants_log logs
+// the Streamline 2 sl::Constants each eye's DLSS receives, to compare the eyes:
+// after the 0x20-byte BaseStructure header come cameraViewToClip,
+// clipToCameraView, clipToLensClip, clipToPrevClip (+0xE0), prevClipToClip,
+// jitterOffset (+0x160), mvecScale (+0x168), cameraPinholeOffset, cameraPos
+// (+0x178) ... and the Boolean flags from +0x1BC (depthInverted,
+// cameraMotionIncluded, motionVectors3D, reset, orthographicProjection,
+// motionVectorsDilated, motionVectorsJittered). The engine calls slSetConstants
+// inside the per-eye wrapper below, so the thread's current slot names the eye.
+thread_local int t_remaster_dlss_slot = -1;
+using Sl2SetConstantsFn = int(__cdecl*)(const void*, const void*, const void*);
+Sl2SetConstantsFn g_sl2_set_constants_probe{};
+std::atomic<int> g_sl2_constants_probe_state{};
+std::array<std::atomic<uint64_t>, 3> g_sl2_constants_probe_calls{};
+
+int __cdecl hook_sl2_set_constants_probe(
+    const void* values, const void* frame, const void* viewport) {
+    const int slot = t_remaster_dlss_slot;
+    if (values != nullptr && slot >= 0 && slot <= 2) {
+        const uint64_t call = g_sl2_constants_probe_calls[
+            static_cast<size_t>(slot)].fetch_add(1, std::memory_order_relaxed);
+        if (call < 8 || call % 90 == 0) {
+            const auto* bytes = static_cast<const uint8_t*>(values);
+            float clip_to_prev[16]{};
+            float jitter[2]{};
+            float mvec_scale[2]{};
+            float camera[3]{};
+            memcpy(clip_to_prev, bytes + 0xE0, sizeof(clip_to_prev));
+            memcpy(jitter, bytes + 0x160, sizeof(jitter));
+            memcpy(mvec_scale, bytes + 0x168, sizeof(mvec_scale));
+            memcpy(camera, bytes + 0x178, sizeof(camera));
+            float deviation = 0.0f;
+            for (int i = 0; i < 16; ++i) {
+                const float d = clip_to_prev[i] - (i % 5 == 0 ? 1.0f : 0.0f);
+                deviation += d * d;
+            }
+            uint32_t viewport_value{};
+            if (viewport != nullptr) {
+                memcpy(&viewport_value,
+                    static_cast<const uint8_t*>(viewport) + 0x20,
+                    sizeof(viewport_value));
+            }
+            log_line("DLSS eye constants slot=%d call=%llu viewport=%u present=%llu "
+                "jitter=%.4f,%.4f mvec_scale=%.6f,%.6f camera=%.3f,%.3f,%.3f "
+                "clip_to_prev_dev=%.6f row3=%.5f,%.5f,%.5f,%.5f flags=%u%u%u%u%u%u%u",
+                slot, static_cast<unsigned long long>(call), viewport_value,
+                static_cast<unsigned long long>(
+                    g_present_count.load(std::memory_order_relaxed)),
+                jitter[0], jitter[1], mvec_scale[0], mvec_scale[1],
+                camera[0], camera[1], camera[2], sqrtf(deviation),
+                clip_to_prev[12], clip_to_prev[13], clip_to_prev[14],
+                clip_to_prev[15], bytes[0x1BC], bytes[0x1BD], bytes[0x1BE],
+                bytes[0x1BF], bytes[0x1C0], bytes[0x1C1], bytes[0x1C2]);
+        }
+    }
+    return g_sl2_set_constants_probe(values, frame, viewport);
+}
+
+void install_sl2_constants_probe() {
+    if (!g_config.dlss_eye_constants_log) {
+        return;
+    }
+    int expected = 0;
+    if (!g_sl2_constants_probe_state.compare_exchange_strong(expected, 2,
+            std::memory_order_acq_rel)) {
+        return;
+    }
+    auto* module = GetModuleHandleW(L"sl.interposer.dll");
+    void* target = module != nullptr
+        ? reinterpret_cast<void*>(GetProcAddress(module, "slSetConstants"))
+        : nullptr;
+    if (target == nullptr || g_sl_set_constants != nullptr) {
+        log_line("DLSS eye constants probe disabled: slSetConstants=%p "
+            "already_hooked=%d", target, g_sl_set_constants != nullptr ? 1 : 0);
+        g_sl2_constants_probe_state.store(-1, std::memory_order_release);
+        return;
+    }
+    if (MH_CreateHook(target, reinterpret_cast<void*>(&hook_sl2_set_constants_probe),
+            reinterpret_cast<void**>(&g_sl2_set_constants_probe)) == MH_OK &&
+        MH_EnableHook(target) == MH_OK) {
+        log_line("DLSS eye constants probe hooked slSetConstants=%p", target);
+        g_sl2_constants_probe_state.store(1, std::memory_order_release);
+    } else {
+        log_line("DLSS eye constants probe hook failed slSetConstants=%p", target);
+        g_sl2_constants_probe_state.store(-1, std::memory_order_release);
+    }
+}
+
 uintptr_t call_remaster_dlss_per_eye(
     EngineDlssStateFunction original,
     const char* name,
@@ -47633,6 +47726,10 @@ uintptr_t call_remaster_dlss_per_eye(
     memcpy(&frame_index, frame_bytes + 0xC44, sizeof(frame_index));
     memcpy(&render_counter, frame_bytes + 0xC40, sizeof(render_counter));
 
+    // [DIAG:REMASTER-DLSS-EYE-CONSTANTS 2/2]
+    if (constants_call) {
+        install_sl2_constants_probe();
+    }
     std::scoped_lock lock{g_remaster_dlss_mutex};
     if (g_remaster_dlss_state != state) {
         g_remaster_dlss_state = state;
@@ -47686,8 +47783,11 @@ uintptr_t call_remaster_dlss_per_eye(
         ? reinterpret_cast<void*>(
             (reinterpret_cast<uintptr_t>(third) & ~uintptr_t{0xFF}) | 1u)
         : third;
+    const int previous_slot = t_remaster_dlss_slot;
+    t_remaster_dlss_slot = static_cast<int>(slot);
     const uintptr_t result =
         original(state, frame_data, call_third, fourth, fifth);
+    t_remaster_dlss_slot = previous_slot;
     guards.constants_frame = read_u32(constants_offset);
     guards.apply_frame = read_u32(apply_offset);
     guards.prepare_frame = read_u32(prepare_offset);
