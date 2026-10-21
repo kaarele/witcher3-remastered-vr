@@ -673,7 +673,7 @@ struct Config {
     bool options_menu_see_through{false};
     // Opacity of the veil that replaces the options page's black backdrop
     // while see-through is active (0 = invisible, 1 = the game's black).
-    float options_menu_see_through_veil{0.35f};
+    float options_menu_see_through_veil{0.5f};
     float cinema_render_stereo_strength{1.0f};
     int cinema_hud_stereo_shift_px{-72};
     float manual_cinema_hud_scale{1.25f};
@@ -17286,7 +17286,7 @@ void load_config() {
         g_config.options_menu_see_through =
             read_ini_bool("openxr", "options_menu_see_through", false);
         g_config.options_menu_see_through_veil = std::clamp(
-            read_ini_float("openxr", "options_menu_see_through_veil", 0.35f),
+            read_ini_float("openxr", "options_menu_see_through_veil", 0.5f),
             0.0f, 1.0f);
         log_line("Config options menu see-through=%d veil=%.2f",
             g_config.options_menu_see_through ? 1 : 0,
