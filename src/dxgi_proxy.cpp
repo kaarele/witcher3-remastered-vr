@@ -626,6 +626,10 @@ struct Config {
     // for the GTAO and screen-space shadow noise index.
     bool remaster_pair_jitter{};
     bool remaster_pair_noise{};
+    // 5.01 strict Stereo: a render proxy's previous transform (motion vectors
+    // of moving objects) is valid for one engine render only; 1 re-validates
+    // it for the second eye of the pair (see [FIX:REMASTER-PAIR-PREVIOUS]).
+    bool remaster_pair_previous_transforms{};
     // Controller-locked HUD faces the recentered heading only (no pitch/roll).
     bool hud_anchor_level{true};
     // A reduced HUD (hud_size < 1) shrinks toward the centre of the visible
@@ -17842,6 +17846,12 @@ void load_config() {
                 read_ini_bool("engine", "remaster_pair_jitter", false);
             g_config.remaster_pair_noise =
                 read_ini_bool("engine", "remaster_pair_noise", false);
+        }
+        // [FIX:REMASTER-PAIR-PREVIOUS 1/4]
+        g_config.remaster_pair_previous_transforms = false;
+        if (running_game_build() == w3vr::game_build::Build::Remaster501) {
+            g_config.remaster_pair_previous_transforms = read_ini_bool(
+                "engine", "remaster_pair_previous_transforms", false);
         }
 
         if (clean_mono_transport_active()) {
@@ -50683,6 +50693,166 @@ bool find_local_light_collection(
     return true;
 }
 
+// [FIX:REMASTER-PAIR-PREVIOUS 2/4] 5.01 strict Stereo. Every engine render
+// ("collection") takes a new frame index: the collector init 0x01BF84D0 does
+// ++scene+0x1B8 and copies it to collector+0xB0, so the two eyes of a pair get
+// consecutive indices. Render proxies (IRenderProxyBase) stamp the index of
+// the last render that visited them at +0xEC. A transform update (base
+// UpdateTransform 0x01D46AA0, base relink transform 0x01D46670, decal
+// 0x01CF5A10) copies localToWorld (+0x40) to the previous transform (+0x80)
+// and marks it valid for exactly the next render: +0xC0 = +0xEC + 1.
+// The tick's updates are applied in the first eye's flush, so the first eye
+// sees +0xC0 == its index and gets object motion; the second eye's index is
+// one higher and the previous transform counts as stale: moving objects get
+// camera-only motion vectors in that eye (the left one; DLSS/FSR smear them).
+// With remaster_pair_previous_transforms the three writers record the proxies
+// they update; at the second render's collector init, every recorded proxy
+// still marked valid for the first render (+0xC0 == first index) is marked
+// valid for this render too. Each recorded proxy holds a reference (+0x8,
+// released through vtable +0x10) until then.
+constexpr uint8_t kRemaster501ProxyRelinkTransformBytes[] = {
+    0x8B, 0x81, 0xEC, 0x00, 0x00, 0x00, 0xFF, 0xC0, 0x89, 0x81, 0xC0, 0x00,
+    0x00, 0x00, 0x8B, 0x41, 0x40, 0x89, 0x81, 0x80, 0x00, 0x00, 0x00};
+constexpr uint8_t kRemaster501ProxyUpdateTransformBytes[] = {
+    0x48, 0x83, 0xEC, 0x58, 0x8B, 0x81, 0xEC, 0x00, 0x00, 0x00, 0xFF, 0xC0,
+    0x89, 0x81, 0xC0, 0x00, 0x00, 0x00, 0x8B, 0x41, 0x40, 0x89, 0x81, 0x80,
+    0x00, 0x00, 0x00};
+constexpr uint8_t kRemaster501DecalUpdateTransformBytes[] = {
+    0x40, 0x53, 0x48, 0x83, 0xEC, 0x50, 0x8B, 0x81, 0xEC, 0x00, 0x00, 0x00,
+    0x48, 0x8B, 0xD9, 0xFF, 0xC0, 0x89, 0x81, 0xC0, 0x00, 0x00, 0x00, 0x8B,
+    0x41, 0x40, 0x89, 0x81, 0x80, 0x00};
+constexpr RemasterLocalLightHook kRemasterProxyRelinkTransformHook{
+    "ProxyRelinkTransform", 0x01D46670, kRemaster501ProxyRelinkTransformBytes,
+    sizeof(kRemaster501ProxyRelinkTransformBytes)};
+constexpr RemasterLocalLightHook kRemasterProxyUpdateTransformHook{
+    "ProxyUpdateTransform", 0x01D46AA0, kRemaster501ProxyUpdateTransformBytes,
+    sizeof(kRemaster501ProxyUpdateTransformBytes)};
+constexpr RemasterLocalLightHook kRemasterDecalUpdateTransformHook{
+    "DecalUpdateTransform", 0x01CF5A10, kRemaster501DecalUpdateTransformBytes,
+    sizeof(kRemaster501DecalUpdateTransformBytes)};
+constexpr size_t kProxyPreviousValidOffset = 0xC0;
+constexpr size_t kProxyRefCountOffset = 0x08;
+constexpr size_t kPairMovedProxyCap = 16384;
+
+using EngineProxyTransformFn = void(__fastcall*)(void*, void*, void*, void*);
+EngineProxyTransformFn g_engine_proxy_relink_transform{};
+EngineProxyTransformFn g_engine_proxy_update_transform{};
+EngineProxyTransformFn g_engine_decal_update_transform{};
+bool g_pair_previous_transforms_active{};
+std::mutex g_pair_moved_mutex;
+std::vector<void*> g_pair_moved_proxies;    // updated since the last collection
+std::vector<void*> g_pair_pending_proxies;  // updated before the pair's first render
+uint64_t g_pair_pending_pair_id{};
+uint32_t g_pair_pending_first_index{};
+std::atomic<uint64_t> g_pair_previous_recorded{};
+std::atomic<uint64_t> g_pair_previous_revalidated{};
+std::atomic<uint64_t> g_pair_previous_not_valid{};
+std::atomic<uint64_t> g_pair_previous_overflow{};
+std::atomic<uint64_t> g_pair_previous_second_renders{};
+
+void record_pair_moved_proxy(void* proxy) {
+    if (proxy == nullptr ||
+        !g_engine_dual_render_active.load(std::memory_order_acquire)) {
+        return;
+    }
+    std::scoped_lock lock{g_pair_moved_mutex};
+    if (g_pair_moved_proxies.size() >= kPairMovedProxyCap) {
+        g_pair_previous_overflow.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    _InterlockedIncrement(reinterpret_cast<volatile long*>(
+        static_cast<uint8_t*>(proxy) + kProxyRefCountOffset));
+    g_pair_moved_proxies.push_back(proxy);
+    g_pair_previous_recorded.fetch_add(1, std::memory_order_relaxed);
+}
+
+void release_render_proxies(std::vector<void*>& proxies) {
+    using ReleaseFn = void(__fastcall*)(void*);
+    for (void* proxy : proxies) {
+        auto* const* vtable = *static_cast<void* const* const*>(proxy);
+        reinterpret_cast<ReleaseFn>(vtable[2])(proxy);
+    }
+    proxies.clear();
+}
+
+void __fastcall hook_engine_proxy_relink_transform(
+    void* proxy, void* second, void* third, void* fourth) {
+    g_engine_proxy_relink_transform(proxy, second, third, fourth);
+    record_pair_moved_proxy(proxy);
+}
+
+void __fastcall hook_engine_proxy_update_transform(
+    void* proxy, void* second, void* third, void* fourth) {
+    g_engine_proxy_update_transform(proxy, second, third, fourth);
+    record_pair_moved_proxy(proxy);
+}
+
+void __fastcall hook_engine_decal_update_transform(
+    void* proxy, void* second, void* third, void* fourth) {
+    g_engine_decal_update_transform(proxy, second, third, fourth);
+    record_pair_moved_proxy(proxy);
+}
+
+// Collector init (render thread, after the engine assigned the frame index).
+void remaster_pair_previous_at_collection(
+    uint32_t frame_index, uint64_t pair_id, bool tagged, bool second) {
+    std::vector<void*> moved;
+    {
+        std::scoped_lock lock{g_pair_moved_mutex};
+        moved.swap(g_pair_moved_proxies);
+    }
+    if (!tagged) {
+        release_render_proxies(moved);
+        release_render_proxies(g_pair_pending_proxies);
+        return;
+    }
+    if (!second) {
+        // The tick's updates, applied in this (first) render's flush.
+        release_render_proxies(g_pair_pending_proxies);
+        g_pair_pending_proxies.swap(moved);
+        g_pair_pending_pair_id = pair_id;
+        g_pair_pending_first_index = frame_index;
+        return;
+    }
+    uint64_t revalidated = 0;
+    uint64_t not_valid = 0;
+    if (g_pair_pending_pair_id == pair_id) {
+        for (void* proxy : g_pair_pending_proxies) {
+            auto* stamp = reinterpret_cast<volatile uint32_t*>(
+                static_cast<uint8_t*>(proxy) + kProxyPreviousValidOffset);
+            if (*stamp == g_pair_pending_first_index) {
+                *stamp = frame_index;
+                ++revalidated;
+            } else {
+                ++not_valid;
+            }
+        }
+    }
+    release_render_proxies(g_pair_pending_proxies);
+    // Updates applied between the two renders are already valid for this one.
+    release_render_proxies(moved);
+    g_pair_previous_revalidated.fetch_add(revalidated, std::memory_order_relaxed);
+    g_pair_previous_not_valid.fetch_add(not_valid, std::memory_order_relaxed);
+    const uint64_t renders = g_pair_previous_second_renders.fetch_add(
+        1, std::memory_order_relaxed) + 1;
+    if (renders <= 4 || renders % 600 == 0) {
+        log_local_light_line("Pair previous transforms render=%llu pair=%llu index=%u "
+            "first=%u revalidated=%llu not_valid=%llu total_recorded=%llu "
+            "total_revalidated=%llu overflow=%llu",
+            static_cast<unsigned long long>(renders),
+            static_cast<unsigned long long>(pair_id), frame_index,
+            g_pair_pending_first_index,
+            static_cast<unsigned long long>(revalidated),
+            static_cast<unsigned long long>(not_valid),
+            static_cast<unsigned long long>(
+                g_pair_previous_recorded.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(
+                g_pair_previous_revalidated.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(
+                g_pair_previous_overflow.load(std::memory_order_relaxed)));
+    }
+}
+
 void __fastcall hook_remaster_collector_init(
     void* collector, void* frame, void* scene, void* fourth, uintptr_t fifth) {
     g_engine_collector_init(collector, frame, scene, fourth, fifth);
@@ -50733,6 +50903,10 @@ void __fastcall hook_remaster_collector_init(
             kLocalLightCollectionTagged : 0) |
         kLocalLightCollectionPublished;
     slot.key.store(key, std::memory_order_release);
+    // [FIX:REMASTER-PAIR-PREVIOUS 3/4]
+    if (g_pair_previous_transforms_active) {
+        remaster_pair_previous_at_collection(frame_index, pair_id, tagged, second);
+    }
 }
 
 // True when |light| was already advanced in the pair |pair_low|; otherwise
@@ -51403,6 +51577,58 @@ void install_remaster_local_light_render_hooks(
         g_local_light_diag_active = false;
         g_local_light_pair_lock_active = false;
     }
+}
+
+// [FIX:REMASTER-PAIR-PREVIOUS 4/4] Installed after the local-light hooks,
+// which may already own the collector init hook.
+void install_remaster_pair_previous_hooks() {
+    if (!g_config.remaster_pair_previous_transforms ||
+        g_pair_previous_transforms_active) {
+        return;
+    }
+    auto* module = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
+    if (running_game_build() != w3vr::game_build::Build::Remaster501 ||
+        module == nullptr || mode3_aer_presentation_active()) {
+        log_local_light_line("Pair previous transforms off: needs 5.01 strict Stereo");
+        return;
+    }
+    if (g_engine_collector_init == nullptr &&
+        (!remaster_local_light_probes_match(module, false) ||
+            !install_remaster_local_light_hook(module, kRemasterCollectorInitHook,
+                reinterpret_cast<void*>(&hook_remaster_collector_init),
+                reinterpret_cast<void**>(&g_engine_collector_init)))) {
+        log_local_light_line("Pair previous transforms off: no collector init hook");
+        return;
+    }
+    const RemasterLocalLightHook* const hooks[3]{
+        &kRemasterProxyRelinkTransformHook, &kRemasterProxyUpdateTransformHook,
+        &kRemasterDecalUpdateTransformHook};
+    for (size_t i = 0; i < 3; ++i) {
+        if (memcmp(module + hooks[i]->rva, hooks[i]->signature,
+                hooks[i]->signature_size) != 0) {
+            log_local_light_line("Pair previous transforms off: %s signature mismatch",
+                hooks[i]->name);
+            return;
+        }
+    }
+    // The flag goes up before the hooks so no recorded proxy is ever missed
+    // by the collection side; recording only starts once a hook is enabled.
+    g_pair_previous_transforms_active = true;
+    const bool installed =
+        install_remaster_local_light_hook(module, kRemasterProxyRelinkTransformHook,
+            reinterpret_cast<void*>(&hook_engine_proxy_relink_transform),
+            reinterpret_cast<void**>(&g_engine_proxy_relink_transform)) &&
+        install_remaster_local_light_hook(module, kRemasterProxyUpdateTransformHook,
+            reinterpret_cast<void*>(&hook_engine_proxy_update_transform),
+            reinterpret_cast<void**>(&g_engine_proxy_update_transform)) &&
+        install_remaster_local_light_hook(module, kRemasterDecalUpdateTransformHook,
+            reinterpret_cast<void*>(&hook_engine_decal_update_transform),
+            reinterpret_cast<void**>(&g_engine_decal_update_transform));
+    log_local_light_line("Pair previous transforms %s (relink=%p update=%p decal=%p)",
+        installed ? "active" : "partially hooked",
+        reinterpret_cast<void*>(g_engine_proxy_relink_transform),
+        reinterpret_cast<void*>(g_engine_proxy_update_transform),
+        reinterpret_cast<void*>(g_engine_decal_update_transform));
 }
 
 void install_remaster_local_light_hooks() {
@@ -56595,6 +56821,7 @@ void ensure_initialized() {
         install_engine_viewport_resolution_hook();
         install_engine_camera_light_placement_hook();
         install_remaster_local_light_hooks();
+        install_remaster_pair_previous_hooks();
         log_line(
             "Hook routes taau_functional=%u taau_metadata=%u dlss=%u reverse_diagnostics=%u mode=%d",
             taau_functional_hooks_needed() ? 1u : 0u,
