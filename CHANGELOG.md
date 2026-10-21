@@ -10,7 +10,9 @@ original mod and of the Remastered port this project builds on are in [docs/rele
   (`[openxr] world_marker_depth=1`). Not tested in the game yet.
 - Experimental, off by default: FSR in Stereo with a separate FSR history for each eye
   (`[engine] remaster_fsr_per_eye=1`, Linux tool `configure --aa fsr`). Works with whatever FSR
-  version the game picks (FSR 4 on RDNA4, the older FSR elsewhere). Not tested in the game yet.
+  version the game picks: the FidelityFX loader path (FSR 4 on RDNA4, FSR 3.1 where the driver
+  offers it) and the game's built-in FSR 2 (NVIDIA, Intel, RX 6000, Steam Deck). Not tested in the
+  game yet.
 
 ## 0.1.2 (2026-10-20)
 
