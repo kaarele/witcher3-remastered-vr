@@ -295,6 +295,56 @@ inline constexpr uint8_t kAsyncAnimTickCull501Bytes[] = {
     0x64, 0xC2, 0xC4, 0x11, 0xC5, 0xFC, 0x50, 0xC0, 0xA8, 0x3F, 0x0F, 0x85,
     0x18, 0x01, 0x00, 0x00};
 
+// [FIX:REMASTER-PAIR-JITTER 1/6] 5.01 only. The frame builder (FrameBuilder)
+// asks the temporal jitter generator (0x01C0A9B0: (context, float2* out,
+// mode, frame_data, index); Halton(3,2) of index + 1, or the FidelityFX
+// jitter query for FSR) twice per render: the current jitter with the render
+// counter (render context +0x7F0, +1 per engine render) and the previous one
+// with counter - 1. In strict Stereo every eye render advances the counter,
+// so each eye's own history only ever sees every other Halton sample (half
+// the pixel in y) and the two eyes jitter differently. Generator entry:
+// mov [rsp+8],rcx; push rbx; push rdi; push r14; sub rsp,0x70; xor ebx,ebx;
+// lea r14,[rdx+4].
+inline constexpr uintptr_t kTemporalJitterGenerator501Rva = 0x01C0A9B0;
+inline constexpr uint8_t kTemporalJitterGenerator501Bytes[] = {
+    0x48, 0x89, 0x4C, 0x24, 0x08, 0x53, 0x57, 0x41, 0x56, 0x48, 0x83, 0xEC,
+    0x70, 0x33, 0xDB, 0x4C, 0x8D, 0x72, 0x04};
+// The current-jitter call, from its counter load: mov eax,[rsi+0x7F0];
+// lea rdx,[rsp+0x50]; mov r9,r14; mov [rsp+0x20],eax; call rel32.
+inline constexpr uintptr_t kTemporalJitterCurrentSite501Rva = 0x01C1B754;
+inline constexpr uintptr_t kTemporalJitterCurrentCall501Rva = 0x01C1B766;
+inline constexpr uint8_t kTemporalJitterCurrentSite501Bytes[] = {
+    0x8B, 0x86, 0xF0, 0x07, 0x00, 0x00, 0x48, 0x8D, 0x54, 0x24, 0x50, 0x4D,
+    0x8B, 0xCE, 0x89, 0x44, 0x24, 0x20, 0xE8, 0x45, 0xF2, 0xFE, 0xFF};
+// The previous-jitter call: mov eax,[rsi+0x7F0]; mov r9,r14; dec eax;
+// mov [rsp+0x20],eax; mov r8d,[r8+0x74]; call rel32.
+inline constexpr uintptr_t kTemporalJitterPreviousSite501Rva = 0x01C1B773;
+inline constexpr uintptr_t kTemporalJitterPreviousCall501Rva = 0x01C1B786;
+inline constexpr uint8_t kTemporalJitterPreviousSite501Bytes[] = {
+    0x8B, 0x86, 0xF0, 0x07, 0x00, 0x00, 0x4D, 0x8B, 0xCE, 0xFF, 0xC8, 0x89,
+    0x44, 0x24, 0x20, 0x45, 0x8B, 0x40, 0x74, 0xE8, 0x25, 0xF2, 0xFE, 0xFF};
+
+// [FIX:REMASTER-PAIR-NOISE 1/4] 5.01 only. The builder copies the render
+// counter to frame_data +0xC40. GTAO (0x01D19810) uses it & 63 as its noise
+// index and the screen-space shadow pass (0x01C6CC20) passes it to its
+// constants, so both noise patterns differ per eye and each eye's GTAO
+// history sees only every other index. Each site is one 7-byte load from
+// r14 = frame_data, which the mod replaces with a call into a stub.
+// GTAO: mov ecx,[r14+0xBE0]; mov edx,[r14+0xC40] (site); mov [rip+..],eax.
+inline constexpr uintptr_t kGtaoNoiseReadContext501Rva = 0x01D1A0A6;
+inline constexpr uintptr_t kGtaoNoiseRead501Rva = 0x01D1A0AD;
+inline constexpr uint8_t kGtaoNoiseReadContext501Bytes[] = {
+    0x41, 0x8B, 0x8E, 0xE0, 0x0B, 0x00, 0x00, 0x41, 0x8B, 0x96, 0x40, 0x0C,
+    0x00, 0x00, 0x89, 0x05};
+// Screen shadows: jne +0x0C; mov eax,[r14+0xC40] (site); mov [rbp-0x60],eax;
+// jmp +3.
+inline constexpr uintptr_t kScreenShadowNoiseReadContext501Rva = 0x01C6D1A8;
+inline constexpr uintptr_t kScreenShadowNoiseRead501Rva = 0x01C6D1AA;
+inline constexpr uint8_t kScreenShadowNoiseReadContext501Bytes[] = {
+    0x75, 0x0C, 0x41, 0x8B, 0x86, 0x40, 0x0C, 0x00, 0x00, 0x89, 0x45, 0xA0,
+    0xEB, 0x03};
+inline constexpr size_t kFrameNoiseReadBytes = 7;
+
 inline constexpr Entry kEntries[] = {
     {"IsAnyMenu", 0x01F3C5C0, 0x01DF41A0, {kIsAnyMenuBytes, sizeof(kIsAnyMenuBytes)}},
     {"IsLoadingScreenVideoPlaying", 0x0154EED0, 0x0227A0F0,
