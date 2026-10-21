@@ -652,6 +652,16 @@ struct Config {
     bool cinema_full_vr{false};
     bool steady_icons{false};
     float menu_distance{1.5f};
+    // [FEATURE:MENU-WORLD-SCREEN 1/5] [openxr] menu_world_locked=1: the
+    // startup main menu, loading screens and the loading video become one
+    // world-locked screen (LOCAL space) instead of the head-locked VIEW-space
+    // panel. Distance and width in metres; re-anchored on the recenter key and
+    // when the head has moved further than menu_world_reanchor_distance from
+    // where it was anchored (for example a headset put on after startup).
+    bool menu_world_locked{false};
+    float menu_world_distance{2.5f};
+    float menu_world_width{2.4f};
+    float menu_world_reanchor_distance{0.5f};
     float cinema_render_stereo_strength{1.0f};
     int cinema_hud_stereo_shift_px{-72};
     float manual_cinema_hud_scale{1.25f};
@@ -7235,6 +7245,9 @@ std::atomic<bool> g_taau_force_matrix_fallback{};
 std::atomic<bool> g_close_camera_f8_latched{};
 std::atomic<bool> g_manual_cinema_f10_latched{};
 std::atomic<bool> g_hmd_f9_latched{};
+// [FEATURE:MENU-WORLD-SCREEN 3/5] Counts recenter key presses, so the
+// world-locked menu screen can re-anchor in front of the player.
+std::atomic<uint32_t> g_hmd_manual_recenter_generation{};
 std::atomic<bool> g_first_person_f11_latched{};
 std::atomic<int> g_camera_mode{};
 // [FIX:FIRST-PERSON-AIM-GAMEPLAY-AUTHORITY 1/3] The renderer's exact native
@@ -17202,6 +17215,23 @@ void load_config() {
             "openxr", "steady_icons", false);
         g_config.menu_distance = std::clamp(
             read_ini_float("openxr", "menu_distance", 1.5f), 0.5f, 5.0f);
+        // [FEATURE:MENU-WORLD-SCREEN 2/5]
+        g_config.menu_world_locked =
+            read_ini_bool("openxr", "menu_world_locked", false);
+        g_config.menu_world_distance = std::clamp(
+            read_ini_float("openxr", "menu_world_distance", 2.5f),
+            0.75f, 10.0f);
+        g_config.menu_world_width = std::clamp(
+            read_ini_float("openxr", "menu_world_width", 2.4f), 0.5f, 10.0f);
+        g_config.menu_world_reanchor_distance = std::clamp(
+            read_ini_float("openxr", "menu_world_reanchor_distance", 0.5f),
+            0.1f, 5.0f);
+        log_line(
+            "Config menu world screen locked=%d distance=%.3f width=%.3f "
+            "reanchor_distance=%.3f",
+            g_config.menu_world_locked ? 1 : 0,
+            g_config.menu_world_distance, g_config.menu_world_width,
+            g_config.menu_world_reanchor_distance);
         // Missing keys preserve the pre-V865 cinema exactly: full REDengine
         // baseline and the original zero-shift HUD composite.
         g_config.cinema_render_stereo_strength = std::clamp(
@@ -60235,6 +60265,10 @@ void update_hmd_freelook_pose() {
     if (!f9_down) {
         g_hmd_f9_latched.store(false, std::memory_order_relaxed);
     }
+    if (manual_recenter) {
+        g_hmd_manual_recenter_generation.fetch_add(
+            1, std::memory_order_acq_rel);
+    }
     if (manual_recenter && !g_config.hmd_lock_game_pitch) {
         g_hmd_vertical_pitch_recenter_pending.store(
             true, std::memory_order_release);
@@ -66450,25 +66484,72 @@ void render_openxr_test_frame(
         !g_engine_dual_render_active.load(std::memory_order_relaxed) &&
         (!clean_mono_transport_active() ||
             !clean_mono_gameplay_camera_seen);
-    const int spatial_panel_kind = startup_frontend_panel
+    // [FEATURE:MENU-WORLD-SCREEN 4/5] Kind 3: the startup frontend (main menu,
+    // loading screens) and the loading video as one world-locked screen.
+    // In-game menus (kind 1) and cinema (kind 2) keep their own anchoring.
+    const bool world_menu_screen = g_config.menu_world_locked &&
+        fullscreen_menu && (startup_frontend_panel || loading_video);
+    const int spatial_panel_kind = world_menu_screen
+        ? 3
+        : (startup_frontend_panel
         ? 0
         : (fullscreen_menu ? 1
-        : (cinema_panel ? 2 : 0));
+        : (cinema_panel ? 2 : 0)));
     static int anchored_panel_kind{};
     static bool anchored_panel_pose_valid{};
     static XrPosef anchored_panel_pose{};
+    static XrVector3f anchored_panel_head_position{};
+    static uint32_t anchored_panel_recenter_generation{};
+    const uint32_t panel_recenter_generation =
+        g_hmd_manual_recenter_generation.load(std::memory_order_acquire);
+    const float panel_distance = world_menu_screen
+        ? g_config.menu_world_distance
+        : g_config.menu_distance;
     const XrViewStateFlags required_panel_pose_flags =
         XR_VIEW_STATE_ORIENTATION_VALID_BIT |
         XR_VIEW_STATE_POSITION_VALID_BIT;
     const bool panel_tracking_pose_valid = views_valid &&
         (located_view_state_flags & required_panel_pose_flags) ==
             required_panel_pose_flags;
+    // The world screen re-anchors on the recenter key and when the head has
+    // left the place where it was anchored (startup may anchor it while the
+    // headset still lies on the desk). Looking around never moves it.
+    bool world_screen_reanchor = false;
+    const char* world_screen_reanchor_reason = "";
+    if (spatial_panel_kind == 3 && anchored_panel_kind == 3 &&
+        anchored_panel_pose_valid && panel_tracking_pose_valid) {
+        if (panel_recenter_generation != anchored_panel_recenter_generation) {
+            world_screen_reanchor = true;
+            world_screen_reanchor_reason = "recenter";
+        } else {
+            const XrView* head_views =
+                isolate_publication_pose && !frame_was_prepared
+                ? publication_views.data()
+                : g_xr_views.data();
+            const XrVector3f head_now{
+                (head_views[0].pose.position.x +
+                    head_views[1].pose.position.x) * 0.5f,
+                (head_views[0].pose.position.y +
+                    head_views[1].pose.position.y) * 0.5f,
+                (head_views[0].pose.position.z +
+                    head_views[1].pose.position.z) * 0.5f};
+            const float dx = head_now.x - anchored_panel_head_position.x;
+            const float dy = head_now.y - anchored_panel_head_position.y;
+            const float dz = head_now.z - anchored_panel_head_position.z;
+            if (sqrtf(dx * dx + dy * dy + dz * dz) >
+                g_config.menu_world_reanchor_distance) {
+                world_screen_reanchor = true;
+                world_screen_reanchor_reason = "head_moved";
+            }
+        }
+    }
     if (spatial_panel_kind == 0) {
         anchored_panel_kind = 0;
         anchored_panel_pose_valid = false;
     } else if (panel_tracking_pose_valid &&
         (!anchored_panel_pose_valid ||
-            anchored_panel_kind != spatial_panel_kind)) {
+            anchored_panel_kind != spatial_panel_kind ||
+            world_screen_reanchor)) {
         const XrView* anchor_views =
             isolate_publication_pose && !frame_was_prepared
             ? publication_views.data()
@@ -66503,17 +66584,35 @@ void render_openxr_test_frame(
                 anchor_views[1].pose.position.z) * 0.5f};
         const auto panel_offset = rotate_vector(
             anchored_panel_pose.orientation,
-            XrVector3f{0.0f, 0.0f, -g_config.menu_distance});
+            XrVector3f{0.0f, 0.0f, -panel_distance});
         anchored_panel_pose.position = {
             head_position.x + panel_offset.x,
             head_position.y + panel_offset.y,
             head_position.z + panel_offset.z};
         anchored_panel_kind = spatial_panel_kind;
         anchored_panel_pose_valid = true;
+        anchored_panel_head_position = head_position;
+        anchored_panel_recenter_generation = panel_recenter_generation;
+        if (spatial_panel_kind == 3) {
+            log_line(
+                "OpenXR world menu screen anchored present=%llu reason=%s "
+                "head=%.3f,%.3f,%.3f position=%.3f,%.3f,%.3f "
+                "distance=%.2f width=%.2f",
+                static_cast<unsigned long long>(current_present),
+                world_screen_reanchor ? world_screen_reanchor_reason
+                                      : "entered",
+                head_position.x, head_position.y, head_position.z,
+                anchored_panel_pose.position.x,
+                anchored_panel_pose.position.y,
+                anchored_panel_pose.position.z,
+                g_config.menu_world_distance, g_config.menu_world_width);
+        }
         log_taau_trace_line(
             "OpenXR spatial panel anchored kind=%s present=%llu "
             "position=%.4f,%.4f,%.4f orientation=%.5f,%.5f,%.5f,%.5f",
-            fullscreen_menu ? "menu" : "cinema",
+            spatial_panel_kind == 3
+                ? "screen"
+                : (fullscreen_menu ? "menu" : "cinema"),
             static_cast<unsigned long long>(current_present),
             anchored_panel_pose.position.x,
             anchored_panel_pose.position.y,
@@ -66536,12 +66635,16 @@ void render_openxr_test_frame(
             ? menu_visible_center_tilt(g_xr_views[0].fov)
             : XrQuaternionf{0.0f, 0.0f, 0.0f, 1.0f};
         menu_layer.pose = XrPosef{view_tilt, rotate_vector(view_tilt,
-            XrVector3f{0.0f, 0.0f, -g_config.menu_distance})};
+            XrVector3f{0.0f, 0.0f, -panel_distance})};
     }
     const float spatial_panel_scale = cinema_panel && !fullscreen_menu
         ? g_config.cinema_scale
         : g_config.menu_scale;
-    menu_layer.size.width = 1.6f * spatial_panel_scale;
+    // [FEATURE:MENU-WORLD-SCREEN 5/5] The world screen has its own size, like
+    // a cinema screen at menu_world_distance.
+    menu_layer.size.width = world_menu_screen
+        ? g_config.menu_world_width
+        : 1.6f * spatial_panel_scale;
     constexpr uint64_t kCinemaProjectionAspectMaxAge = 8;
     const uint64_t cinema_projection_last =
         g_cinema_projection_last_present.load(std::memory_order_acquire);
@@ -66611,6 +66714,8 @@ void render_openxr_test_frame(
         end_info.layerCount = 0;
         end_info.layers = nullptr;
     } else if (fullscreen_menu) {
+        // A background layer for the world menu screen (job L: a 360 picture
+        // around the loading screen) belongs before menu_layer here.
         end_info.layerCount = 1;
         end_info.layers = menu_layers;
     } else if (cinema_panel && cinema_projection_panel_ready) {
