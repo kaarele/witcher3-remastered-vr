@@ -576,6 +576,11 @@ Feature status on the tested setup:
   `python3 linux/w3vr-linux.py status`.
 - Make sure `[test] openxr_loader` in `witcher3vr.ini` is empty.
 
+**The headset stays black, the game shows on the monitor and the sound stutters (Linux).** WiVRn
+may be running on the CPU fallback renderer after a Flatpak NVIDIA driver update (its server log
+then shows `GPU: llvmpipe`). Quit the game and restart WiVRn, or reboot:
+`flatpak kill io.github.wivrn.wivrn`, then start WiVRn again.
+
 **The mod does nothing.** The game build is probably not 5.01, for example after a game update.
 `python3 linux/w3vr-linux.py status` shows the detected build.
 
