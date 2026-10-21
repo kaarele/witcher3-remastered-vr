@@ -75,6 +75,15 @@ HUD_EDITOR_BINDINGS = [('IK_Insert', 'W3VRHudEditorToggle'), ('IK_Q', 'W3VRHudEd
                        ('IK_R', 'W3VRHudEditorResetCurrent'), ('IK_X', 'W3VRHudEditorResetProfile'),
                        ('IK_F7', 'W3VRHudEditorProfile')]
 HUD_XML_LINE = b'modWitcher3VRHUDEditor.xml;'
+# 5.01 keys tested in the headset for 0.1.3 (configure adds them when missing).
+REMASTER_DEFAULTS = (
+    ('openxr', 'world_marker_depth', '1'),
+    ('engine', 'remaster_pair_jitter', '1'),
+    ('engine', 'remaster_pair_noise', '1'),
+    ('engine', 'remaster_pair_previous_transforms', '1'),
+    ('engine', 'dlss_mip_bias_offset', '0.5'),
+    ('engine', 'async_anim_tick_visible', '1'),
+)
 DLSS_QUALITY_NAMES = {0: 'DLAA', 1: 'Quality', 2: 'Balanced', 3: 'Performance', 4: 'Ultra Performance'}
 # Remastered 5.01: the game runs DLSS itself (Streamline 2; the mod gives each eye its own DLSS history) and has
 # no TAAU. "none" uses FXAA. "fsr" is the game's FSR (FSR 4 on RDNA4, the older FSR elsewhere, any GPU); in Stereo
@@ -622,7 +631,12 @@ def cmd_configure(args):
     ini.set('openxr', 'native_stereo', '0' if remaster else '1')
     if remaster:
         ini.set('engine', 'remaster_asymmetric_ndc', '0' if args.symmetric else '1')
-        ini.set('engine', 'remaster_fsr_per_eye', '1' if aa == 'fsr' else '0')
+        # Per-eye FSR only acts while the game uses FSR, so it is safe to leave on with DLSS or FXAA.
+        ini.set('engine', 'remaster_fsr_per_eye', '1')
+        # Tested 0.1.3 defaults; a value the user already set is kept.
+        for section, key, value in REMASTER_DEFAULTS:
+            if ini.get(section, key) in (None, ''):
+                ini.set(section, key, value)
     ini.set('openxr', 'world_detail_range', '%.3f' % args.world_detail)
     ini.set('openxr', 'hud_horizontal_scale', '%.3f' % args.hud_frame)
     ini.set('openxr', 'hud_vertical_scale', '%.3f' % args.hud_frame)
@@ -866,8 +880,8 @@ def main():
     sp.add_argument('--aa', choices=['dlss', 'taau', 'fsr', 'none'],
                     help='default: dlss on NVIDIA, otherwise taau (4.04) or none = FXAA (5.01, which has no TAAU); '
                          'fsr = the game\'s FSR with one FSR history per eye (5.01, experimental)')
-    sp.add_argument('--dlss-quality', type=int, default=2, choices=range(0, 5),
-                    help='0 DLAA, 1 Quality, 2 Balanced (default), 3 Performance, 4 Ultra Performance')
+    sp.add_argument('--dlss-quality', type=int, default=1, choices=range(0, 5),
+                    help='0 DLAA, 1 Quality (default), 2 Balanced, 3 Performance, 4 Ultra Performance')
     sp.add_argument('--res', default='2476x2594',
                     help="per-eye render size WIDTHxHEIGHT; use your OpenXR runtime's recommended per-eye size "
                          "(default 2476x2594, WiVRn's recommendation for Quest 3)")

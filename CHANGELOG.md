@@ -4,15 +4,28 @@ Versions below 1.0 are alpha releases. Downloads are on the
 [Releases page](https://github.com/kaarele/witcher3-remastered-vr/releases). Release notes of the
 original mod and of the Remastered port this project builds on are in [docs/releases](docs/releases/).
 
-## Unreleased
+## 0.1.3 (2026-10-22)
 
-- Experimental, off by default: interaction prompts and NPC labels at their target's distance
-  (`[openxr] world_marker_depth=1`). Not tested in the game yet.
-- Experimental, off by default: FSR in Stereo with a separate FSR history for each eye
-  (`[engine] remaster_fsr_per_eye=1`, Linux tool `configure --aa fsr`). Works with whatever FSR
-  version the game picks: the FidelityFX loader path (FSR 4 on RDNA4, FSR 3.1 where the driver
-  offers it) and the game's built-in FSR 2 (NVIDIA, Intel, RX 6000, Steam Deck). Not tested in the
-  game yet.
+- **DLSS fixed in both eyes.** The eye rendered second (the left one) was jagged and flickered on
+  moving characters with DLSS Quality, Balanced and Performance. Two causes, both fixed and on in the
+  release ini and the Linux tool:
+  - Moving objects lost their motion vectors in the second eye
+    (`[engine] remaster_pair_previous_transforms=1`).
+  - Each eye got only half of the DLSS jitter pattern and its own shadow noise
+    (`remaster_pair_jitter=1`, `remaster_pair_noise=1`).
+  Balanced is now playable without artifacts; Quality or DLAA look best.
+- **Interaction prompts and NPC labels at the target's real depth** (`[openxr] world_marker_depth=1`).
+- **FSR in Stereo** with a separate history for each eye (`remaster_fsr_per_eye=1`). It covers both
+  of the game's FSR paths: the FidelityFX loader (FSR 4 / 3.1 on AMD) and the built-in FSR 2
+  (NVIDIA, Intel, older AMD, Steam Deck). Works on NVIDIA but costs a lot of frames there; untested on
+  AMD.
+- Background characters keep updating while the headset sees them (`async_anim_tick_visible=1`).
+- DLSS image controls: texture LOD offset (`dlss_mip_bias_offset`, 0.5 in the release ini) and an
+  optional DLSS model override (`dlss_preset`, untested).
+- First person: `F11` recenters on entry; optional eye at Geralt's head
+  (`remaster_native_head_provider`, untested); optional follow of runtime recenters.
+- Linux tool: `configure` defaults to DLSS Quality, adds the new keys when missing and supports
+  `--aa fsr`.
 
 ## 0.1.2 (2026-10-20)
 

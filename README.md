@@ -11,7 +11,7 @@ Proton today. Windows support is being worked on. This project continues the
 
 **Linux** (Steam + Proton, headset through WiVRn): the tested setup.
 
-1. Download `Witcher3RemasteredVR-v0.1.2.zip` from **[Releases](https://github.com/kaarele/witcher3-remastered-vr/releases)**.
+1. Download `Witcher3RemasteredVR-v0.1.3.zip` from **[Releases](https://github.com/kaarele/witcher3-remastered-vr/releases)**.
 2. In Steam: right-click *The Witcher 3* → **Manage** → **Browse local files**.
 3. Extract the zip into that folder and merge the folders.
 4. Close the game. Open a terminal in that folder and run:
@@ -26,7 +26,7 @@ Proton today. Windows support is being worked on. This project continues the
 
 **Windows** (not tested yet, so please report how it goes):
 
-1. Download `Witcher3RemasteredVR-v0.1.2.zip` from **[Releases](https://github.com/kaarele/witcher3-remastered-vr/releases)**.
+1. Download `Witcher3RemasteredVR-v0.1.3.zip` from **[Releases](https://github.com/kaarele/witcher3-remastered-vr/releases)**.
 2. Extract it into the game folder (the one with `bin`, `content` and `mods`).
 3. Start your headset's OpenXR runtime (SteamVR, Meta Quest Link, Virtual Desktop, ...).
 4. Start the game. In **Options → Graphics** set Anti-aliasing to **DLSS** (Quality or DLAA), and
@@ -46,6 +46,11 @@ near view, F10 the cinema screen, F11 first person.
 **Works, tested in the headset:** Linux (Bazzite), Steam, Proton Hotfix, NVIDIA RTX 3080, Meta Quest
 3 through WiVRn at 90 Hz.
 - Full stereo 3D with DLSS/DLAA kept separately for each eye, and a sharp per-eye projection.
+- **DLSS looks clean in both eyes.** Both eyes get the same DLSS jitter and the same shadow noise,
+  and the eye that is rendered second keeps the motion of moving characters. Before, the left eye
+  was jagged and flickered on moving characters (Geralt's armour). Balanced is now playable without
+  artifacts; Quality or DLAA look best.
+- **"Press A to talk" labels appear at the person's real depth**, not on a flat HUD plane.
 - HUD, menus and loading screens placed where you can read them. "Press A to talk" style markers
   sit on the people and objects they belong to.
 - No black rectangles when cutscenes or loading screens fade.
@@ -54,23 +59,29 @@ near view, F10 the cinema screen, F11 first person.
 - About 15% more frames per second with DLSS Quality: the game prepares the next frame early, and
   both eyes still show every character in the same pose. (With DLAA the graphics card is the limit,
   so it gains nothing there.)
-- People keep animating when you look at them with your head rather than the game camera.
+- People keep animating when you look at them with your head rather than the game camera, also
+  background people beside or behind you.
+- **FSR works in Stereo**, with its own history for each eye. On NVIDIA the game uses its built-in
+  FSR 2, which works but costs a lot of performance there, so DLSS is the better choice on NVIDIA.
+  AMD owners: please try FSR and report how it runs.
 
 **Coming soon:**
 - SteamVR, on Linux and Windows.
 - Windows in general (the code should work, but nobody has run it yet).
-- Interaction labels at the person's real depth.
+- An options page for the mod inside the game's own menu.
+- Main menu and loading screens as a screen floating in front of you, with a 3D picture around it
+  while loading instead of black.
 - A picture for the story recap while a save loads (black in VR for now).
 
-**Not tested:** AMD and Intel GPUs (use FXAA there), headsets other than Quest 3, the GOG edition,
-SteamOS / Steam Deck.
+**Not tested:** AMD and Intel GPUs (use FSR or FXAA there; reports very welcome), headsets other than
+Quest 3, the GOG edition, SteamOS / Steam Deck.
 
 **Known issues:** loading a save looks very slow, but most of the wait is the game's story recap
 video, which stays black in VR. The game itself has usually loaded after 20 to 25 seconds: press
-**Space** on the keyboard or **X** on the gamepad to skip the recap. In first person (F11) Geralt can walk at an angle
-to where you look (press F9 while facing forward) and the camera sits inside his head. "Press A to
-talk" labels float at the HUD's distance instead of at the person's depth. A character can still
-freeze now and then (seen once, in a cutscene). More in
+**Space** on the keyboard or **X** on the gamepad to skip the recap. FSR on NVIDIA costs a lot of
+frames. In busy towns, people a few metres away lose detail quickly (the game's level of detail). In
+first person (`F11`) the camera sits inside Geralt's head (an experimental fix is in the
+[configuration reference](#configuration-reference)). More in
 [Troubleshooting and known issues](#troubleshooting-and-known-issues).
 
 ## Why this mod exists
@@ -250,7 +261,7 @@ file before it overwrites it:
      the Close cameras, a half-size controller-locked HUD and the near view.
    - `configure` uses WiVRn's recommended Quest 3 render size (2476x2594 per eye). For another
      headset pass `--res WIDTHxHEIGHT` with your runtime's recommended per-eye size.
-   - `--dlss-quality` selects the DLSS mode: 1 Quality, 2 Balanced (default), 3 Performance,
+   - `--dlss-quality` selects the DLSS mode: 1 Quality (default), 2 Balanced, 3 Performance,
      4 Ultra Performance, 0 DLAA. You can also change it in the game's graphics options at any time.
 
 5. **Set the launch options** in Steam: *The Witcher 3 > Properties > General > Launch Options*.
@@ -331,8 +342,8 @@ supports the new build. A one-click installer for both systems is planned.
 
 | Setting | Recommendation |
 |---|---|
-| Anti-aliasing | **DLSS** on an RTX GPU, otherwise **FXAA**. FSR only with `remaster_fsr_per_eye=1` (experimental). XeSS and TAA keep one history for both eyes and ghost in Stereo. |
-| DLSS mode | **DLAA** looks best; **Quality** is faster. Both were used on the test setup (RTX 3080). There the frame rate was mostly limited by the CPU, so the faster DLSS modes gained little. |
+| Anti-aliasing | **DLSS** on an RTX GPU. Otherwise **FSR** (one history per eye, `remaster_fsr_per_eye=1` in the release ini; on NVIDIA it works but is slow) or **FXAA**. XeSS and TAA keep one history for both eyes and ghost in Stereo. |
+| DLSS mode | **DLAA** or **Quality** look best; **Balanced** is playable without artifacts. All three were used on the test setup (RTX 3080). There the frame rate was mostly limited by the CPU, so the faster DLSS modes gained little. |
 | Sharpening | Off. It adds shimmer after the headset stream's resampling. |
 | Frame generation, Reflex, ray reconstruction | Off. The mod presents its own eye pairs. The launcher and the Linux tool switch them off. |
 | Ray tracing | Off |
@@ -369,6 +380,21 @@ temporal_backend=dlss
 remaster_asymmetric_ndc=1
 camera_mode=1
 close_camera_offset=-1.000
+```
+
+On 5.01 it also adds these keys when they are missing (your own values are kept):
+
+```ini
+[openxr]
+world_marker_depth=1
+
+[engine]
+remaster_pair_jitter=1
+remaster_pair_noise=1
+remaster_pair_previous_transforms=1
+dlss_mip_bias_offset=0.5
+async_anim_tick_visible=1
+remaster_fsr_per_eye=1
 ```
 
 The values below are **not the code defaults**, but the release's `bin/x64_dx12/witcher3vr.ini`
@@ -433,7 +459,7 @@ The original mod's keys are documented in [witcher3vr.example.ini](witcher3vr.ex
 | `menu_vertical_center` | `visible` | `visible`: menus and loading screens are centred on the visible image. `forward`: old behaviour. All builds. |
 | `world_marker_exact_projection` | `1` | Project interaction prompts and NPC or door markers exactly through the HUD plane. Needs the controller-locked level HUD (`hud_controller_locked=1`, `hud_anchor_level=1`) in Stereo. `0`: the game's markers. |
 | `hud_centre_split_aim_only` | `1` | Redraw the HUD's centre square (crosshair) about the render centre only while aiming. If the crosshair is off target while aiming, try `0`. |
-| `world_marker_depth` | `0` | Experimental, not tested in the headset yet. `1`: interaction prompts and NPC labels appear at the person's or object's distance instead of the HUD's. Needs `world_marker_exact_projection=1` and the controller-locked level HUD. Read at startup. |
+| `world_marker_depth` | `0` | Release ini and Linux tool: `1`, tested in the headset. `1`: interaction prompts and NPC labels appear at the person's or object's distance instead of the HUD's. Needs `world_marker_exact_projection=1` and the controller-locked level HUD. Read at startup. |
 | `world_marker_depth_box` | `240,130,70` | With `world_marker_depth=1`: the HUD area moved with each marker, as half width, height above and height below the marker point, in 1920x1080 HUD pixels. Raise it if a long label is split between two depths. |
 | `cinema_restore_gameplay_recenter` | `1` | After a cutscene, gameplay keeps the forward direction it had before the cutscene. |
 | `follow_runtime_recenter` | `0` | `1` = recenter the view when the runtime recenters (Meta button, WiVRn, SteamVR's *Reset seated position*). Not tested in the headset yet. |
@@ -448,18 +474,19 @@ The original mod's keys are documented in [witcher3vr.example.ini](witcher3vr.ex
 | `remaster_sl_wine_bypass` | auto | The game skips its DLSS (Streamline) setup under Wine. The mod removes that check in memory, on the exact 5.01 build only. Auto = on when `temporal_backend=dlss`. `0` = never, `1` = always. No effect on Windows. |
 | `remaster_dlss_per_eye_motion` | `1` | Keep a separate motion-vector camera history for each eye with per-eye DLSS or per-eye FSR. |
 | `dlss_preset` | empty | Experimental. Force one DLSS model preset for both eyes and every quality mode: `K` (the game's choice for DLAA, Quality and Balanced), `J`, or the newer `M` and `L` (sharper and steadier, but heavier). Empty = the game's choice. 5.01 with per-eye DLSS only. |
-| `dlss_mip_bias_offset` | `0` | Experimental. Added to the game's DLSS texture sharpness bias (texture LOD bias), for both eyes. Positive values (`0.5`, `1.0`) calm sparkle and moiré on fine patterns such as clothing and fences, at the cost of a little texture detail; negative values sharpen. Never raised above NVIDIA's limit for the render scale. 5.01 with per-eye DLSS only. |
-| `remaster_fsr_per_eye` | `0` | Experimental, 5.01 Stereo. With the game's anti-aliasing set to FSR: `1` = a separate FSR history for each eye (a second FSR context for the right eye), so FSR no longer blends the eyes. Covers both FSR paths of the game: the FidelityFX loader (FSR 4 on RDNA4, FSR 3.1 where the driver offers it; costs one more FSR context) and the game's built-in FSR 2 on NVIDIA, Intel, RX 6000 and Steam Deck (costs five more history textures, about 100 MB at 2476x2594). The Linux tool sets it with `--aa fsr`. |
+| `dlss_mip_bias_offset` | `0` | Experimental. Added to the game's DLSS texture sharpness bias (texture LOD bias), for both eyes. Release ini and Linux tool: `0.5`. Positive values (`0.5`, `1.0`) calm sparkle and moiré on fine patterns such as clothing and fences, at the cost of a little texture detail; negative values sharpen. Never raised above NVIDIA's limit for the render scale. 5.01 with per-eye DLSS only. |
+| `remaster_fsr_per_eye` | `0` | Release ini and Linux tool: `1`. 5.01 Stereo; tried in the headset on NVIDIA (works, slow), untested on AMD. With the game's anti-aliasing set to FSR: `1` = a separate FSR history for each eye (a second FSR context for the right eye), so FSR no longer blends the eyes. Covers both FSR paths of the game: the FidelityFX loader (FSR 4 on RDNA4, FSR 3.1 where the driver offers it; costs one more FSR context) and the game's built-in FSR 2 on NVIDIA, Intel, RX 6000 and Steam Deck (costs five more history textures, about 100 MB at 2476x2594). Only active while the game uses FSR. |
 | `remaster_asymmetric_ndc` | `0` | `1` = render each eye with its own off-centre field of view and send the whole image to the headset (sharper). The Linux tool sets `1`. Switches itself off for the session if it keeps failing. |
 | `remaster_asymmetric_ndc_reproject` | `1` | With per-eye projection: correct the game's temporal reprojection for it. |
 | `remaster_asymmetric_ndc_cascade_fix` | `1` | With per-eye projection: `1` fits the sun shadows to each eye's own view; `0` uses the same centred fit for both eyes, so distant shadows match between the eyes. The test setup uses `0`. |
 | `remaster_shadow_pair_reuse` | `0` | `1` = render the sun-shadow maps once per stereo pair; the second eye reuses them. Switches itself off after repeated mismatches. `9` is for measurements only. |
 | `remaster_light_flicker_per_pair` | `0` | `1` = flickering lights advance once per stereo pair: the same flicker in both eyes, at the normal speed. |
 | `remaster_local_light_pair_lock` | `0` | `1` = choose and fade local shadows for both eyes from the first eye's position. |
-| `remaster_pair_jitter` | `0` | `1` = both eyes use the same DLSS jitter sample, advancing once per stereo pair, so each eye's DLSS history sees the whole jitter pattern (the game steps it per eye render, which gives each eye only half of it). Experimental, not tested in the game yet. |
-| `remaster_pair_noise` | `0` | `1` = the same GTAO and screen-space shadow noise pattern in both eyes, advancing once per stereo pair. Experimental, not tested in the game yet. |
-| `remaster_pair_previous_transforms` | `0` | `1` = moving characters and objects keep their motion vectors in the second-rendered (left) eye, so DLSS and FSR do not smear them there. Experimental, not tested in the game yet. |
+| `remaster_pair_jitter` | `0` | `1` = both eyes use the same DLSS jitter sample, advancing once per stereo pair, so each eye's DLSS history sees the whole jitter pattern (the game steps it per eye render, which gives each eye only half of it). Release ini and Linux tool: `1`, tested in the headset. |
+| `remaster_pair_noise` | `0` | `1` = the same GTAO and screen-space shadow noise pattern in both eyes, advancing once per stereo pair. Release ini and Linux tool: `1`, tested in the headset. |
+| `remaster_pair_previous_transforms` | `0` | `1` = moving characters and objects keep their motion vectors in the second-rendered (left) eye, so DLSS and FSR do not smear or alias them there. Release ini and Linux tool: `1`, tested in the headset. |
 | `animated_component_visible` | `1` | Keep animating characters the headset sees but the game camera does not (outside its view). 4.04 and 5.01. |
+| `async_anim_tick_visible` | `0` | Release ini and Linux tool: `1`. 5.01: background characters (the async animation tick) keep updating while the headset sees them, not only inside the game camera's view. Needs `menu_state_probe=1`. Played in the headset. |
 | `remaster_local_shadow_slices` | `1` | `1`-`4` local-shadow atlas slices of 2048x2048. More slices let more lights cast shadows (4 costs about 24-48 MB more VRAM). |
 | `remaster_local_shadow_sort_corrected` | `0` | `1` = pack the nearest shadowed lights first, so an overflow drops far lights. |
 | `remaster_local_light_diag` | `0` | Log local-light and local-shadow choices per eye (needs diagnostics). |
@@ -522,7 +549,15 @@ Feature status on the tested setup:
 | Shared sun shadows (`remaster_shadow_pair_reuse`) | Off (release ini: on) | Played in the headset, no problems reported |
 | Per-pair flicker and local shadows | Off (release ini: on) | Played in the headset, no problems reported |
 | Animation outside the game camera's view (`animated_component_visible`) | On | Tested in the headset |
-| Per-eye FSR (`remaster_fsr_per_eye`) | Off | Experimental, not tested in the game yet |
+| Same jitter and noise in both eyes (`remaster_pair_jitter`, `remaster_pair_noise`) | Off (release ini: on) | Tested in the headset |
+| Second eye keeps object motion (`remaster_pair_previous_transforms`) | Off (release ini: on) | Tested in the headset: fixes the jagged left eye with DLSS |
+| Labels at the target's depth (`world_marker_depth`) | Off (release ini: on) | Tested in the headset |
+| Background characters keep updating (`async_anim_tick_visible`) | Off (release ini: on) | Played in the headset, no problems reported |
+| DLSS texture LOD offset (`dlss_mip_bias_offset`) | 0 (release ini: 0.5) | Played in the headset |
+| Per-eye FSR (`remaster_fsr_per_eye`) | Off (release ini: on) | Tried in the headset on NVIDIA (works, slow); untested on AMD |
+| DLSS model override (`dlss_preset`) | Game's choice | Not tested yet |
+| First person: recenter on `F11` (`first_person_recenter_on_entry`) | On | Not tested in the headset yet |
+| First person: eye at Geralt's head (`remaster_native_head_provider`) | Off | Not tested yet |
 | `frame_wait_early`, `pair_rate_divisor` | Off | Experimental, no gain measured |
 
 ## Troubleshooting and known issues
@@ -552,9 +587,13 @@ does this on NVIDIA) and select DLSS as the game's anti-aliasing. Make sure NVAP
 (`PROTON_ENABLE_NVAPI=1`), that `[engine] remaster_sl_wine_bypass` is not `0`, and that you use an
 RTX GPU.
 
-**Ghosting or blending between the eyes.** Use DLSS with `temporal_backend=dlss`, or FXAA. The
-game's FSR needs `[engine] remaster_fsr_per_eye=1` (experimental); XeSS and TAA are not supported in
+**Ghosting or blending between the eyes.** Use DLSS with `temporal_backend=dlss`, FSR with
+`[engine] remaster_fsr_per_eye=1` (in the release ini), or FXAA. XeSS and TAA are not supported in
 Stereo.
+
+**One eye looks more jagged or smeared than the other on moving characters.** Make sure
+`[engine] remaster_pair_previous_transforms=1`, `remaster_pair_jitter=1` and `remaster_pair_noise=1`
+are set (release ini and Linux tool).
 
 **The HUD is too big or sits at the edges of the view.** Use `hud_size=0.5` with
 `hud_controller_locked=1` (the Linux tool's default), then press `F9` while looking straight ahead.

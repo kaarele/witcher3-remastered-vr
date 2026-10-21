@@ -586,7 +586,7 @@ null OpenXR runtime.
 - Unit test: `renderer_eye_geometry` checks that a texel of a marker box drawn at 0.8, 6 and 40 m
   lands on the world point in each eye and that the disparity relative to the HUD plane is
   baseline x (1/H - 1/D).
-- Status: built and unit-tested; not run in the game yet.
+- Status (2026-10-22, 0.1.3): on in the release ini; tested in the headset ("perfectly spot on").
 
 ### Near view "zooming in and out" on 5.01
 - Camera trace (`[debug] camera_offset_trace=1`, null HMD, scripted panning): the near offset was
@@ -1114,7 +1114,7 @@ thread, just before xrWaitFrame/xrEndFrame.
 - Log: `Async animation tick visibility hooked build=remaster-5.01 ...` at startup and
   `Async animation tick frustum opened count=1` the first time. Census: `PERF anim tick frustum
   builds= opened=` per window.
-- Status: built, not yet run. To test: CPU cost in a busy town (census presents/s with the key on
+- Status (2026-10-22, 0.1.3): on in the release ini; played in the headset, background people kept moving. Still to measure: CPU cost in a busy town (census presents/s with the key on
   and off) and whether background people beside or behind the game camera keep moving.
 
 ### Same jitter and noise in both eyes (`remaster_pair_jitter`, `remaster_pair_noise`, 5.01)
@@ -1142,8 +1142,35 @@ thread, just before xrWaitFrame/xrEndFrame.
   handled, so both eyes must keep distinct values there).
 - Pair index: the tag the mod gives every duplicate-render pair (same for both eyes, also with
   run-ahead); renders without a tag keep the game's counter.
-- Status: built, not run yet. Census line `PERF pair temporal jitter_calls= jitter_pair=
+- Status (2026-10-22, 0.1.3): on in the release ini; tested headless (zero-IPD left/right disagreement 3-4x lower) and in the headset. Census line `PERF pair temporal jitter_calls= jitter_pair=
   previous_pair= noise_reads= noise_pair=`.
+
+### Second eye keeps object motion (`remaster_pair_previous_transforms`, 5.01)
+- Symptom (owner, headset): with DLSS Quality/Balanced/Performance the left eye was more jagged
+  and flickered on moving characters (Geralt's armour). With FSR 2 per eye at 63 mm IPD, the left
+  eye smeared a running Geralt. The right eye was clean.
+- Cause: every eye render gets its own frame index:
+  - the collector init 0x141BF84D0 increments scene+0x1B8 and copies it to collector+0xB0;
+  - the right eye renders first in each pair.
+- The writers of a proxy's previous transform copy +0x40 to +0x80 and stamp "previous valid" (+0xC0)
+  as last-visited index (+0xEC) + 1:
+  - relink 0x141D46670;
+  - UpdateTransform 0x141D46AA0 (vtable +0x50);
+  - decal 0x141CF5A10.
+  The tick's updates are applied in the first eye's flush, so the stamp matches only the first
+  eye. The second eye treated moving objects as static (camera-only motion vectors).
+- Proof: swapping the render order (`taau_reverse_eye_order=1`) moved the smear and the lower
+  detail to the right eye (headless high-frequency L/R 0.96/0.94 -> 1.03/1.06).
+- Fix: the three writers are hooked to record the updated proxies of a pair. On the second render,
+  every recorded proxy whose +0xC0 still equals the first render's index is re-stamped to the current
+  index. About 270 proxies per pair in the village, no overflow.
+- Result (headless, DLSS Quality, zero IPD):
+  - L/R detail 0.963 -> 0.993 standing and 0.938 -> 0.982 walking.
+  - Moving-Geralt L/R difference 4.2 -> 1.8.
+  - FSR 2 at 63 mm: both eyes crisp.
+  Tested in the headset by the owner: "looks amazing". On in the release ini for 0.1.3.
+- Diagnostic: `[debug] dlss_eye_constants_log=1` (with logging and diagnostics) logs the Streamline
+  constants each eye's DLSS receives.
 
 ### Per-eye FSR history in Stereo (`[engine] remaster_fsr_per_eye`, 5.01)
 
@@ -1218,4 +1245,4 @@ thread, just before xrWaitFrame/xrEndFrame.
   `first left/right-eye dispatch on built-in FSR2 targets`. VRAM: five textures at the output
   size (two RGBA16F upscaled histories, two lock-status and the luma history), about 100 MB at
   2476x2594.
-- Status (loader and built-in paths): built for the loader path only; the built-in path is implemented but not built or run yet.
+- Status (2026-10-22, 0.1.3): on in the release ini. Built-in FSR 2 path tested headless at 63 mm IPD (both eyes crisp with `remaster_pair_previous_transforms=1`) and tried in the headset on an RTX 3080 (works, large performance cost). The loader path (AMD) is untested.
