@@ -43,6 +43,7 @@ enum class Function : size_t {
     FrustumAabbTest,       // (frustum, world box {min, max}): 1 = box fully outside the frustum
     ActorGetHeadBoneIndex,           // native CActor.GetHeadBoneIndex
     EntityGetBoneWorldMatrixByIndex, // native CEntity.GetBoneWorldMatrixByIndex
+    DlssMipBias,           // (frame_data, _, float* bias): texture LOD bias for the frame's samplers
     Count,
 };
 
@@ -244,6 +245,16 @@ inline constexpr uint8_t kAnimatedComponentFrustumCall501Bytes[] = {
 inline constexpr uint8_t kAnimatedComponentFrustumStore501Bytes[] = {
     0x49, 0x8D, 0x8F, 0x50, 0x0F, 0x00, 0x00, 0x41, 0x88, 0x87, 0x74, 0x0F,
     0x00, 0x00};
+// [FEATURE:REMASTER-DLSS-IMAGE 1/5] 5.01 texture LOD bias, called by the frame
+// builder (0x141C1AC02) and two other passes. Unless frame_data+0xBEC is set,
+// AA modes 3-8 get clamp(log2(render_h / output_h) - 1, -3, 0) plus the
+// TextureMipBias setting (render_h at frame_data+0xBE0, output_h at +0xBE8),
+// other modes TextureMipBias alone. push rbx; sub rsp,0x30; cmp byte ptr
+// [rcx+0xBEC],0; mov rbx,r8; mov r8,rcx; jne: unique in the 5.01 exe.
+inline constexpr uint8_t kDlssMipBias501Bytes[] = {
+    0x40, 0x53, 0x48, 0x83, 0xEC, 0x30, 0x80, 0xB9, 0xEC, 0x0B, 0x00, 0x00,
+    0x00, 0x49, 0x8B, 0xD8, 0x4C, 0x8B, 0xC1, 0x0F, 0x85, 0x84, 0x00, 0x00,
+    0x00};
 
 // Registered script natives used by the first-person head provider. The
 // opening bytes are identical in 4.04 and 5.01 and unique in the 5.01 exe;
@@ -402,6 +413,8 @@ inline constexpr Entry kEntries[] = {
     {"Entity.GetBoneWorldMatrixByIndex", 0x0152E600, 0x02259FC0,
         {kEntityGetBoneWorldMatrixByIndexBytes,
             sizeof(kEntityGetBoneWorldMatrixByIndexBytes)}},
+    {"DlssMipBias", 0, 0x01C1D180,
+        {kDlssMipBias501Bytes, sizeof(kDlssMipBias501Bytes)}},
 };
 static_assert(sizeof(kEntries) / sizeof(kEntries[0]) ==
     static_cast<size_t>(Function::Count));

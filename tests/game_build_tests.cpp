@@ -131,6 +131,10 @@ int main() {
                         addresses::rva(Build::Remaster501, Function::FrustumAabbTest),
                 "5.01 visibility call reaches the frustum test");
         }
+        require(addresses::rva(Build::Remaster501, Function::DlssMipBias) == 0x01C1D180 &&
+                addresses::rva(Build::NextGen404, Function::DlssMipBias) == 0 &&
+                addresses::signature(Build::Remaster501, Function::DlssMipBias).size == 25,
+            "5.01 DLSS mip bias RVA and signature; not mapped on 4.04");
         require(addresses::rva(Build::Unknown, Function::IsAnyMenu) == 0,
             "no engine addresses on unknown builds");
         require(addresses::signature(Build::NextGen404, Function::IsAnyMenu).size == 0,
