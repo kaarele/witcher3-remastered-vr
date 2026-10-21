@@ -141,6 +141,25 @@ int main() {
                 addresses::rva(Build::NextGen404, Function::DlssMipBias) == 0 &&
                 addresses::signature(Build::Remaster501, Function::DlssMipBias).size == 25,
             "5.01 DLSS mip bias RVA and signature; not mapped on 4.04");
+        {
+            // The options see-through signal native: 5.01 only, whole function, and the
+            // opcode-table lea (4C 8D 0D rel32) and code-pointer load (+0x30) the hook
+            // reproduces sit where the hook reads them.
+            const auto hdr = addresses::signature(
+                Build::Remaster501, Function::GameSetHdrMenuFadePercentage);
+            const uint8_t* b = addresses::kGameSetHdrMenuFadePercentage501Bytes;
+            const size_t lea = addresses::kScriptNativeOpcodeTableRel32Offset - 3;
+            require(addresses::rva(Build::Remaster501,
+                        Function::GameSetHdrMenuFadePercentage) == 0x02273A20 &&
+                    addresses::rva(Build::NextGen404,
+                        Function::GameSetHdrMenuFadePercentage) == 0 &&
+                    hdr.size == 70 && b[0] == 0x40 && b[69] == 0xC3 &&
+                    b[lea] == 0x4C && b[lea + 1] == 0x8D && b[lea + 2] == 0x0D &&
+                    addresses::kScriptNativeOpcodeTableNextIp ==
+                        addresses::kScriptNativeOpcodeTableRel32Offset + 4 &&
+                    b[9] == addresses::kScriptStackFrameCodeOffset,
+                "5.01 SetHDRMenuFadePercentage signal native");
+        }
         require(addresses::rva(Build::Unknown, Function::IsAnyMenu) == 0,
             "no engine addresses on unknown builds");
         require(addresses::signature(Build::NextGen404, Function::IsAnyMenu).size == 0,
