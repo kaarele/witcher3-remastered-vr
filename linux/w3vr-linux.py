@@ -769,6 +769,10 @@ def cmd_launch_options(args):
         system = '/var/lib/flatpak/app/io.github.wivrn.wivrn'
         user = os.path.expanduser('~/.local/share/flatpak/app/io.github.wivrn.wivrn')
         parts.append('PRESSURE_VESSEL_FILESYSTEMS_RW=%s' % (user if os.path.isdir(user) and not os.path.isdir(system) else system))
+    # The tested setup: load the mod's dxgi.dll, and NVAPI for DLSS on NVIDIA.
+    parts.append('WINEDLLOVERRIDES="dxgi=n,b"')
+    if nvidia_gpu():
+        parts.append('PROTON_ENABLE_NVAPI=1')
     print('Runtime: %s' % detail)
     print('Steam > The Witcher 3 > Properties > General > Launch Options:')
     print()
