@@ -697,6 +697,18 @@ struct Config {
     // anchor, in 1920x1080 Scaleform movie pixels.
     bool world_marker_depth{false};
     float world_marker_depth_box_px[3]{240.0f, 130.0f, 70.0f};
+    // [FEATURE:LOADING-BACKGROUND 6/6] 360-degree picture around the loading
+    // screen ([openxr] loading_background*), off by default.
+    bool loading_background{false};
+    bool loading_background_frontend{true};
+    bool loading_background_in_game_menus{false};
+    float loading_background_seconds{30.0f};
+    float loading_background_yaw_offset{0.0f};
+    float loading_background_pitch{0.0f};
+    float loading_background_roll{0.0f};
+    int loading_background_max_width{4096};
+    int loading_background_eye_width{1600};
+    std::string loading_background_folder{"w3vr_backgrounds"};
     bool reverse_enabled{false};
     bool reverse_scan_periodic{false};
     bool reverse_scan_unmap{false};
@@ -17287,6 +17299,26 @@ void load_config() {
                 }
             }
         }
+        g_config.loading_background = read_ini_bool(
+            "openxr", "loading_background", false);
+        g_config.loading_background_frontend = read_ini_bool(
+            "openxr", "loading_background_frontend", true);
+        g_config.loading_background_in_game_menus = read_ini_bool(
+            "openxr", "loading_background_in_game_menus", false);
+        g_config.loading_background_seconds = std::clamp(read_ini_float(
+            "openxr", "loading_background_seconds", 30.0f), 5.0f, 3600.0f);
+        g_config.loading_background_yaw_offset = read_ini_float(
+            "openxr", "loading_background_yaw_offset", 0.0f);
+        g_config.loading_background_pitch = std::clamp(read_ini_float(
+            "openxr", "loading_background_pitch", 0.0f), -90.0f, 90.0f);
+        g_config.loading_background_roll = std::clamp(read_ini_float(
+            "openxr", "loading_background_roll", 0.0f), -90.0f, 90.0f);
+        g_config.loading_background_max_width = std::clamp(read_ini_int(
+            "openxr", "loading_background_max_width", 4096), 1024, 16384);
+        g_config.loading_background_eye_width = std::clamp(read_ini_int(
+            "openxr", "loading_background_eye_width", 1600), 512, 4096);
+        g_config.loading_background_folder = read_ini_string(
+            "openxr", "loading_background_folder", "w3vr_backgrounds");
         apply_hud_frame_scale();
 
         g_config.reverse_enabled = read_ini_bool("reverse", "enabled", false);
@@ -62767,6 +62799,883 @@ bool consume_openxr_early_frame(XrFrameState& frame_state) {
     return true;
 }
 
+// [FEATURE:LOADING-BACKGROUND 1/6] A 360-degree picture around the loading
+// screen instead of the black void. Equirectangular JPG/PNG files from
+// <game>\bin\x64_dx12\w3vr_backgrounds\ (mono 2:1, or top-bottom stereo 1:1
+// with the left eye on top) are decoded with WIC on a worker thread, uploaded
+// once and drawn by the mod into a private stereo projection layer that is
+// submitted behind the menu quad. The layer works on every OpenXR runtime and
+// costs one texture sample per pixel of each eye. The picture is world-locked
+// to the head's yaw when it appears and rotates through the folder every
+// [openxr] loading_background_seconds, starting from a random file.
+namespace loading_background {
+
+struct DecodedImage {
+    std::vector<uint8_t> bgra;
+    uint32_t width{};
+    uint32_t height{};
+    bool stereo_tb{};
+    size_t index{};
+};
+
+struct GpuImage {
+    ID3D12Resource* texture{};
+    uint32_t width{};
+    uint32_t height{};
+    bool stereo_tb{};
+    size_t index{};
+};
+
+struct PendingRelease {
+    ID3D12Resource* resource{};
+    uint64_t fence{};
+};
+
+std::mutex g_decode_mutex;
+std::unique_ptr<DecodedImage> g_decoded;
+std::atomic<bool> g_decode_busy{};
+std::atomic<uint64_t> g_decode_generation{};
+
+std::vector<std::wstring> g_files;
+bool g_files_scanned{};
+size_t g_current_index{};
+bool g_have_index{};
+
+GpuImage g_front{};
+GpuImage g_back{};
+std::vector<PendingRelease> g_releases;
+bool g_back_requested{};
+uint64_t g_switch_at_ms{};
+uint64_t g_fade_start_ms{};
+bool g_fading{};
+
+XrSwapchain g_swapchain{XR_NULL_HANDLE};
+uint32_t g_width{};
+uint32_t g_height{};
+DXGI_FORMAT g_format{DXGI_FORMAT_UNKNOWN};
+std::vector<XrSwapchainImageD3D12KHR> g_images;
+ID3D12DescriptorHeap* g_rtv_heap{};
+ID3D12DescriptorHeap* g_srv_heap{};
+UINT g_rtv_increment{};
+UINT g_srv_increment{};
+ID3D12RootSignature* g_root_signature{};
+ID3D12PipelineState* g_pipeline{};
+bool g_init_failed{};
+bool g_initialized{};
+
+bool g_active{};
+bool g_anchor_valid{};
+XrQuaternionf g_anchor{0.0f, 0.0f, 0.0f, 1.0f};
+bool g_acquired{};
+uint32_t g_image_index{};
+bool g_recorded{};
+std::array<XrCompositionLayerProjectionView, 2> g_views{{
+    {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW},
+    {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW}}};
+
+int g_loading_object_state{-1};
+bool g_loading_object_trusted{};
+
+constexpr uint64_t kFadeMs = 1500;
+
+std::wstring folder() {
+    wchar_t path[MAX_PATH]{};
+    const DWORD length = GetModuleFileNameW(
+        nullptr, path, static_cast<DWORD>(std::size(path)));
+    if (length == 0 || length >= std::size(path)) {
+        return {};
+    }
+    wchar_t* slash = wcsrchr(path, L'\\');
+    if (slash == nullptr) {
+        return {};
+    }
+    slash[1] = L'\0';
+    std::wstring result = path;
+    const std::string& configured = g_config.loading_background_folder;
+    result.append(configured.begin(), configured.end());
+    if (!result.empty() && result.back() != L'\\' && result.back() != L'/') {
+        result.push_back(L'\\');
+    }
+    return result;
+}
+
+void scan_files() {
+    g_files_scanned = true;
+    g_files.clear();
+    const std::wstring directory = folder();
+    if (directory.empty()) {
+        return;
+    }
+    for (const wchar_t* pattern : {L"*.jpg", L"*.jpeg", L"*.png"}) {
+        WIN32_FIND_DATAW data{};
+        HANDLE find = FindFirstFileW((directory + pattern).c_str(), &data);
+        if (find == INVALID_HANDLE_VALUE) {
+            continue;
+        }
+        do {
+            if ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+                g_files.push_back(directory + data.cFileName);
+            }
+        } while (FindNextFileW(find, &data));
+        FindClose(find);
+    }
+    std::sort(g_files.begin(), g_files.end());
+    g_files.erase(std::unique(g_files.begin(), g_files.end()), g_files.end());
+    log_line("Loading background: %zu image(s) in %ls",
+        g_files.size(), directory.c_str());
+}
+
+bool name_says_top_bottom(const std::wstring& path) {
+    std::wstring name = path.substr(path.find_last_of(L"\\/") + 1);
+    for (auto& character : name) {
+        character = static_cast<wchar_t>(towlower(character));
+    }
+    return name.find(L"_tb") != std::wstring::npos ||
+        name.find(L"-tb") != std::wstring::npos ||
+        name.find(L".tb.") != std::wstring::npos;
+}
+
+// Halves both dimensions with an exact 2x2 average (alias-free) and then
+// resamples bilinearly to the final width, so a large camera JPG keeps no
+// moire after the downscale.
+void downscale(DecodedImage& image, uint32_t max_width) {
+    while (image.width > max_width * 2 && image.height >= 2) {
+        const uint32_t width = image.width / 2;
+        const uint32_t height = image.height / 2;
+        std::vector<uint8_t> out(static_cast<size_t>(width) * height * 4);
+        for (uint32_t y = 0; y < height; ++y) {
+            const uint8_t* row0 = image.bgra.data() +
+                static_cast<size_t>(y * 2) * image.width * 4;
+            const uint8_t* row1 = row0 + static_cast<size_t>(image.width) * 4;
+            uint8_t* target = out.data() + static_cast<size_t>(y) * width * 4;
+            for (uint32_t x = 0; x < width; ++x) {
+                for (uint32_t c = 0; c < 4; ++c) {
+                    const uint32_t sum = row0[x * 8 + c] + row0[x * 8 + 4 + c] +
+                        row1[x * 8 + c] + row1[x * 8 + 4 + c];
+                    target[x * 4 + c] = static_cast<uint8_t>((sum + 2) / 4);
+                }
+            }
+        }
+        image.bgra = std::move(out);
+        image.width = width;
+        image.height = height;
+    }
+    if (image.width <= max_width) {
+        return;
+    }
+    const uint32_t width = max_width;
+    const uint32_t height = std::max<uint32_t>(1,
+        static_cast<uint32_t>(static_cast<uint64_t>(image.height) * width /
+            image.width));
+    std::vector<uint8_t> out(static_cast<size_t>(width) * height * 4);
+    const float sx = static_cast<float>(image.width) / width;
+    const float sy = static_cast<float>(image.height) / height;
+    for (uint32_t y = 0; y < height; ++y) {
+        const float fy = std::max(0.0f, (y + 0.5f) * sy - 0.5f);
+        const uint32_t y0 = std::min(static_cast<uint32_t>(fy), image.height - 1);
+        const uint32_t y1 = std::min(y0 + 1, image.height - 1);
+        const float wy = fy - y0;
+        for (uint32_t x = 0; x < width; ++x) {
+            const float fx = std::max(0.0f, (x + 0.5f) * sx - 0.5f);
+            const uint32_t x0 = std::min(static_cast<uint32_t>(fx), image.width - 1);
+            const uint32_t x1 = (x0 + 1) % image.width;
+            const float wx = fx - x0;
+            for (uint32_t c = 0; c < 4; ++c) {
+                auto at = [&](uint32_t px, uint32_t py) {
+                    return static_cast<float>(image.bgra[
+                        (static_cast<size_t>(py) * image.width + px) * 4 + c]);
+                };
+                const float top = at(x0, y0) + (at(x1, y0) - at(x0, y0)) * wx;
+                const float bottom = at(x0, y1) + (at(x1, y1) - at(x0, y1)) * wx;
+                out[(static_cast<size_t>(y) * width + x) * 4 + c] =
+                    static_cast<uint8_t>(std::clamp(
+                        top + (bottom - top) * wy + 0.5f, 0.0f, 255.0f));
+            }
+        }
+    }
+    image.bgra = std::move(out);
+    image.width = width;
+    image.height = height;
+}
+
+bool decode_file(const std::wstring& path, uint32_t max_width,
+    DecodedImage& image) {
+    const HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    IWICImagingFactory* factory{};
+    IWICBitmapDecoder* decoder{};
+    IWICBitmapFrameDecode* frame{};
+    IWICFormatConverter* converter{};
+    UINT width{};
+    UINT height{};
+    bool ok = SUCCEEDED(CoCreateInstance(CLSID_WICImagingFactory, nullptr,
+                  CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory))) &&
+        SUCCEEDED(factory->CreateDecoderFromFilename(path.c_str(), nullptr,
+            GENERIC_READ, WICDecodeMetadataCacheOnDemand, &decoder)) &&
+        SUCCEEDED(decoder->GetFrame(0, &frame)) &&
+        SUCCEEDED(frame->GetSize(&width, &height)) &&
+        width >= 16 && height >= 16 && width <= 32768 && height <= 32768 &&
+        SUCCEEDED(factory->CreateFormatConverter(&converter)) &&
+        SUCCEEDED(converter->Initialize(frame, GUID_WICPixelFormat32bppBGRA,
+            WICBitmapDitherTypeNone, nullptr, 0.0,
+            WICBitmapPaletteTypeCustom));
+    if (ok) {
+        image.width = width;
+        image.height = height;
+        image.bgra.resize(static_cast<size_t>(width) * height * 4);
+        ok = SUCCEEDED(converter->CopyPixels(nullptr, width * 4,
+            static_cast<UINT>(image.bgra.size()), image.bgra.data()));
+    }
+    if (converter != nullptr) converter->Release();
+    if (frame != nullptr) frame->Release();
+    if (decoder != nullptr) decoder->Release();
+    if (factory != nullptr) factory->Release();
+    if (SUCCEEDED(co)) {
+        CoUninitialize();
+    }
+    if (!ok) {
+        return false;
+    }
+    // Top-bottom stereo: about square (two 2:1 halves) or named *_TB*.
+    image.stereo_tb = name_says_top_bottom(path) ||
+        image.height * 10 >= image.width * 8;
+    downscale(image, max_width);
+    for (size_t pixel = 0; pixel < image.bgra.size(); pixel += 4) {
+        image.bgra[pixel + 3] = 255;
+    }
+    return true;
+}
+
+void request_decode(size_t index) {
+    if (g_files.empty() || g_decode_busy.exchange(true)) {
+        return;
+    }
+    const std::wstring path = g_files[index % g_files.size()];
+    const uint32_t max_width = static_cast<uint32_t>(
+        std::clamp(g_config.loading_background_max_width, 1024, 16384));
+    const uint64_t generation = g_decode_generation.load();
+    std::thread([path, max_width, index, generation]() {
+        auto image = std::make_unique<DecodedImage>();
+        image->index = index;
+        const bool ok = decode_file(path, max_width, *image);
+        if (ok && generation == g_decode_generation.load()) {
+            std::scoped_lock lock{g_decode_mutex};
+            g_decoded = std::move(image);
+        }
+        log_line("Loading background decode %ls ok=%d", path.c_str(),
+            ok ? 1 : 0);
+        g_decode_busy.store(false);
+    }).detach();
+}
+
+void defer_release(ID3D12Resource* resource) {
+    if (resource != nullptr) {
+        g_releases.push_back({resource, g_xr_fence_value + 1});
+    }
+}
+
+void collect_releases() {
+    if (g_xr_fence == nullptr) {
+        return;
+    }
+    const uint64_t completed = g_xr_fence->GetCompletedValue();
+    auto it = std::remove_if(g_releases.begin(), g_releases.end(),
+        [completed](const PendingRelease& entry) {
+            if (entry.fence > completed) {
+                return false;
+            }
+            entry.resource->Release();
+            return true;
+        });
+    g_releases.erase(it, g_releases.end());
+}
+
+void release_image(GpuImage& image) {
+    defer_release(image.texture);
+    image = {};
+}
+
+bool initialize(DXGI_FORMAT format, uint32_t eye_width, uint32_t eye_height) {
+    if (g_initialized) {
+        return true;
+    }
+    if (g_init_failed || g_d3d12_device == nullptr || !initialize_dxc() ||
+        eye_width == 0 || eye_height == 0) {
+        return false;
+    }
+    g_init_failed = true;
+    const uint32_t width = std::min<uint32_t>(eye_width,
+        static_cast<uint32_t>(std::clamp(
+            g_config.loading_background_eye_width, 512, 4096)));
+    const uint32_t height = std::max<uint32_t>(1, static_cast<uint32_t>(
+        static_cast<uint64_t>(eye_height) * width / eye_width));
+    XrSwapchainCreateInfo info{XR_TYPE_SWAPCHAIN_CREATE_INFO};
+    info.usageFlags = XR_SWAPCHAIN_USAGE_SAMPLED_BIT |
+        XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
+    info.format = format;
+    info.sampleCount = 1;
+    info.width = width;
+    info.height = height;
+    info.faceCount = 1;
+    info.arraySize = 2;
+    info.mipCount = 1;
+    XrResult result = pfn_xrCreateSwapchain(g_xr_session, &info, &g_swapchain);
+    if (XR_FAILED(result)) {
+        log_line("Loading background swapchain failed result=%s (%d)",
+            xr_result_name(result), result);
+        return false;
+    }
+    uint32_t count{};
+    result = pfn_xrEnumerateSwapchainImages(g_swapchain, 0, &count, nullptr);
+    if (XR_FAILED(result) || count == 0) {
+        return false;
+    }
+    g_images.assign(count, {XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR});
+    result = pfn_xrEnumerateSwapchainImages(g_swapchain, count, &count,
+        reinterpret_cast<XrSwapchainImageBaseHeader*>(g_images.data()));
+    if (XR_FAILED(result)) {
+        return false;
+    }
+    D3D12_DESCRIPTOR_HEAP_DESC rtv_heap{};
+    rtv_heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+    rtv_heap.NumDescriptors = count * 2;
+    D3D12_DESCRIPTOR_HEAP_DESC srv_heap{};
+    srv_heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    srv_heap.NumDescriptors = 2;
+    srv_heap.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    if (FAILED(g_d3d12_device->CreateDescriptorHeap(&rtv_heap,
+            IID_PPV_ARGS(&g_rtv_heap))) ||
+        FAILED(g_d3d12_device->CreateDescriptorHeap(&srv_heap,
+            IID_PPV_ARGS(&g_srv_heap)))) {
+        return false;
+    }
+    g_rtv_increment = g_d3d12_device->GetDescriptorHandleIncrementSize(
+        D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    g_srv_increment = g_d3d12_device->GetDescriptorHandleIncrementSize(
+        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    auto rtv = g_rtv_heap->GetCPUDescriptorHandleForHeapStart();
+    for (uint32_t image = 0; image < count; ++image) {
+        for (uint32_t eye = 0; eye < 2; ++eye) {
+            D3D12_RENDER_TARGET_VIEW_DESC desc{};
+            desc.Format = format;
+            desc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
+            desc.Texture2DArray.FirstArraySlice = eye;
+            desc.Texture2DArray.ArraySize = 1;
+            g_d3d12_device->CreateRenderTargetView(
+                g_images[image].texture, &desc, rtv);
+            rtv.ptr += g_rtv_increment;
+        }
+    }
+
+    static constexpr char kShader[] = R"(
+Texture2D<float4> image_a : register(t0);
+Texture2D<float4> image_b : register(t1);
+SamplerState image_sampler : register(s0);
+cbuffer Background : register(b0) {
+    float4 row0;      // eye-to-picture rotation row 0, w = crossfade 0..1
+    float4 row1;      // row 1, w = picture A is top-bottom stereo
+    float4 row2;      // row 2, w = picture B is top-bottom stereo
+    float4 tangents;  // left, right, up, down
+    float4 eye_info;  // x = eye (0 left, 1 right)
+};
+struct VertexOutput {
+    float4 position : SV_Position;
+    float2 uv : TEXCOORD0;
+};
+VertexOutput vs_main(uint vertex_id : SV_VertexID) {
+    VertexOutput output;
+    float2 clip = float2(vertex_id == 2 ? 3.0 : -1.0,
+                         vertex_id == 1 ? 3.0 : -1.0);
+    output.position = float4(clip, 0.0, 1.0);
+    output.uv = float2(clip.x * 0.5 + 0.5, 0.5 - clip.y * 0.5);
+    return output;
+}
+float2 equirect_uv(float3 direction, float stereo_tb) {
+    const float pi = 3.14159265;
+    float longitude = atan2(direction.x, -direction.z);
+    float latitude = asin(clamp(direction.y, -1.0, 1.0));
+    float2 uv = float2(0.5 + longitude / (2.0 * pi), 0.5 - latitude / pi);
+    if (stereo_tb > 0.5) {
+        uv.y = uv.y * 0.5 + (eye_info.x > 0.5 ? 0.5 : 0.0);
+    }
+    return uv;
+}
+float4 ps_main(VertexOutput input) : SV_Target0 {
+    float3 eye_direction = normalize(float3(
+        lerp(tangents.x, tangents.y, input.uv.x),
+        lerp(tangents.z, tangents.w, input.uv.y), -1.0));
+    float3 direction = float3(dot(row0.xyz, eye_direction),
+        dot(row1.xyz, eye_direction), dot(row2.xyz, eye_direction));
+    float4 a = image_a.SampleLevel(image_sampler, equirect_uv(direction, row1.w), 0.0);
+    float4 b = image_b.SampleLevel(image_sampler, equirect_uv(direction, row2.w), 0.0);
+    return float4(lerp(a.rgb, b.rgb, saturate(row0.w)), 1.0);
+}
+)";
+    auto compile = [](const wchar_t* entry, const wchar_t* target) -> IDxcBlob* {
+        DxcBuffer source{kShader, sizeof(kShader) - 1, DXC_CP_UTF8};
+        LPCWSTR arguments[] = {L"-E", entry, L"-T", target, L"-O3"};
+        IDxcResult* result{};
+        if (FAILED(g_dxc_compiler->Compile(&source, arguments,
+                static_cast<UINT32>(std::size(arguments)), nullptr,
+                IID_PPV_ARGS(&result))) || result == nullptr) {
+            return nullptr;
+        }
+        HRESULT status{};
+        result->GetStatus(&status);
+        IDxcBlob* shader{};
+        if (FAILED(status) || FAILED(result->GetOutput(
+                DXC_OUT_OBJECT, IID_PPV_ARGS(&shader), nullptr))) {
+            IDxcBlobUtf8* errors{};
+            result->GetOutput(DXC_OUT_ERRORS, IID_PPV_ARGS(&errors), nullptr);
+            log_line("Loading background shader compile failed: %s",
+                errors != nullptr ? errors->GetStringPointer() : "unknown");
+            if (errors != nullptr) errors->Release();
+            shader = nullptr;
+        }
+        result->Release();
+        return shader;
+    };
+    IDxcBlob* vertex_shader = compile(L"vs_main", L"vs_6_0");
+    IDxcBlob* pixel_shader = compile(L"ps_main", L"ps_6_0");
+    if (vertex_shader == nullptr || pixel_shader == nullptr) {
+        if (vertex_shader != nullptr) vertex_shader->Release();
+        if (pixel_shader != nullptr) pixel_shader->Release();
+        return false;
+    }
+    D3D12_DESCRIPTOR_RANGE range{};
+    range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    range.NumDescriptors = 2;
+    D3D12_ROOT_PARAMETER parameters[2]{};
+    parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    parameters[0].DescriptorTable = {1, &range};
+    parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    parameters[1].Constants.ShaderRegister = 0;
+    parameters[1].Constants.Num32BitValues = 20;
+    parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    D3D12_STATIC_SAMPLER_DESC sampler{};
+    sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+    sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sampler.MaxLOD = D3D12_FLOAT32_MAX;
+    sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    D3D12_ROOT_SIGNATURE_DESC root{};
+    root.NumParameters = 2;
+    root.pParameters = parameters;
+    root.NumStaticSamplers = 1;
+    root.pStaticSamplers = &sampler;
+    ID3DBlob* serialized{};
+    ID3DBlob* errors{};
+    const HRESULT serialize = D3D12SerializeRootSignature(
+        &root, D3D_ROOT_SIGNATURE_VERSION_1, &serialized, &errors);
+    const bool root_ok = SUCCEEDED(serialize) && serialized != nullptr &&
+        SUCCEEDED(g_d3d12_device->CreateRootSignature(0,
+            serialized->GetBufferPointer(), serialized->GetBufferSize(),
+            IID_PPV_ARGS(&g_root_signature)));
+    if (errors != nullptr) errors->Release();
+    if (serialized != nullptr) serialized->Release();
+    if (!root_ok) {
+        vertex_shader->Release();
+        pixel_shader->Release();
+        return false;
+    }
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pipeline{};
+    pipeline.pRootSignature = g_root_signature;
+    pipeline.VS = {vertex_shader->GetBufferPointer(), vertex_shader->GetBufferSize()};
+    pipeline.PS = {pixel_shader->GetBufferPointer(), pixel_shader->GetBufferSize()};
+    pipeline.BlendState.RenderTarget[0].RenderTargetWriteMask =
+        D3D12_COLOR_WRITE_ENABLE_ALL;
+    pipeline.SampleMask = UINT_MAX;
+    pipeline.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pipeline.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pipeline.RasterizerState.DepthClipEnable = TRUE;
+    pipeline.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pipeline.NumRenderTargets = 1;
+    pipeline.RTVFormats[0] = format;
+    pipeline.SampleDesc.Count = 1;
+    const HRESULT pipeline_hr = g_d3d12_device->CreateGraphicsPipelineState(
+        &pipeline, IID_PPV_ARGS(&g_pipeline));
+    vertex_shader->Release();
+    pixel_shader->Release();
+    if (FAILED(pipeline_hr)) {
+        log_line("Loading background pipeline failed hr=0x%08X",
+            static_cast<unsigned>(pipeline_hr));
+        return false;
+    }
+    g_width = width;
+    g_height = height;
+    g_format = format;
+    g_init_failed = false;
+    g_initialized = true;
+    log_line("Loading background ready swapchain=%ux%u x2 images=%u format=%u",
+        width, height, count, static_cast<unsigned>(format));
+    return true;
+}
+
+// Creates the GPU texture for a decoded picture and records its upload on the
+// XR command list. The upload heap is released once this frame's fence passes.
+bool upload(const DecodedImage& image, GpuImage& target) {
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = image.width;
+    desc.Height = image.height;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+    desc.SampleDesc.Count = 1;
+    D3D12_HEAP_PROPERTIES default_heap{};
+    default_heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    ID3D12Resource* texture{};
+    if (FAILED(g_d3d12_device->CreateCommittedResource(&default_heap,
+            D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST,
+            nullptr, IID_PPV_ARGS(&texture)))) {
+        return false;
+    }
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+    UINT64 total{};
+    g_d3d12_device->GetCopyableFootprints(&desc, 0, 1, 0, &footprint,
+        nullptr, nullptr, &total);
+    D3D12_HEAP_PROPERTIES upload_heap{};
+    upload_heap.Type = D3D12_HEAP_TYPE_UPLOAD;
+    D3D12_RESOURCE_DESC buffer{};
+    buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    buffer.Width = total;
+    buffer.Height = 1;
+    buffer.DepthOrArraySize = 1;
+    buffer.MipLevels = 1;
+    buffer.SampleDesc.Count = 1;
+    buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    ID3D12Resource* staging{};
+    uint8_t* mapped{};
+    if (FAILED(g_d3d12_device->CreateCommittedResource(&upload_heap,
+            D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_GENERIC_READ,
+            nullptr, IID_PPV_ARGS(&staging))) ||
+        FAILED(staging->Map(0, nullptr, reinterpret_cast<void**>(&mapped)))) {
+        if (staging != nullptr) staging->Release();
+        texture->Release();
+        return false;
+    }
+    for (uint32_t row = 0; row < image.height; ++row) {
+        std::memcpy(mapped + footprint.Offset +
+                static_cast<size_t>(row) * footprint.Footprint.RowPitch,
+            image.bgra.data() + static_cast<size_t>(row) * image.width * 4,
+            static_cast<size_t>(image.width) * 4);
+    }
+    staging->Unmap(0, nullptr);
+    D3D12_TEXTURE_COPY_LOCATION destination{};
+    destination.pResource = texture;
+    destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    D3D12_TEXTURE_COPY_LOCATION source{};
+    source.pResource = staging;
+    source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    source.PlacedFootprint = footprint;
+    g_xr_command_list->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = texture;
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    g_xr_command_list->ResourceBarrier(1, &barrier);
+    defer_release(staging);
+    target.texture = texture;
+    target.width = image.width;
+    target.height = image.height;
+    target.stereo_tb = image.stereo_tb;
+    target.index = image.index;
+    return true;
+}
+
+// A plain pointer read in its own function: no C++ objects may live in a
+// frame that uses __try. -1 = unknown, 0 = no loading screen, 1 = present.
+int read_loading_object_state(void* game) {
+    if (game == nullptr) {
+        return -1;
+    }
+    __try {
+        return *reinterpret_cast<void**>(
+            static_cast<uint8_t*>(game) + 0x198) != nullptr ? 1 : 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return -1;
+    }
+}
+
+// [FEATURE:LOADING-BACKGROUND 2/6] When is the picture shown? Only behind a
+// fullscreen panel (menu quad) and only while the game world is not being
+// rendered for the headset:
+//  - the loading/recap video is playing;
+//  - before the first gameplay camera of the session (the startup main menu
+//    and the first loading screen, which the mod cannot tell apart yet);
+//  - REDengine's loading-screen object (game +0x198) exists, once that signal
+//    has been seen switching (the game object is known after the first
+//    script query of IsLoadingScreenVideoPlaying);
+//  - optionally around in-game menus while the world camera is stale.
+bool context_active(bool fullscreen_menu, bool loading_video,
+    uint64_t current_present, uint64_t last_hmd_camera) {
+    const int object_state = read_loading_object_state(
+        g_engine_loading_screen_video_game.load(std::memory_order_acquire));
+    if (object_state != g_loading_object_state) {
+        if (g_loading_object_state == 0 && object_state == 1 &&
+            !g_loading_object_trusted) {
+            g_loading_object_trusted = true;
+        }
+        log_line("Loading background loading-screen object state %d -> %d "
+            "present=%llu trusted=%d", g_loading_object_state, object_state,
+            static_cast<unsigned long long>(current_present),
+            g_loading_object_trusted ? 1 : 0);
+        g_loading_object_state = object_state;
+    }
+    if (!g_config.loading_background || !fullscreen_menu) {
+        return false;
+    }
+    if (loading_video) {
+        return true;
+    }
+    if (last_hmd_camera == UINT64_MAX) {
+        return g_config.loading_background_frontend;
+    }
+    if (g_loading_object_trusted && object_state == 1) {
+        return true;
+    }
+    const bool world_stale = current_present < last_hmd_camera ||
+        current_present - last_hmd_camera > 45;
+    return g_config.loading_background_in_game_menus && world_stale;
+}
+
+XrQuaternionf yaw_only(const XrQuaternionf& orientation) {
+    const float length = sqrtf(orientation.y * orientation.y +
+        orientation.w * orientation.w);
+    return length > 0.000001f
+        ? XrQuaternionf{0.0f, orientation.y / length, 0.0f, orientation.w / length}
+        : XrQuaternionf{0.0f, 0.0f, 0.0f, 1.0f};
+}
+
+XrQuaternionf axis_angle(float x, float y, float z, float degrees) {
+    const float half = degrees * 0.00872664626f;
+    const float s = sinf(half);
+    return {x * s, y * s, z * s, cosf(half)};
+}
+
+void begin_frame(bool active, uint64_t now_ms) {
+    g_recorded = false;
+    collect_releases();
+    if (active == g_active) {
+        return;
+    }
+    g_active = active;
+    log_line("Loading background %s", active ? "shown" : "hidden");
+    if (active) {
+        if (!g_files_scanned) {
+            scan_files();
+        }
+        if (!g_files.empty()) {
+            if (!g_have_index) {
+                g_current_index = static_cast<size_t>(
+                    (GetTickCount64() ^ (__rdtsc() >> 7)) % g_files.size());
+                g_have_index = true;
+            }
+            if (g_front.texture == nullptr) {
+                request_decode(g_current_index);
+            }
+        }
+        g_switch_at_ms = now_ms + static_cast<uint64_t>(std::clamp(
+            g_config.loading_background_seconds, 5.0f, 3600.0f) * 1000.0f);
+        g_anchor_valid = false;
+        g_fading = false;
+        g_back_requested = false;
+    } else {
+        // Keep GPU memory bounded: nothing stays resident after loading.
+        // The next session starts with the following picture.
+        if (g_front.texture != nullptr && !g_files.empty()) {
+            g_current_index = (g_front.index + 1) % g_files.size();
+        }
+        ++g_decode_generation;
+        {
+            std::scoped_lock lock{g_decode_mutex};
+            g_decoded.reset();
+        }
+        release_image(g_front);
+        release_image(g_back);
+        g_fading = false;
+        g_back_requested = false;
+    }
+}
+
+}  // namespace loading_background
+
+// [FEATURE:LOADING-BACKGROUND 3/6] Acquire, upload and draw. Runs inside the
+// open XR command list of a menu frame; the image is released after the
+// submission (release_loading_background_image) and the layer is placed
+// behind the menu quad in xrEndFrame.
+bool record_loading_background(const XrView* views, uint64_t now_ms) {
+    namespace lb = loading_background;
+    lb::g_recorded = false;
+    lb::g_acquired = false;
+    if (!lb::g_active || views == nullptr || g_xr_command_list == nullptr) {
+        return false;
+    }
+    const auto& eye_swapchain = g_xr_eye_swapchains[0];
+    if (!lb::initialize(eye_swapchain.format, eye_swapchain.width,
+            eye_swapchain.height)) {
+        return false;
+    }
+    // Upload a finished decode into the free slot.
+    std::unique_ptr<lb::DecodedImage> decoded;
+    {
+        std::scoped_lock lock{lb::g_decode_mutex};
+        decoded = std::move(lb::g_decoded);
+    }
+    if (decoded != nullptr) {
+        lb::GpuImage& slot = lb::g_front.texture == nullptr ? lb::g_front : lb::g_back;
+        if (slot.texture == nullptr && !lb::upload(*decoded, slot)) {
+            log_line("Loading background upload failed %ux%u",
+                decoded->width, decoded->height);
+        }
+    }
+    if (lb::g_front.texture == nullptr) {
+        // A decode dropped while an older one was still running is retried.
+        if (decoded == nullptr && !lb::g_decode_busy.load()) {
+            lb::request_decode(lb::g_current_index);
+        }
+        return false;
+    }
+    // Prefetch the next picture once the current one is shown.
+    if (lb::g_files.size() > 1 && lb::g_back.texture == nullptr &&
+        !lb::g_back_requested && !lb::g_decode_busy.load()) {
+        lb::g_back_requested = true;
+        lb::request_decode((lb::g_front.index + 1) % lb::g_files.size());
+    }
+    if (!lb::g_fading && lb::g_back.texture != nullptr &&
+        now_ms >= lb::g_switch_at_ms) {
+        lb::g_fading = true;
+        lb::g_fade_start_ms = now_ms;
+    }
+    float fade = 0.0f;
+    if (lb::g_fading) {
+        fade = static_cast<float>(now_ms - lb::g_fade_start_ms) /
+            static_cast<float>(lb::kFadeMs);
+        if (fade >= 1.0f) {
+            lb::release_image(lb::g_front);
+            lb::g_front = lb::g_back;
+            lb::g_back = {};
+            lb::g_back_requested = false;
+            lb::g_fading = false;
+            fade = 0.0f;
+            lb::g_switch_at_ms = now_ms + static_cast<uint64_t>(std::clamp(
+                g_config.loading_background_seconds, 5.0f, 3600.0f) * 1000.0f);
+        }
+    }
+
+    if (!lb::g_anchor_valid) {
+        XrQuaternionf head = lb::yaw_only(views[0].pose.orientation);
+        head = w3vr::openxr_eye_geometry::multiply(head,
+            lb::axis_angle(0.0f, 1.0f, 0.0f,
+                g_config.loading_background_yaw_offset));
+        head = w3vr::openxr_eye_geometry::multiply(head,
+            lb::axis_angle(1.0f, 0.0f, 0.0f,
+                g_config.loading_background_pitch));
+        lb::g_anchor = w3vr::openxr_eye_geometry::multiply(head,
+            lb::axis_angle(0.0f, 0.0f, 1.0f,
+                g_config.loading_background_roll));
+        lb::g_anchor_valid = true;
+    }
+
+    XrSwapchainImageAcquireInfo acquire{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+    if (XR_FAILED(pfn_xrAcquireSwapchainImage(lb::g_swapchain, &acquire,
+            &lb::g_image_index))) {
+        return false;
+    }
+    lb::g_acquired = true;
+    XrSwapchainImageWaitInfo wait{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+    wait.timeout = XR_INFINITE_DURATION;
+    if (XR_FAILED(pfn_xrWaitSwapchainImage(lb::g_swapchain, &wait))) {
+        return false;
+    }
+
+    // Descriptors: t0 = current picture, t1 = next (or the current again).
+    const lb::GpuImage& b = lb::g_back.texture != nullptr ? lb::g_back : lb::g_front;
+    auto srv = lb::g_srv_heap->GetCPUDescriptorHandleForHeapStart();
+    for (const lb::GpuImage* image : {static_cast<const lb::GpuImage*>(&lb::g_front), &b}) {
+        D3D12_SHADER_RESOURCE_VIEW_DESC desc{};
+        desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+        desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        desc.Texture2D.MipLevels = 1;
+        g_d3d12_device->CreateShaderResourceView(image->texture, &desc, srv);
+        srv.ptr += lb::g_srv_increment;
+    }
+
+    ID3D12Resource* target = lb::g_images[lb::g_image_index].texture;
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = target;
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    g_xr_command_list->ResourceBarrier(1, &barrier);
+    g_xr_command_list->SetPipelineState(lb::g_pipeline);
+    g_xr_command_list->SetGraphicsRootSignature(lb::g_root_signature);
+    ID3D12DescriptorHeap* heaps[] = {lb::g_srv_heap};
+    g_xr_command_list->SetDescriptorHeaps(1, heaps);
+    g_xr_command_list->SetGraphicsRootDescriptorTable(0,
+        lb::g_srv_heap->GetGPUDescriptorHandleForHeapStart());
+    g_xr_command_list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    const D3D12_VIEWPORT viewport{0.0f, 0.0f, static_cast<float>(lb::g_width),
+        static_cast<float>(lb::g_height), 0.0f, 1.0f};
+    const D3D12_RECT scissor{0, 0, static_cast<LONG>(lb::g_width),
+        static_cast<LONG>(lb::g_height)};
+    g_xr_command_list->RSSetViewports(1, &viewport);
+    g_xr_command_list->RSSetScissorRects(1, &scissor);
+    const XrQuaternionf anchor_inverse{-lb::g_anchor.x, -lb::g_anchor.y,
+        -lb::g_anchor.z, lb::g_anchor.w};
+    for (uint32_t eye = 0; eye < 2; ++eye) {
+        // Eye direction -> picture frame: conj(anchor) * eye orientation.
+        const XrQuaternionf q = w3vr::openxr_eye_geometry::multiply(
+            anchor_inverse, views[eye].pose.orientation);
+        const XrVector3f x_axis = rotate_vector(q, {1.0f, 0.0f, 0.0f});
+        const XrVector3f y_axis = rotate_vector(q, {0.0f, 1.0f, 0.0f});
+        const XrVector3f z_axis = rotate_vector(q, {0.0f, 0.0f, 1.0f});
+        const float constants[20] = {
+            x_axis.x, y_axis.x, z_axis.x, fade,
+            x_axis.y, y_axis.y, z_axis.y, lb::g_front.stereo_tb ? 1.0f : 0.0f,
+            x_axis.z, y_axis.z, z_axis.z, b.stereo_tb ? 1.0f : 0.0f,
+            tanf(views[eye].fov.angleLeft), tanf(views[eye].fov.angleRight),
+            tanf(views[eye].fov.angleUp), tanf(views[eye].fov.angleDown),
+            static_cast<float>(eye), 0.0f, 0.0f, 0.0f};
+        g_xr_command_list->SetGraphicsRoot32BitConstants(1, 20, constants, 0);
+        D3D12_CPU_DESCRIPTOR_HANDLE rtv =
+            lb::g_rtv_heap->GetCPUDescriptorHandleForHeapStart();
+        rtv.ptr += static_cast<SIZE_T>(lb::g_image_index * 2 + eye) *
+            lb::g_rtv_increment;
+        g_xr_command_list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+        g_xr_command_list->DrawInstanced(3, 1, 0, 0);
+
+        auto& view = lb::g_views[eye];
+        view = {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW};
+        view.pose = views[eye].pose;
+        view.fov = views[eye].fov;
+        view.subImage.swapchain = lb::g_swapchain;
+        view.subImage.imageRect.offset = {0, 0};
+        view.subImage.imageRect.extent = {static_cast<int32_t>(lb::g_width),
+            static_cast<int32_t>(lb::g_height)};
+        view.subImage.imageArrayIndex = eye;
+    }
+    std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
+    g_xr_command_list->ResourceBarrier(1, &barrier);
+    lb::g_recorded = true;
+    return true;
+}
+
+// [FEATURE:LOADING-BACKGROUND 4/6] After the XR command list was submitted.
+void release_loading_background_image() {
+    namespace lb = loading_background;
+    if (lb::g_acquired) {
+        XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+        pfn_xrReleaseSwapchainImage(lb::g_swapchain, &release);
+        lb::g_acquired = false;
+    }
+}
+
 void render_openxr_test_frame(
     PoseTimelineEvent trace_reason = PoseTimelineEvent::SubmitOther,
     uint64_t trace_pair_id = 0) {
@@ -62897,6 +63806,11 @@ void render_openxr_test_frame(
         g_engine_menu_state.load() != 0 || loading_video;
     const auto last_hmd_camera = g_engine_hmd_camera_last_present.load(
         std::memory_order_relaxed);
+    // [FEATURE:LOADING-BACKGROUND 5/6] Decide once per XR frame.
+    loading_background::begin_frame(
+        loading_background::context_active(fullscreen_menu, loading_video,
+            current_present, last_hmd_camera),
+        GetTickCount64());
     constexpr uint64_t kCinemaExitCameraAge = 8;
     const uint64_t loading_video_exit_present =
         g_engine_loading_screen_video_exit_present.load(
@@ -66314,6 +67228,14 @@ void render_openxr_test_frame(
             maybe_write_mode3_hud_audit(current_present);
         }
 
+        if (command_list_recording && fullscreen_menu && views_valid) {
+            record_loading_background(
+                isolate_publication_pose && !frame_was_prepared
+                    ? publication_views.data()
+                    : g_xr_views.data(),
+                GetTickCount64());
+        }
+
         bool puredark_afw_bundle_submitted{};
         uint64_t puredark_afw_bundle_fence{};
         if (command_list_recording) {
@@ -66426,6 +67348,7 @@ void render_openxr_test_frame(
                     release_result);
             }
         }
+        release_loading_background_image();
     }
 
     XrCompositionLayerProjection projection_layer{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
@@ -66603,6 +67526,16 @@ void render_openxr_test_frame(
         reinterpret_cast<const XrCompositionLayerBaseHeader*>(&projection_layer)};
     const XrCompositionLayerBaseHeader* menu_layers[] = {
         reinterpret_cast<const XrCompositionLayerBaseHeader*>(&menu_layer)};
+    // [FEATURE:LOADING-BACKGROUND 6/6] The 360-degree picture goes first, so
+    // the runtime composites the menu quad on top of it.
+    XrCompositionLayerProjection background_layer{
+        XR_TYPE_COMPOSITION_LAYER_PROJECTION};
+    background_layer.space = g_xr_space;
+    background_layer.viewCount = 2;
+    background_layer.views = loading_background::g_views.data();
+    const XrCompositionLayerBaseHeader* background_menu_layers[] = {
+        reinterpret_cast<const XrCompositionLayerBaseHeader*>(&background_layer),
+        reinterpret_cast<const XrCompositionLayerBaseHeader*>(&menu_layer)};
 
     XrFrameEndInfo end_info{XR_TYPE_FRAME_END_INFO};
     end_info.displayTime = frame_state.predictedDisplayTime;
@@ -66610,6 +67543,9 @@ void render_openxr_test_frame(
     if (!submitted) {
         end_info.layerCount = 0;
         end_info.layers = nullptr;
+    } else if (fullscreen_menu && loading_background::g_recorded) {
+        end_info.layerCount = 2;
+        end_info.layers = background_menu_layers;
     } else if (fullscreen_menu) {
         end_info.layerCount = 1;
         end_info.layers = menu_layers;
