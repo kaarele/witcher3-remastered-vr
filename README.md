@@ -331,7 +331,7 @@ supports the new build. A one-click installer for both systems is planned.
 
 | Setting | Recommendation |
 |---|---|
-| Anti-aliasing | **DLSS** on an RTX GPU, otherwise **FXAA**. FSR, XeSS and TAA keep one history for both eyes and ghost in Stereo. |
+| Anti-aliasing | **DLSS** on an RTX GPU, otherwise **FXAA**. FSR only with `remaster_fsr_per_eye=1` (experimental). XeSS and TAA keep one history for both eyes and ghost in Stereo. |
 | DLSS mode | **DLAA** looks best; **Quality** is faster. Both were used on the test setup (RTX 3080). There the frame rate was mostly limited by the CPU, so the faster DLSS modes gained little. |
 | Sharpening | Off. It adds shimmer after the headset stream's resampling. |
 | Frame generation, Reflex, ray reconstruction | Off. The mod presents its own eye pairs. The launcher and the Linux tool switch them off. |
@@ -446,9 +446,10 @@ The original mod's keys are documented in [witcher3vr.example.ini](witcher3vr.ex
 |---|---|---|
 | `temporal_backend` | `auto` (the launcher and the Linux tool always write it) | On 5.01: `dlss` = the game's DLSS with a separate history per eye (the game's anti-aliasing must be DLSS too; the setup sets both); `none` = FXAA. |
 | `remaster_sl_wine_bypass` | auto | The game skips its DLSS (Streamline) setup under Wine. The mod removes that check in memory, on the exact 5.01 build only. Auto = on when `temporal_backend=dlss`. `0` = never, `1` = always. No effect on Windows. |
-| `remaster_dlss_per_eye_motion` | `1` | Keep a separate motion-vector camera history for each eye with per-eye DLSS. |
+| `remaster_dlss_per_eye_motion` | `1` | Keep a separate motion-vector camera history for each eye with per-eye DLSS or per-eye FSR. |
 | `dlss_preset` | empty | Experimental. Force one DLSS model preset for both eyes and every quality mode: `K` (the game's choice for DLAA, Quality and Balanced), `J`, or the newer `M` and `L` (sharper and steadier, but heavier). Empty = the game's choice. 5.01 with per-eye DLSS only. |
 | `dlss_mip_bias_offset` | `0` | Experimental. Added to the game's DLSS texture sharpness bias (texture LOD bias), for both eyes. Positive values (`0.5`, `1.0`) calm sparkle and moiré on fine patterns such as clothing and fences, at the cost of a little texture detail; negative values sharpen. Never raised above NVIDIA's limit for the render scale. 5.01 with per-eye DLSS only. |
+| `remaster_fsr_per_eye` | `0` | Experimental, 5.01 Stereo. With the game's anti-aliasing set to FSR: `1` = a separate FSR history for each eye (a second FSR context for the right eye), so FSR no longer blends the eyes. Works with whatever FSR version the game picks (FSR 4 on RDNA4, the older FSR on other GPUs) and costs the VRAM of one more FSR context. The Linux tool sets it with `--aa fsr`. |
 | `remaster_asymmetric_ndc` | `0` | `1` = render each eye with its own off-centre field of view and send the whole image to the headset (sharper). The Linux tool sets `1`. Switches itself off for the session if it keeps failing. |
 | `remaster_asymmetric_ndc_reproject` | `1` | With per-eye projection: correct the game's temporal reprojection for it. |
 | `remaster_asymmetric_ndc_cascade_fix` | `1` | With per-eye projection: `1` fits the sun shadows to each eye's own view; `0` uses the same centred fit for both eyes, so distant shadows match between the eyes. The test setup uses `0`. |
@@ -520,6 +521,7 @@ Feature status on the tested setup:
 | Shared sun shadows (`remaster_shadow_pair_reuse`) | Off (release ini: on) | Played in the headset, no problems reported |
 | Per-pair flicker and local shadows | Off (release ini: on) | Played in the headset, no problems reported |
 | Animation outside the game camera's view (`animated_component_visible`) | On | Tested in the headset |
+| Per-eye FSR (`remaster_fsr_per_eye`) | Off | Experimental, not tested in the game yet |
 | `frame_wait_early`, `pair_rate_divisor` | Off | Experimental, no gain measured |
 
 ## Troubleshooting and known issues
@@ -550,7 +552,8 @@ does this on NVIDIA) and select DLSS as the game's anti-aliasing. Make sure NVAP
 RTX GPU.
 
 **Ghosting or blending between the eyes.** Use DLSS with `temporal_backend=dlss`, or FXAA. The
-game's FSR, XeSS and TAA are not supported in Stereo.
+game's FSR needs `[engine] remaster_fsr_per_eye=1` (experimental); XeSS and TAA are not supported in
+Stereo.
 
 **The HUD is too big or sits at the edges of the view.** Use `hud_size=0.5` with
 `hud_controller_locked=1` (the Linux tool's default), then press `F9` while looking straight ahead.

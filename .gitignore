@@ -3,6 +3,7 @@
 /external/*
 /runtime/
 !/external/README.md
+!/external/fidelityfx-api/
 /.vs/
 *.dll
 *.exe

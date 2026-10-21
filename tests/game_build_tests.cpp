@@ -118,6 +118,12 @@ int main() {
                 addresses::value(Build::NextGen404,
                     addresses::Value::AnimatedComponentVisibilityReturn) == 0x015E186C,
             "4.04 animated-component visibility keeps its original RVAs");
+        require(addresses::rva(Build::Remaster501, Function::FsrUpscaleDispatch) == 0x01C665B0 &&
+                addresses::rva(Build::NextGen404, Function::FsrUpscaleDispatch) == 0 &&
+                addresses::value(Build::Remaster501, addresses::Value::FsrStateContext) == 0x40 &&
+                addresses::value(Build::Remaster501, addresses::Value::FsrStateResetFlag) == 0x26 &&
+                addresses::value(Build::NextGen404, addresses::Value::FsrStateContext) == 0,
+            "per-eye FSR is 5.01 only");
         {
             // The 5.01 call bytes end at the return address and encode the test.
             const uint8_t* call = addresses::kAnimatedComponentFrustumCall501Bytes;

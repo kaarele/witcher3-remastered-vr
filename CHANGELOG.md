@@ -8,6 +8,9 @@ original mod and of the Remastered port this project builds on are in [docs/rele
 
 - Experimental, off by default: interaction prompts and NPC labels at their target's distance
   (`[openxr] world_marker_depth=1`). Not tested in the game yet.
+- Experimental, off by default: FSR in Stereo with a separate FSR history for each eye
+  (`[engine] remaster_fsr_per_eye=1`, Linux tool `configure --aa fsr`). Works with whatever FSR
+  version the game picks (FSR 4 on RDNA4, the older FSR elsewhere). Not tested in the game yet.
 
 ## 0.1.2 (2026-10-20)
 

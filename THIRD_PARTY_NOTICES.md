@@ -19,6 +19,14 @@ The following components are incorporated or adapted under the MIT License:
     `1d2fddbe3d1e8f403f795afc17e7db239a83f6a2`
   - Copyright (c) 2023 emoose
   - License: MIT
+- **AMD FidelityFX SDK API headers** (`external/fidelityfx-api`: `ffx_api.h`,
+  `ffx_api_types.h`, `ffx_upscale.h`, vendored unchanged)
+  - Project: https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK
+  - Pinned revision: `60f4ea81909200d8542eca14dccb2628b763a9a3` (tag `v2.3.0`)
+  - Copyright (C) 2026 Advanced Micro Devices, Inc.
+  - License: MIT (listed as such in the SDK's `Kits/FidelityFX/docs/license.md`)
+  - Only the API declarations are used. The FidelityFX runtime DLLs are the
+    game's own and are neither modified nor distributed.
 - **Microsoft DirectX-Headers**
   - Project: https://github.com/microsoft/DirectX-Headers
   - Pinned revision: `2c305c16da8a4450db8d7f1e7d8d014c8bc665ee`
