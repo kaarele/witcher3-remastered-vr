@@ -1297,8 +1297,9 @@ thread, just before xrWaitFrame/xrEndFrame.
 
   The pointer state is logged ("Loading background loading-screen object state") so a run can
   confirm the signal.
-- Status: built, not run in the game yet. Untested: the loading-screen pointer signal, WIC JPEG
-  decoding under Wine, the second projection layer under WiVRn.
+- Status (0.1.4): headless pass (night job N, 2026-10-22) and tested in the headset by the owner (WiVRn): WIC
+  decoding under Wine works, the second projection layer works under WiVRn, the picture rotates and crossfades.
+  Untested under SteamVR (the two-layer frame is near a known wineopenxr layer-size bug).
 - Tools in `tools/loading-backgrounds/`:
   - `make_test_equirect.py` writes synthetic mono and stereo test pictures.
   - `stitch_views_to_equirect.py` turns a ring of rectilinear captures (8 yaws per eye + up/down)
@@ -1335,10 +1336,9 @@ thread, just before xrWaitFrame/xrEndFrame.
   (`Options see-through fallback ...`).
 - Logs: `Options see-through signal hooked ...`, `Options see-through request=...`, and
   `REDengine menu state ... options_see_through=1`.
-- Status: built, not run yet. Open questions for the first test:
-  - whether the world keeps rendering while the menu has the game fully paused;
-  - how dark the menu's own Flash background makes the world;
-  - whether the menu is readable at HUD size.
+- Status (0.1.4): headless pass and tested in the headset by the owner ("OMG I love the graphics menu"). The world
+  keeps rendering while the pause menu has the game paused; the opaque settings backdrop is replaced by the veil;
+  the menu is readable.
 
 - 2026-10-22 owner follow-up (job P, after the try3 headset test: "I love the graphics menu"):
   - The whole in-game pause menu is see-through now, not only the Graphics/Display pages.
@@ -1383,7 +1383,8 @@ thread, just before xrWaitFrame/xrEndFrame.
   - The loading background rescans the folder on its next appearance.
 - Plans: mono = 8 views at 45 degrees + 6 at +-55 + 3 at +-85 (26 steps, about 15 s);
   stereo_ods = 360/step strips (120 at 3 degrees) + the same pole rings (about 40 s).
-- Status: built, unit-tested, not run in the game yet.
+- Status (0.1.4): headless pass (mono 8192 and stereo_ods; T4b, 2026-10-22) and tested in the headset by the owner
+  (a 10240x10240 3D capture in Novigrad, shipped as the default background). Off by default in the release ini.
 
 
 ### Polish after the first headset test of the 360 features (2026-10-22)

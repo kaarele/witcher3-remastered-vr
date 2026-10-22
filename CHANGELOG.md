@@ -4,6 +4,26 @@ Versions below 1.0 are alpha releases. Downloads are on the
 [Releases page](https://github.com/kaarele/witcher3-remastered-vr/releases). Release notes of the
 original mod and of the Remastered port this project builds on are in [docs/releases](docs/releases/).
 
+## 0.1.4 (2026-10-23)
+
+- **See-through pause menu:** the whole in-game pause menu (main list and all settings pages except
+  HDR calibration) floats over the live stereo world on a soft dark panel with feathered edges, so
+  graphics changes are visible as you make them (`[openxr] options_menu_see_through=1`, veil 0.75,
+  feather 0.15). Inventory, map and the other panels are unchanged.
+- **Main menu and loading screens on a world-locked screen** (3.6 m wide at 2.5 m, raised 5°),
+  fixed where you look when it appears; `F9` re-centres (`menu_world_locked=1`).
+- **360° backgrounds** around that screen instead of a black void, also on the main menu after
+  quitting a game (`loading_background=1`). Mono 2:1 or top-bottom 3D pictures in
+  `bin/x64_dx12/w3vr_backgrounds/`, rotating every 30 s. Ships with one 3D picture captured in the game.
+- **In-game 360° capture** (opt-in, `capture360_enabled=1`): pause menu + `F4` captures a 3D
+  (omnidirectional stereo) 10240x10240 picture of the frozen world, assembled in the mod and added to
+  the rotation; saved with the forward direction 45° left of the screen.
+- **One-click installer:** extract the zip anywhere and open `Install (Linux)` or
+  `Install (Windows)`; `Uninstall` reverts it. Nothing is downloaded. Linux sets the Steam launch
+  options when Steam is closed. The Windows installer has not been run yet.
+- SteamVR preparation (untested): `render_size_from_runtime`, `launch-options --runtime steamvr`.
+- Linux tool: `setup`/`remove` for the installer, Snap Steam, the new keys added by `configure`.
+
 ## 0.1.3 (2026-10-22)
 
 - **DLSS fixed in both eyes.** The eye rendered second (the left one) was jagged and flickered on

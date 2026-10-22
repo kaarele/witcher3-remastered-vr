@@ -72,16 +72,25 @@ near view, F10 the cinema screen, F11 first person.
   so it gains nothing there.)
 - People keep animating when you look at them with your head rather than the game camera, also
   background people beside or behind you.
+- **See-through pause menu.** The whole in-game pause menu (Back / Esc) floats over the live 3D
+  world on a soft dark panel. In the graphics settings you can look around and see every change as
+  you make it. Inventory, map and the other panels keep their black background.
+- **Main menu and loading screens on a big screen in the room**, fixed where you look when it
+  appears, with a 360° 3D picture around it instead of a black void (a Novigrad view captured in the
+  game ships with the mod). `F9` brings the screen back in front of you.
+- **Your own 360° pictures** (opt-in): set `capture360_enabled=1`, open the pause menu where you like
+  the view and press `F4`. Keep still for about 30-40 seconds (the headset stays dark meanwhile).
+  The 3D picture lands in the loading-screen rotation. Tip: turn the camera to face Geralt first; the
+  picture is saved with him to the left of the loading screen.
 - **FSR works in Stereo**, with its own history for each eye. On NVIDIA the game uses its built-in
   FSR 2, which works but costs a lot of performance there, so DLSS is the better choice on NVIDIA.
   AMD owners: please try FSR and report how it runs.
 
 **Coming soon:**
-- SteamVR, on Linux and Windows.
-- Windows in general (the code should work, but nobody has run it yet).
-- An options page for the mod inside the game's own menu.
-- Main menu and loading screens as a screen floating in front of you, with a 3D picture around it
-  while loading instead of black.
+- SteamVR, on Linux and Windows (prepared, not tested yet; see [SteamVR on Linux](#linux-steam--proton)).
+- Windows in general (the code and the installer should work, but nobody has run them yet).
+- More detail close up: some objects and characters switch to their simpler versions too early in VR.
+- A photo-mode button for 360° pictures.
 - A picture for the story recap while a save loads (black in VR for now).
 
 **Not tested:** AMD and Intel GPUs (use FSR or FXAA there; reports very welcome), headsets other than
@@ -90,7 +99,8 @@ Quest 3, the GOG edition, SteamOS / Steam Deck.
 **Known issues:** loading a save looks very slow, but most of the wait is the game's story recap
 video, which stays black in VR. The game itself has usually loaded after 20 to 25 seconds: press
 **Space** on the keyboard or **X** on the gamepad to skip the recap. FSR on NVIDIA costs a lot of
-frames. In busy towns, people a few metres away lose detail quickly (the game's level of detail). In
+frames. In VR some objects and characters switch to their simpler versions (level of detail) quite close
+up, for example round barrels look angular a few metres away. In
 first person (`F11`) the camera sits inside Geralt's head (an experimental fix is in the
 [configuration reference](#configuration-reference)). More in
 [Troubleshooting and known issues](#troubleshooting-and-known-issues).
@@ -478,26 +488,26 @@ The original mod's keys are documented in [witcher3vr.example.ini](witcher3vr.ex
 | `hud_anchor_level` | `1` | The controller-locked HUD keeps only your heading from the recenter, not head pitch or roll. All builds. |
 | `hud_scale_origin` | `visible` | `visible`: `hud_size` shrinks the HUD toward the centre of the visible image. `render`: toward the straight-ahead axis (old behaviour). All builds. |
 | `menu_vertical_center` | `visible` | `visible`: menus and loading screens are centred on the visible image. `forward`: old behaviour. All builds. |
-| `menu_world_locked` | `0` | Experimental. `1`: the main menu, loading screens and the loading video appear as one world-locked screen (like a big TV in front of you) instead of a panel that follows your head. Looking around no longer moves it. Re-anchored with `F9` or when your head moves more than `menu_world_reanchor_distance` (default `0.5` m) from where it was anchored. In-game menus are unchanged. Not tested in the headset yet. |
+| `menu_world_locked` | `0` | Release ini and installer: `1`, tested in the headset. `1`: the main menu, loading screens and the loading video appear as one world-locked screen (like a big TV in front of you) instead of a panel that follows your head. Looking around no longer moves it. Re-anchored with `F9` or when your head moves more than `menu_world_reanchor_distance` (default `0.5` m) from where it was anchored. In-game menus are unchanged. Not tested in the headset yet. |
 | `menu_world_aspect` | `1.7778` | With `menu_world_locked=1`: width/height of the picture on the world screen. The game draws its menus letterboxed; 16:9 cuts the black bars above and below off. `0` = the whole image. |
 | `menu_world_distance`, `menu_world_width` | `2.5`, `3.6` | Distance and width of that screen in metres. |
 | `menu_world_pitch_offset` | `5` | Degrees the world screen is raised above the menus' slightly downward-tilted centre; it keeps facing you. |
 | `menu_world_follow` | `0` | With `menu_world_locked=1`: `1` = lazy follow. When you look more than `menu_world_follow_angle` (default `25`) degrees away from the screen for `menu_world_follow_delay` (`0.8`) seconds, the screen glides back in front of you over `menu_world_follow_time` (`0.6`) seconds. `0` (default) = the screen stays where it was anchored, in front of you; `F9` re-centres it. |
-| `options_menu_see_through` | `0` | Experimental, 5.01. `1`: while the in-game **pause menu** is open (its main list and all its settings pages except the HDR calibration page), the world keeps rendering in stereo behind the menu and the menu is drawn on the HUD plane, so you can look around and graphics changes are visible as you make them. Inventory, map and the other panels are unchanged. Needs the 5.01 state-bridge script mod (it sends the signal) and `menu_state_probe=1`. If the world does not render behind the menu, it falls back to the normal menu panel after about 1.5 s. Not tested in the game yet. |
+| `options_menu_see_through` | `0` | Release ini and installer: `1`, tested in the headset. 5.01. `1`: while the in-game **pause menu** is open (its main list and all its settings pages except the HDR calibration page), the world keeps rendering in stereo behind the menu and the menu is drawn on the HUD plane, so you can look around and graphics changes are visible as you make them. Inventory, map and the other panels are unchanged. Needs the 5.01 state-bridge script mod (it sends the signal) and `menu_state_probe=1`. If the world does not render behind the menu, it falls back to the normal menu panel after about 1.5 s. Not tested in the game yet. |
 | `options_menu_see_through_veil` | `0.75` | With `options_menu_see_through=1`: how dark the veil panel behind the whole pause menu looks, as perceived (0 = none, 1 = black; `0.75` leaves the world about a quarter as bright). It replaces the game's black backdrop, so every pause page looks the same; text and widgets stay solid. |
 | `options_menu_see_through_feather` | `0.15` | The veil fades to fully transparent over this fraction of the HUD's shorter side at its edges, so the menu has no hard border. `0` = hard edge. |
 | `world_marker_exact_projection` | `1` | Project interaction prompts and NPC or door markers exactly through the HUD plane. Needs the controller-locked level HUD (`hud_controller_locked=1`, `hud_anchor_level=1`) in Stereo. `0`: the game's markers. |
 | `hud_centre_split_aim_only` | `1` | Redraw the HUD's centre square (crosshair) about the render centre only while aiming. If the crosshair is off target while aiming, try `0`. |
 | `world_marker_depth` | `0` | Release ini and Linux tool: `1`, tested in the headset. `1`: interaction prompts and NPC labels appear at the person's or object's distance instead of the HUD's. Needs `world_marker_exact_projection=1` and the controller-locked level HUD. Read at startup. |
 | `world_marker_depth_box` | `240,130,70` | With `world_marker_depth=1`: the HUD area moved with each marker, as half width, height above and height below the marker point, in 1920x1080 HUD pixels. Raise it if a long label is split between two depths. |
-| `loading_background` | `0` | Experimental, not tested in the headset yet. `1` = show a 360-degree picture around the loading screen instead of black. Pictures: equirectangular JPG/PNG files in `bin/x64_dx12/w3vr_backgrounds/`, mono (2:1, for example straight from a 360 camera such as a DJI Osmo 360) or top-bottom stereo (1:1, left eye on top, or `_TB` in the name). Starts with a random picture and moves to the next every `loading_background_seconds` (default 30) with a short crossfade. The picture is drawn by the mod into a background layer behind the menu panel; it costs one texture lookup per pixel, about the same as an empty frame. |
+| `loading_background` | `0` | Release ini and installer: `1`, tested in the headset. `1` = show a 360-degree picture around the loading screen instead of black. Pictures: equirectangular JPG/PNG files in `bin/x64_dx12/w3vr_backgrounds/`, mono (2:1, for example straight from a 360 camera such as a DJI Osmo 360) or top-bottom stereo (1:1, left eye on top, or `_TB` in the name). Starts with a random picture and moves to the next every `loading_background_seconds` (default 30) with a short crossfade. The picture is drawn by the mod into a background layer behind the menu panel; it costs one texture lookup per pixel, about the same as an empty frame. |
 | `loading_background_frontend` | `1` | With `loading_background=1`: also on the main menu, both at startup and after quitting a game to the main menu (the 5.01 state-bridge script mod signals the main menu), and on the first loading screen. The world screen (`menu_world_locked=1`) applies there too. |
 | `loading_background_in_game_menus` | `0` | With `loading_background=1`: also around in-game menus while the game world is not being drawn. |
 | `loading_background_seconds` | `30` | Seconds per picture (5-3600). |
 | `loading_background_yaw_offset`, `loading_background_pitch`, `loading_background_roll` | `0` | Degrees. Turn the picture's centre to the left (yaw), or level a tilted camera (pitch, roll). The picture is fixed in the room, facing where you looked when it appeared. |
 | `loading_background_max_width`, `loading_background_eye_width` | `10240`, `2880` | Larger pictures are scaled down to this width when loaded (GPU memory). Per-eye width of the background layer. The picture shown is loaded at full size; the next one is prepared at half size for the crossfade and loaded at full size once it is shown, so only one full-size picture is in GPU memory: a 10240-wide top-bottom picture takes about 420 MB, plus about 105 MB for the next one. Lower the width on cards with little memory. |
 | `loading_background_folder` | `w3vr_backgrounds` | Picture folder, relative to `bin/x64_dx12/`. |
-| `capture360_enabled` | `0` | Experimental. `1` = press `capture360_key` to capture a 360-degree picture of the game world into the loading-background folder (named `w3vr360_<date>_<time>_TB.jpg` or `_mono.jpg`). Best from the see-through pause menu: the world is frozen, so nothing moves between the views. The camera turns by itself for about 30-40 seconds (3D) or 15 seconds (mono) while the headset stays dark; the normal view comes back by itself when the capture ends, and also when it is interrupted (a menu, loading or cutscene appears). The menu and HUD are never in the picture. Not in the 3D world view (full-screen menus, loading) it does nothing. Tip for a portrait: turn the game camera to face Geralt before you capture; `capture360_subject_yaw` then places him left of the loading screen. |
+| `capture360_enabled` | `0` | Opt-in (off in the release ini), tested in the headset. `1` = press `capture360_key` to capture a 360-degree picture of the game world into the loading-background folder (named `w3vr360_<date>_<time>_TB.jpg` or `_mono.jpg`). Best from the see-through pause menu: the world is frozen, so nothing moves between the views. The camera turns by itself for about 30-40 seconds (3D) or 15 seconds (mono) while the headset stays dark; the normal view comes back by itself when the capture ends, and also when it is interrupted (a menu, loading or cutscene appears). The menu and HUD are never in the picture. Not in the 3D world view (full-screen menus, loading) it does nothing. Tip for a portrait: turn the game camera to face Geralt before you capture; `capture360_subject_yaw` then places him left of the loading screen. |
 | `capture360_key` | `F4` | Key that starts a capture (a key name such as `F4`). A file `capture360.now` next to `witcher3.exe` also starts one (for scripted runs). |
 | `capture360_mode` | `stereo_ods` | `stereo_ods` (default) = 3D picture (top-bottom): slit-scan omnidirectional stereo, a strip every `capture360_ods_step` degrees for each eye, mono near the poles. `mono` = one camera centre, seamless (no parallax between views): 8 views around plus 2 rings of 6 and 2 of 3 towards the poles. Views are combined in two bands: fine detail from the most central view (no averaging, sharp seams-free detail), brightness spread smoothly between views (no exposure steps or streaks); bicubic sampling and a mild sharpen keep it crisp. |
 | `capture360_ods_step` | `3` | `stereo_ods`: degrees between strips (1-15). Smaller = cleaner stereo, longer capture. |
@@ -603,6 +613,12 @@ Feature status on the tested setup:
 | DLSS model override (`dlss_preset`) | Game's choice | Not tested yet |
 | First person: recenter on `F11` (`first_person_recenter_on_entry`) | On | Not tested in the headset yet |
 | First person: eye at Geralt's head (`remaster_native_head_provider`) | Off | Not tested yet |
+| World-locked main menu / loading screen (`menu_world_locked`) | Off (release ini: on) | Tested in the headset |
+| 360° loading backgrounds (`loading_background`) | Off (release ini: on) | Tested in the headset |
+| See-through pause menu (`options_menu_see_through`) | Off (release ini: on) | Tested in the headset |
+| In-game 360° capture (`capture360_enabled`, `F4`) | Off | Tested in the headset (3D, 10240x10240) |
+| Runtime render size (`render_size_from_runtime`), SteamVR launch options | Off | Not tested yet |
+| One-click installer (`Install (Linux)` / `Install (Windows)`) | — | Linux tested on test setups; Windows not run yet |
 | `frame_wait_early`, `pair_rate_divisor` | Off | Experimental, no gain measured |
 
 ## Troubleshooting and known issues
