@@ -680,12 +680,14 @@ struct Config {
     // rendering and draw the menu on the HUD plane over the live world instead
     // of the flat menu panel, so changes are visible as they are made.
     bool options_menu_see_through{false};
-    // Opacity of the veil that replaces the pause menu's black backdrop
-    // while see-through is active (0 = invisible, 1 = the game's black), and
-    // the width of the soft fade to fully transparent at the edges of the
-    // HUD plane, as a fraction of its shorter side.
+    // How dark the veil panel behind the see-through pause menu looks (0 =
+    // invisible, 1 = black), as perceived on the display: 0.75 leaves the
+    // world about a quarter as bright. The panel is blended in linear light,
+    // so options_see_through_panel_opacity() converts it. Plus the width of
+    // the soft fade to fully transparent at the edges of the HUD plane, as a
+    // fraction of its shorter side.
     float options_menu_see_through_veil{0.75f};
-    float options_menu_see_through_feather{0.08f};
+    float options_menu_see_through_feather{0.15f};
     float cinema_render_stereo_strength{1.0f};
     int cinema_hud_stereo_shift_px{-72};
     float manual_cinema_hud_scale{1.25f};
@@ -3179,6 +3181,15 @@ bool options_see_through_active() {
     return g_config.options_menu_see_through &&
         g_options_see_through_requested.load(std::memory_order_acquire) &&
         !g_options_see_through_fallback.load(std::memory_order_acquire);
+}
+
+// The veil key is a perceived darkness; the HUD is blended into the sRGB
+// projection target in linear light, so a perceived transmission t needs a
+// linear transmission of t^2.2.
+float options_see_through_panel_opacity() {
+    const float perceived = std::clamp(
+        g_config.options_menu_see_through_veil, 0.0f, 1.0f);
+    return 1.0f - std::pow(1.0f - perceived, 2.2f);
 }
 
 // [FIX:AER-AFW-CINEMA-HUD-RESTORE V1190 1/4] AFW is suspended in normal or
@@ -17316,7 +17327,7 @@ void load_config() {
             read_ini_float("openxr", "options_menu_see_through_veil", 0.75f),
             0.0f, 1.0f);
         g_config.options_menu_see_through_feather = std::clamp(
-            read_ini_float("openxr", "options_menu_see_through_feather", 0.08f),
+            read_ini_float("openxr", "options_menu_see_through_feather", 0.15f),
             0.0f, 0.5f);
         log_line("Config options menu see-through=%d veil=%.2f feather=%.3f",
             g_config.options_menu_see_through ? 1 : 0,
@@ -58032,24 +58043,29 @@ float4 bilinear_premultiplied(float2 position) {
     return lerp(top, bottom, f.y);
 }
 // [FEATURE:OPTIONS-SEE-THROUGH 7/7] Bit 1 of filtered_sampling: the pause
-// menu draws an opaque black backdrop; key it into a veil (bits 8-15 = veil
-// opacity), so the live world shows through while text and widgets stay solid.
-// Bits 16-23: the veil fades to fully transparent over this fraction of the
-// HUD's shorter side at its edges, so the panel has no hard border.
+// menu is drawn over the live world on a dark veil panel that covers the whole
+// HUD plane (bits 8-15 = the panel's linear opacity), so every pause page,
+// including the main list, looks the same. The game's own near-black backdrop
+// is removed in favour of the panel; text and widgets stay solid on top.
+// Bits 16-23: the panel fades to fully transparent over this fraction of the
+// HUD's shorter side at its edges, so it has no hard border.
 float4 options_backdrop_key(float4 c, float2 position, float2 size) {
     if ((filtered_sampling & 2u) == 0u) {
         return c;
     }
-    float veil = float((filtered_sampling >> 8) & 255u) / 255.0;
+    float panel = float((filtered_sampling >> 8) & 255u) / 255.0;
     float feather = float((filtered_sampling >> 16) & 255u) / 255.0 *
         min(size.x, size.y);
     float2 edge = min(position, size - position);
     float edge_distance = min(edge.x, edge.y);
-    veil *= feather > 0.5 ? smoothstep(0.0, feather, edge_distance) : 1.0;
+    panel *= feather > 0.5 ? smoothstep(0.0, feather, edge_distance) : 1.0;
     float level = max(max(c.r, c.g), c.b);
     float keep = saturate((level - 0.002) / 0.02);
-    c.a *= lerp(veil, 1.0, keep);
-    return c;
+    float a = c.a * keep;
+    float out_a = a + panel * (1.0 - a);
+    return out_a > (1.0 / 1024.0)
+        ? float4(c.rgb * (a / out_a), out_a)
+        : float4(0.0, 0.0, 0.0, 0.0);
 }
 float4 ps_main(PixelInput input) : SV_Target0 {
     uint source_width, source_height;
@@ -58141,10 +58157,12 @@ float4 ps_main(PixelInput input) : SV_Target0 {
             }
         }
         sum /= float(taps * taps);
-        return sum.a > (1.0 / 1024.0)
-            ? options_backdrop_key(float4(sum.rgb / sum.a, sum.a),
-                  source_position, source_size)
-            : float4(0.0, 0.0, 0.0, 0.0);
+        // Transparent HUD texels still go through the key: while the pause
+        // menu is see-through they carry the veil panel.
+        return options_backdrop_key(sum.a > (1.0 / 1024.0)
+                ? float4(sum.rgb / sum.a, sum.a)
+                : float4(0.0, 0.0, 0.0, 0.0),
+            source_position, source_size);
     }
     // [FIX:MODE3-HUD-SRGB 1/1] REDengine stores display-encoded HUD RGB in an
     // UNORM t1 view. Decode it before blending into the OpenXR sRGB projection
@@ -59012,9 +59030,8 @@ bool composite_mode3_hud_into_projection_image(
             0,
             (g_config.hud_filtered_sampling ? 1u : 0u) |
                 (options_see_through_active()
-                    ? 2u | (static_cast<uint32_t>(std::lround(std::clamp(
-                          g_config.options_menu_see_through_veil, 0.0f, 1.0f) *
-                          255.0f)) << 8) |
+                    ? 2u | (static_cast<uint32_t>(std::lround(
+                          options_see_through_panel_opacity() * 255.0f)) << 8) |
                       (static_cast<uint32_t>(std::lround(std::clamp(
                           g_config.options_menu_see_through_feather, 0.0f,
                           1.0f) * 255.0f)) << 16)

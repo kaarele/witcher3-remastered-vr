@@ -1348,5 +1348,7 @@ thread, just before xrWaitFrame/xrEndFrame.
     - `OnOptionPanelNavigateBack` and `OnNavigatedBack` keep it on after returning to the main list (off while a `refreshViewport` reopen is pending);
     - `OnClosingMenu` signals off.
   - Inventory, map and the other `CR4CommonMenu` panels are separate menus and unchanged.
-  - The veil is darker by default (`options_menu_see_through_veil=0.75`). It fades to fully transparent at the HUD edges over `options_menu_see_through_feather=0.08` of the shorter side (smoothstep, bits 16-23 of the sampling flags). Text and widgets stay solid.
-  - Open: whether the main pause list's backdrop is pure black, which the veil key needs. A dark textured backdrop would stay opaque.
+  - The veil is a panel over the whole HUD plane, drawn under the menu on every pause page (transparent HUD texels included), and the game's own near-black backdrop is removed in its favour.
+    - `options_menu_see_through_veil=0.75` is a perceived darkness. The panel is blended in linear light, so the linear opacity is 1 - (1 - v)^2.2.
+    - A first try with a linear 0.75 measured only ~45% darker on screen, and the main pause list had no veil at all: its band is the game's own semi-transparent strip.
+  - It fades to fully transparent at the HUD edges over `options_menu_see_through_feather=0.15` of the shorter side (smoothstep, bits 16-23 of the sampling flags).
