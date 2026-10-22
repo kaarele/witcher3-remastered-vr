@@ -567,6 +567,12 @@ struct Config {
     bool openxr_mono_eye_shift_auto{true};
     int render_width{0};
     int render_height{0};
+    // [FEATURE:RUNTIME-RENDER-SIZE 1/4] [openxr] render_size_from_runtime=1:
+    // replace render_width/render_height with the OpenXR runtime's recommended
+    // per-eye size (times resolution_scale) before the game creates its
+    // swapchain. SteamVR, WiVRn and other runtimes report different sizes, and
+    // SteamVR's own resolution slider then applies. 0 keeps the ini size.
+    bool render_size_from_runtime{false};
     float hud_horizontal_scale{0.7f};
     float hud_vertical_scale{0.7f};
     int hud_stereo_shift_px{-16};
@@ -17223,6 +17229,8 @@ void load_config() {
         g_config.openxr_mono_eye_shift_auto = read_ini_bool("openxr", "mono_eye_shift_auto", true);
         g_config.render_width = std::max(0, read_ini_int("openxr", "render_width", 0));
         g_config.render_height = std::max(0, read_ini_int("openxr", "render_height", 0));
+        g_config.render_size_from_runtime =
+            read_ini_bool("openxr", "render_size_from_runtime", false);
         g_config.hud_horizontal_scale = std::clamp(
             read_ini_float("openxr", "hud_horizontal_scale", 0.7f), 0.25f, 1.0f);
         g_config.hud_vertical_scale = std::clamp(
@@ -57369,6 +57377,8 @@ void install_xinput_snap_turn_hook() {
     }
 }
 
+void apply_runtime_render_size();
+
 void ensure_initialized() {
     std::call_once(g_init_once, []() {
         // [DEBUG:RENDERDOC-DLSS-CAPTURE V12103 3/3] Load the manual INI gate
@@ -57376,6 +57386,8 @@ void ensure_initialized() {
         // with the default OFF setting the adjacent DLL is never loaded.
         initialize_real_dxgi_exports();
         load_config();
+        // [FEATURE:RUNTIME-RENDER-SIZE 4/4]
+        apply_runtime_render_size();
         log_remaster_streamline_wine_bypass();
         if (g_config.renderdoc_capture_enabled &&
             g_config.renderdoc_streamline_device_bridge) {
@@ -60105,6 +60117,142 @@ bool create_openxr_swapchains() {
     return true;
 }
 
+// The OpenXR loader the mod uses: openxr_loader.dll next to the game, or the
+// [test] openxr_loader override (relative paths are relative to the exe).
+std::string openxr_loader_path_for_process() {
+    std::string loader_path = "openxr_loader.dll";
+    if (!g_config.test_openxr_loader.empty()) {
+        loader_path = g_config.test_openxr_loader;
+        const bool rooted = loader_path.size() >= 2 &&
+            (loader_path[1] == ':' || loader_path[0] == '\\' ||
+                loader_path[0] == '/');
+        if (!rooted) {
+            char exe_path[MAX_PATH]{};
+            const DWORD length = GetModuleFileNameA(nullptr, exe_path, MAX_PATH);
+            std::string exe_dir(exe_path, length);
+            exe_dir.resize(exe_dir.find_last_of("\\/") + 1);
+            loader_path = exe_dir + loader_path;
+        }
+    }
+    return loader_path;
+}
+
+// [FEATURE:RUNTIME-RENDER-SIZE 2/4] Runs once from ensure_initialized, before
+// the game's swapchain and the viewport-resolution hook: a short-lived
+// instance (no graphics binding, no session) reads the first PRIMARY_STEREO
+// view's recommended size, like the Windows launcher's AUTO resolution. On any
+// failure the ini size stays.
+void apply_runtime_render_size() {
+    if (!g_config.render_size_from_runtime || !g_config.openxr_enabled) {
+        return;
+    }
+    const std::string loader_path = openxr_loader_path_for_process();
+    HMODULE loader = LoadLibraryA(loader_path.c_str());
+    if (loader == nullptr) {
+        log_line("OpenXR runtime render size: loader %s not found (gle=%lu); keeping %dx%d",
+            loader_path.c_str(), GetLastError(),
+            g_config.render_width, g_config.render_height);
+        return;
+    }
+    auto create_instance = reinterpret_cast<PFN_xrCreateInstance>(
+        GetProcAddress(loader, "xrCreateInstance"));
+    auto get_proc = reinterpret_cast<PFN_xrGetInstanceProcAddr>(
+        GetProcAddress(loader, "xrGetInstanceProcAddr"));
+    XrInstance instance{XR_NULL_HANDLE};
+    uint32_t width{};
+    uint32_t height{};
+    uint32_t max_width{};
+    uint32_t max_height{};
+    const char* failure = nullptr;
+    XrResult result = XR_SUCCESS;
+    if (create_instance == nullptr || get_proc == nullptr) {
+        failure = "loader exports missing";
+    } else {
+        XrInstanceCreateInfo create_info{XR_TYPE_INSTANCE_CREATE_INFO};
+        strcpy_s(create_info.applicationInfo.applicationName, "witcher3vr-size");
+        create_info.applicationInfo.applicationVersion = 1;
+        strcpy_s(create_info.applicationInfo.engineName, "witcher3vr");
+        create_info.applicationInfo.engineVersion = 1;
+        create_info.applicationInfo.apiVersion = XR_MAKE_VERSION(1, 0, 0);
+        result = create_instance(&create_info, &instance);
+        if (XR_FAILED(result)) {
+            failure = "xrCreateInstance";
+        }
+    }
+    PFN_xrDestroyInstance destroy_instance{};
+    if (failure == nullptr) {
+        PFN_xrGetSystem get_system{};
+        PFN_xrEnumerateViewConfigurationViews enumerate_views{};
+        get_proc(instance, "xrDestroyInstance",
+            reinterpret_cast<PFN_xrVoidFunction*>(&destroy_instance));
+        get_proc(instance, "xrGetSystem",
+            reinterpret_cast<PFN_xrVoidFunction*>(&get_system));
+        get_proc(instance, "xrEnumerateViewConfigurationViews",
+            reinterpret_cast<PFN_xrVoidFunction*>(&enumerate_views));
+        XrSystemId system{XR_NULL_SYSTEM_ID};
+        if (get_system == nullptr || enumerate_views == nullptr) {
+            failure = "instance functions missing";
+        } else {
+            XrSystemGetInfo system_info{XR_TYPE_SYSTEM_GET_INFO};
+            system_info.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
+            result = get_system(instance, &system_info, &system);
+            if (XR_FAILED(result)) {
+                failure = "xrGetSystem";
+            }
+        }
+        if (failure == nullptr) {
+            uint32_t count{};
+            result = enumerate_views(instance, system,
+                XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, 0, &count, nullptr);
+            std::vector<XrViewConfigurationView> views(
+                count, {XR_TYPE_VIEW_CONFIGURATION_VIEW});
+            if (XR_SUCCEEDED(result) && count >= 2) {
+                result = enumerate_views(instance, system,
+                    XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, count, &count,
+                    views.data());
+            }
+            if (XR_FAILED(result) || count < 2) {
+                failure = "xrEnumerateViewConfigurationViews";
+            } else {
+                width = views[0].recommendedImageRectWidth;
+                height = views[0].recommendedImageRectHeight;
+                max_width = views[0].maxImageRectWidth;
+                max_height = views[0].maxImageRectHeight;
+            }
+        }
+    }
+    if (instance != XR_NULL_HANDLE && destroy_instance != nullptr) {
+        destroy_instance(instance);
+    }
+    FreeLibrary(loader);
+    if (failure != nullptr || width == 0 || height == 0) {
+        log_line("OpenXR runtime render size: %s failed (%s, %d); keeping %dx%d",
+            failure != nullptr ? failure : "empty view size",
+            xr_result_name(result), result,
+            g_config.render_width, g_config.render_height);
+        return;
+    }
+    // [FEATURE:RUNTIME-RENDER-SIZE 3/4] Scale, keep even, clamp to a sane
+    // range (VRAM: 3104x3248 per eye already ran out on a 10 GB card) and to
+    // the runtime's maximum.
+    const auto fit = [](uint32_t value, float scale, uint32_t maximum) {
+        float scaled = static_cast<float>(value) * scale;
+        scaled = std::clamp(scaled, 800.0f, 4096.0f);
+        uint32_t result_value = static_cast<uint32_t>(std::lround(scaled)) & ~1u;
+        if (maximum >= 800) {
+            result_value = std::min(result_value, maximum & ~1u);
+        }
+        return result_value;
+    };
+    const uint32_t new_width = fit(width, g_config.resolution_scale, max_width);
+    const uint32_t new_height = fit(height, g_config.resolution_scale, max_height);
+    log_line("OpenXR runtime render size recommended=%ux%u max=%ux%u scale=%.3f -> %ux%u (ini %dx%d)",
+        width, height, max_width, max_height, g_config.resolution_scale,
+        new_width, new_height, g_config.render_width, g_config.render_height);
+    g_config.render_width = static_cast<int>(new_width);
+    g_config.render_height = static_cast<int>(new_height);
+}
+
 void initialize_openxr_probe() {
     if (g_d3d12_device == nullptr || g_command_queue == nullptr) {
         log_line("OpenXR probe skipped: D3D12 device/queue not captured yet");
@@ -60117,19 +60265,8 @@ void initialize_openxr_probe() {
             return;
         }
 
-        std::string loader_path = "openxr_loader.dll";
+        const std::string loader_path = openxr_loader_path_for_process();
         if (!g_config.test_openxr_loader.empty()) {
-            loader_path = g_config.test_openxr_loader;
-            const bool rooted = loader_path.size() >= 2 &&
-                (loader_path[1] == ':' || loader_path[0] == '\\' ||
-                    loader_path[0] == '/');
-            if (!rooted) {
-                char exe_path[MAX_PATH]{};
-                const DWORD length = GetModuleFileNameA(nullptr, exe_path, MAX_PATH);
-                std::string exe_dir(exe_path, length);
-                exe_dir.resize(exe_dir.find_last_of("\\/") + 1);
-                loader_path = exe_dir + loader_path;
-            }
             log_line("OpenXR test loader override: %s", loader_path.c_str());
         }
         g_openxr_loader = LoadLibraryA(loader_path.c_str());
