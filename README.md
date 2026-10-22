@@ -9,32 +9,43 @@ Proton today. Windows support is being worked on. This project continues the
 
 ## How to install?
 
-**Linux** (Steam + Proton, headset through WiVRn): the tested setup.
+1. Download the latest `Witcher3RemasteredVR-v….zip` from
+   **[Releases](https://github.com/kaarele/witcher3-remastered-vr/releases)** and extract it anywhere.
+2. Close the game. In the extracted folder, open **Install (Linux)** or **Install (Windows)**. Done: start your VR
+   runtime (WiVRn, SteamVR, ...), connect the headset, start the game.
 
-1. Download `Witcher3RemasteredVR-v0.1.3.zip` from **[Releases](https://github.com/kaarele/witcher3-remastered-vr/releases)**.
-2. In Steam: right-click *The Witcher 3* → **Manage** → **Browse local files**.
-3. Extract the zip into that folder and merge the folders.
-4. Close the game. Open a terminal in that folder and run:
+The installer finds the game in Steam (on Linux also Flatpak and Snap Steam), backs up your saves, copies the mod
+and writes the tested VR graphics settings (DLSS Quality on NVIDIA). On Linux it also sets the Steam launch options;
+Steam has to be closed for that, otherwise it shows the line to paste. Everything comes from the zip; nothing is
+downloaded. Running it again updates the mod and keeps your render size and DLSS mode.
+
+- **Linux:** if the file opens as text, right-click it and choose *Run* (GNOME: *Allow Launching*), or run
+  `installer/install.sh` in a terminal. Tested setup: Bazzite, Steam + Proton, WiVRn.
+- **Windows** (not tested yet, so please report how it goes): if Windows asks whether to run it, choose *Run*
+  (*More info > Run anyway*). The installer only uses the files in that folder.
+
+**Uninstall:** open **Uninstall (Linux)** or **Uninstall (Windows)**, from the extracted folder or from the
+`Witcher3VR` folder in the game folder. It removes the mod files and restores the graphics settings and Steam
+launch options the installer changed. Your saves are never touched.
+
+<details>
+<summary>Manual install (without the installer)</summary>
+
+1. Copy everything inside the zip's `payload` folder into the game folder (Steam: right-click *The Witcher 3* >
+   **Manage** > **Browse local files**) and merge the folders.
+2. Linux: close the game, open a terminal in the game folder and run
    ```bash
    python3 Witcher3VR/linux/w3vr-linux.py backup-saves
    python3 Witcher3VR/linux/w3vr-linux.py configure
    python3 Witcher3VR/linux/w3vr-linux.py launch-options
    ```
-5. Paste the line that `launch-options` prints into Steam → *The Witcher 3* → **Properties** →
-   **Launch Options**.
-6. Start WiVRn, connect the headset, start the game. Done.
-
-**Windows** (not tested yet, so please report how it goes):
-
-1. Download `Witcher3RemasteredVR-v0.1.3.zip` from **[Releases](https://github.com/kaarele/witcher3-remastered-vr/releases)**.
-2. Extract it into the game folder (the one with `bin`, `content` and `mods`).
-3. Start your headset's OpenXR runtime (SteamVR, Meta Quest Link, Virtual Desktop, ...).
-4. Start the game. In **Options → Graphics** set Anti-aliasing to **DLSS** (Quality or DLAA), and
+   and paste the printed line into Steam > *The Witcher 3* > **Properties** > **Launch Options**.
+3. Windows: start the game, and in **Options > Graphics** set Anti-aliasing to **DLSS** (Quality or DLAA), and
    turn **sharpening**, **NVIDIA Reflex** and **frame generation** off.
 
-**Uninstall:** delete `bin/x64_dx12/dxgi.dll` in the game folder. On Linux,
-`python3 Witcher3VR/linux/w3vr-linux.py uninstall --restore-settings` also puts your graphics
-settings back. Your saves are never touched.
+Uninstall by hand: delete `bin/x64_dx12/dxgi.dll` in the game folder. On Linux,
+`python3 Witcher3VR/linux/w3vr-linux.py uninstall --restore-settings` also puts your graphics settings back.
+</details>
 
 **Controls:** no F keys are needed: the mod starts in the right mode. Play with mouse and keyboard,
 a gamepad or a Steam Controller (tested with the 2026 Steam Controller); VR motion controllers are
@@ -235,8 +246,9 @@ file before it overwrites it:
 
 ### Linux (Steam + Proton)
 
-1. **Get the files.** The easy way: extract this project's release zip from
-   [Releases](https://github.com/kaarele/witcher3-remastered-vr/releases) into the game folder, as in [How to install?](#how-to-install). It contains
+1. **Get the files.** The easy way: the release zip's **Install (Linux)**, as in
+   [How to install?](#how-to-install); it does steps 1 to 5 for you. By hand: copy the zip's `payload` folder into
+   the game folder. It contains
    everything below, including `openxr_loader.dll`, the 5.01 script mods and the setup tool
    (`Witcher3VR/linux/w3vr-linux.py`). To use your own build instead, build `dxgi.dll` (see
    [Building from source](#linux-clang-cl-in-a-distrobox)) and pass it with `install --dll`.
@@ -300,8 +312,9 @@ More details: [LINUX.md](LINUX.md).
 Nobody has run this project on Windows yet. If you try it, please [report](#reporting-problems) what
 happens, good or bad.
 
-1. Extract the release zip from [Releases](https://github.com/kaarele/witcher3-remastered-vr/releases) into the game folder (the folder that contains
-   `bin`, `content` and `mods`) and merge the folders.
+1. Extract the release zip from [Releases](https://github.com/kaarele/witcher3-remastered-vr/releases) anywhere and open
+   **Install (Windows)** (it does step 3 for you). By hand: copy the zip's `payload` folder into the game folder
+   (the folder that contains `bin`, `content` and `mods`) and merge the folders.
 2. Make sure your headset's OpenXR runtime is the active one (SteamVR, Meta Quest Link, Virtual
    Desktop, ...), then start the game.
 3. In **Options → Graphics**: Anti-aliasing **DLSS** (Quality or DLAA) on an RTX GPU, otherwise
@@ -323,8 +336,9 @@ the game's `amd_fidelityfx_framegeneration_dx12.dll`).
 
 Each release on the [Releases page](https://github.com/kaarele/witcher3-remastered-vr/releases) has:
 
-- `Witcher3RemasteredVR-<version>.zip`: one package for Windows and Linux. Its folders mirror the
-  game folder, so it can be extracted straight into it. It replaces no game files.
+- `Witcher3RemasteredVR-<version>.zip`: one package for Windows and Linux. Extract it anywhere and open
+  **Install (Linux)** or **Install (Windows)**; **Uninstall (…)** undoes it. Its `payload` folder mirrors the game
+  folder for a manual install. It replaces no game files.
 - `SHA256SUMS.txt`: checksums. Check with `sha256sum -c SHA256SUMS.txt --ignore-missing` on Linux,
   or `Get-FileHash` in PowerShell on Windows.
 
@@ -332,7 +346,7 @@ The package needs no other software (no Visual C++ Redistributable, no .NET; Lin
 Python 3). It contains no NVIDIA files: DLSS uses the files that come with the game and the
 driver. The files are not code-signed, so Windows SmartScreen may warn (**More info** → **Run
 anyway**). Game updates change the game build; the mod then switches itself off until a release
-supports the new build. A one-click installer for both systems is planned.
+supports the new build; running the installer of that release updates the mod.
 
 ## Recommended settings
 

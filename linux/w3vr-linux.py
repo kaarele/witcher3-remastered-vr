@@ -14,6 +14,9 @@ dx12user.settings, registers the HUD editor and starts the game. This tool does 
 Standard library only (works on SteamOS). Close the game before running any command that writes files.
 
 Commands:
+  setup [--payload DIR]        one-step install from an extracted release (files, VR settings, saves backup,
+                               Steam launch options); this is what "Install (Linux)" runs
+  remove                       undo setup completely (saves are never touched); "Uninstall (Linux)" runs this
   status                       show what was found and the current VR config
   backup-saves                 copy the save folder to ~/w3vr-backups/<timestamp>/
   install ZIP [--sha256 FILE]  install a release zip into the game folder
@@ -75,9 +78,13 @@ HUD_EDITOR_BINDINGS = [('IK_Insert', 'W3VRHudEditorToggle'), ('IK_Q', 'W3VRHudEd
                        ('IK_R', 'W3VRHudEditorResetCurrent'), ('IK_X', 'W3VRHudEditorResetProfile'),
                        ('IK_F7', 'W3VRHudEditorProfile')]
 HUD_XML_LINE = b'modWitcher3VRHUDEditor.xml;'
-# 5.01 keys tested in the headset for 0.1.3 (configure adds them when missing).
+# 5.01 keys tested in the headset for 0.1.3 and 0.1.4 (configure adds them when missing; user values are kept).
+# The in-game 360 capture (capture360_enabled) stays opt-in.
 REMASTER_DEFAULTS = (
     ('openxr', 'world_marker_depth', '1'),
+    ('openxr', 'menu_world_locked', '1'),
+    ('openxr', 'loading_background', '1'),
+    ('openxr', 'options_menu_see_through', '1'),
     ('engine', 'remaster_pair_jitter', '1'),
     ('engine', 'remaster_pair_noise', '1'),
     ('engine', 'remaster_pair_previous_transforms', '1'),
@@ -100,6 +107,7 @@ MODES_501 = {
 
 
 def die(msg):
+    sys.stdout.flush()
     print('error: ' + msg, file=sys.stderr)
     sys.exit(1)
 
@@ -160,6 +168,46 @@ class Ini:
                 return
         self.add_line(section, '%s=%s' % (key, value))
 
+    def remove(self, section, key):
+        b = self._bounds(section)
+        if not b:
+            return
+        for i in range(b[0] + 1, b[1]):
+            line = self.lines[i]
+            if ('=' in line and not line.lstrip().startswith((';', '#'))
+                    and line.split('=', 1)[0].strip().lower() == key.lower()):
+                del self.lines[i]
+                return
+
+    def sections(self):
+        return [l.strip()[1:-1].strip() for l in self.lines if l.strip().startswith('[') and l.strip().endswith(']')]
+
+    def drop_empty_sections(self, keep=()):
+        """Remove sections (not in keep) that have no entries left, with the blank line before them."""
+        keep = {k.lower() for k in keep}
+        for section in self.sections():
+            b = self._bounds(section)
+            if not b or section.lower() in keep or any(l.strip() for l in self.lines[b[0] + 1:b[1]]):
+                continue
+            start = b[0]
+            while start > 0 and not self.lines[start - 1].strip():
+                start -= 1
+            del self.lines[start:b[1]]
+
+    def snapshot(self, skip_sections=('Galaxy',)):
+        """{(section, key): value} of every entry, without the sections in skip_sections."""
+        out, section = {}, None
+        for line in self.lines:
+            t = line.strip()
+            if t.startswith('[') and t.endswith(']'):
+                section = t[1:-1].strip()
+                continue
+            if section is None or section in skip_sections or '=' not in line or t.startswith((';', '#')):
+                continue
+            k, v = line.split('=', 1)
+            out.setdefault((section, k.strip()), v.strip())
+        return out
+
     def has_action(self, section, action):
         b = self._bounds(section)
         return bool(b) and any(re.search(r'Action=%s[,)]' % re.escape(action), l) for l in self.lines[b[0] + 1:b[1]])
@@ -212,6 +260,8 @@ def steam_roots():
         os.path.expanduser('~/.steam/root'),
         os.path.expanduser('~/.var/app/com.valvesoftware.Steam/.local/share/Steam'),
         os.path.expanduser('~/.var/app/com.valvesoftware.Steam/data/Steam'),
+        os.path.expanduser('~/snap/steam/common/.local/share/Steam'),
+        os.path.expanduser('~/snap/steam/common/.local/share/steam'),
     ]
     seen, roots = set(), []
     for c in candidates:
@@ -330,6 +380,9 @@ def fix_state_bridge(g, build, dry_run=False):
 
 
 def game_running():
+    override = os.environ.get('W3VR_ASSUME_GAME')  # tests: running | closed
+    if override in ('running', 'closed'):
+        return override == 'running'
     for pid in os.listdir('/proc'):
         if pid.isdigit():
             # Match Wine's argv[0] (backslash path). The comm name is useless (Wine renames it to the thread name,
@@ -448,6 +501,10 @@ def backup_saves(g):
         die('No Witcher 3 documents folder yet (%s). Start the game once.' % src)
     stamp = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
     dest = os.path.join(BACKUP_ROOT, stamp)
+    n = 2
+    while os.path.exists(dest):  # two backups in the same second
+        dest = os.path.join(BACKUP_ROOT, '%s-%d' % (stamp, n))
+        n += 1
     os.makedirs(BACKUP_ROOT, exist_ok=True)
     shutil.copytree(src, os.path.join(dest, 'The Witcher 3'))
     # Verify the copy byte for byte.
@@ -782,13 +839,16 @@ def cmd_configure(args):
         write_with_backup(input_path, inp.text().encode('utf-8'), args.dry_run)
     else:
         print('  input.settings not found yet; run configure again after the first game start')
-    print('Done. Keep the headset connected to your OpenXR runtime BEFORE starting the game.')
+    if not getattr(args, 'from_setup', False):
+        print('Done. Keep the headset connected to your OpenXR runtime BEFORE starting the game.')
 
 
-def cmd_launch_options(args):
+def launch_option_parts(runtime='auto'):
+    """(environment assignments before %command%, detail, runtime) for this PC's OpenXR runtime and GPU.
+
+    runtime: 'auto' (the active runtime; SteamVR when it is the only one), 'wivrn' or 'steamvr'."""
     kind, detail = openxr_runtime()
     steamvr = find_steamvr()
-    runtime = getattr(args, 'runtime', 'auto')
     if runtime == 'auto':
         if kind == 'steamvr' or (kind is None and steamvr):
             runtime = 'steamvr'
@@ -802,6 +862,7 @@ def cmd_launch_options(args):
         parts.append('XR_RUNTIME_JSON="%s"' % steamvr)
         detail = 'SteamVR (%s)' % steamvr
     elif kind and kind.startswith('wivrn-flatpak'):
+        # The Steam runtime container must see the WiVRn Flatpak to load its OpenXR runtime.
         system = '/var/lib/flatpak/app/io.github.wivrn.wivrn'
         user = os.path.expanduser('~/.local/share/flatpak/app/io.github.wivrn.wivrn')
         parts.append('PRESSURE_VESSEL_FILESYSTEMS_RW=%s' % (user if os.path.isdir(user) and not os.path.isdir(system) else system))
@@ -809,6 +870,14 @@ def cmd_launch_options(args):
     parts.append('WINEDLLOVERRIDES="dxgi=n,b"')
     if nvidia_gpu():
         parts.append('PROTON_ENABLE_NVAPI=1')
+    return parts, detail, runtime
+
+
+LAUNCH_ARGS = ['--launcher-skip']
+
+
+def cmd_launch_options(args):
+    parts, detail, runtime = launch_option_parts(getattr(args, 'runtime', 'auto'))
     print('Runtime: %s' % detail)
     print('Steam > The Witcher 3 > Properties > General > Launch Options:')
     print()
@@ -908,9 +977,495 @@ def cmd_uninstall(args):
     print('Removed %d mod files. The game runs without VR again. (Saves were not touched.)' % removed)
 
 
-def main():
+# ------------------------------------------------------------------------------ Steam launch options (localconfig.vdf)
+# Steam keeps each account's per-game launch options in userdata/<account id>/config/localconfig.vdf, under
+# UserLocalConfigStore/Software/Valve/Steam/apps/<appid>/LaunchOptions. Steam rewrites that file when it exits, so it
+# may only be edited while Steam is closed.
+STEAM_ID64_BASE = 76561197960265728
+VDF_TOKEN = re.compile(r'"((?:[^"\\]|\\.)*)"|(\{)|(\})|(//[^\n]*)')
+
+
+def vdf_unescape(value):
+    return re.sub(r'\\(.)', lambda m: {'n': '\n', 't': '\t'}.get(m.group(1), m.group(1)), value)
+
+
+def vdf_escape(value):
+    return value.replace('\\', '\\\\').replace('"', '\\"')
+
+
+def vdf_block(text, path):
+    """(open brace index, close brace index) of the block at path (keys compared case-insensitively), or None."""
+    want = [k.lower() for k in path]
+    stack, last = [], None
+    for m in VDF_TOKEN.finditer(text):
+        if m.group(4):
+            continue
+        if m.group(2):
+            stack.append(((last or '').lower(), m.start()))
+            last = None
+            if [k for k, _ in stack] == want:
+                depth = 1
+                for n in VDF_TOKEN.finditer(text, m.end()):
+                    if n.group(2):
+                        depth += 1
+                    elif n.group(3):
+                        depth -= 1
+                        if depth == 0:
+                            return m.start(), n.start()
+                return None
+        elif m.group(3):
+            if stack:
+                stack.pop()
+            last = None
+        else:
+            last = None if last is not None else vdf_unescape(m.group(1))
+    return None
+
+
+def vdf_child_value(text, span, key):
+    """(value, value token span) of a direct key/value child of the block span, or (None, None)."""
+    depth, expect_key, current = 0, True, None
+    for m in VDF_TOKEN.finditer(text, span[0] + 1, span[1]):
+        if m.group(4):
+            continue
+        if m.group(2):
+            depth += 1
+            expect_key = True
+        elif m.group(3):
+            depth -= 1
+            expect_key = True
+        elif depth == 0:
+            if expect_key:
+                current = vdf_unescape(m.group(1))
+                expect_key = False
+            else:
+                if current is not None and current.lower() == key.lower():
+                    return vdf_unescape(m.group(1)), (m.start(), m.end())
+                expect_key = True
+    return None, None
+
+
+def vdf_line_indent(text, index):
+    start = text.rfind('\n', 0, index) + 1
+    return text[start:index][:len(text[start:index]) - len(text[start:index].lstrip('\t '))]
+
+
+def vdf_set_child_value(text, path, key, value):
+    """Set (value str) or remove (value None) path/key, creating missing blocks under the deepest existing one."""
+    span = vdf_block(text, path)
+    if span is None:
+        if value is None:
+            return text
+        parent_path = list(path[:-1])
+        while parent_path and vdf_block(text, parent_path) is None:
+            parent_path.pop()
+        if not parent_path:
+            raise ValueError('localconfig.vdf has no %s block' % path[0])
+        parent = vdf_block(text, parent_path)
+        missing = path[len(parent_path):]
+        indent = vdf_line_indent(text, parent[0]) + '\t'
+        block = ''
+        for depth, name in enumerate(missing):
+            pad = indent + '\t' * depth
+            block += '%s"%s"\n%s{\n' % (pad, vdf_escape(name), pad)
+        pad = indent + '\t' * len(missing)
+        block += '%s"%s"\t\t"%s"\n' % (pad, vdf_escape(key), vdf_escape(value))
+        for depth in reversed(range(len(missing))):
+            block += '%s}\n' % (indent + '\t' * depth)
+        close = parent[1]
+        line_start = text.rfind('\n', 0, close) + 1
+        return text[:line_start] + block + text[line_start:]
+    current, token = vdf_child_value(text, span, key)
+    if current is not None:
+        if value is None:
+            line_start = text.rfind('\n', 0, token[0]) + 1
+            line_end = text.find('\n', token[1])
+            return text[:line_start] + text[line_end + 1 if line_end >= 0 else len(text):]
+        return text[:token[0]] + '"%s"' % vdf_escape(value) + text[token[1]:]
+    if value is None:
+        return text
+    pad = vdf_line_indent(text, span[0]) + '\t'
+    line_start = text.rfind('\n', 0, span[1]) + 1
+    return text[:line_start] + '%s"%s"\t\t"%s"\n' % (pad, vdf_escape(key), vdf_escape(value)) + text[line_start:]
+
+
+def vdf_remove_block_if_empty(text, path):
+    span = vdf_block(text, path)
+    if span is None:
+        return text
+    inner = VDF_TOKEN.search(text, span[0] + 1, span[1])
+    if inner and not inner.group(4):
+        return text  # still has entries (Steam keeps e.g. LastPlayed there)
+    # Remove the line with the block's key, the braces and everything between.
+    key_line = text.rfind('\n', 0, text.rfind('"', 0, span[0])) + 1
+    end = text.find('\n', span[1])
+    return text[:key_line] + text[end + 1 if end >= 0 else len(text):]
+
+
+APP_PATH = ['UserLocalConfigStore', 'Software', 'Valve', 'Steam', 'apps', APP_ID]
+
+
+def localconfig_path(g):
+    """localconfig.vdf of the Steam account that last logged in (or the only/most recent one), or None."""
+    userdata = os.path.join(g['steam_root'], 'userdata')
+    if not os.path.isdir(userdata):
+        return None
+    candidates = [os.path.join(userdata, d, 'config', 'localconfig.vdf') for d in os.listdir(userdata) if d.isdigit()]
+    candidates = [c for c in candidates if os.path.exists(c)]
+    loginusers = os.path.join(g['steam_root'], 'config', 'loginusers.vdf')
+    if os.path.exists(loginusers):
+        with open(loginusers, encoding='utf-8', errors='replace') as f:
+            text = f.read()
+        for m in re.finditer(r'"(7656\d{13})"\s*\{([^}]*)\}', text):
+            if re.search(r'"MostRecent"\s+"1"', m.group(2), re.I):
+                account = str(int(m.group(1)) - STEAM_ID64_BASE)
+                path = os.path.join(userdata, account, 'config', 'localconfig.vdf')
+                if os.path.exists(path):
+                    return path
+    return max(candidates, key=os.path.getmtime) if candidates else None
+
+
+def steam_running():
+    override = os.environ.get('W3VR_ASSUME_STEAM')  # tests: running | closed
+    if override in ('running', 'closed'):
+        return override == 'running'
+    for pid in os.listdir('/proc'):
+        if not pid.isdigit():
+            continue
+        try:
+            with open('/proc/%s/comm' % pid) as f:
+                comm = f.read().strip()
+            with open('/proc/%s/cmdline' % pid, 'rb') as f:
+                argv0 = f.read().split(b'\0', 1)[0]
+        except OSError:
+            continue
+        if comm == 'steam' and (argv0.endswith(b'/steam') or b'ubuntu12_32/steam' in argv0):
+            return True
+    return False
+
+
+def split_launch_options(value):
+    """(tokens before %command%, tokens after it). Options without %command% are game arguments."""
+    value = (value or '').strip().replace('"%command%"', '%command%')
+    if '%command%' in value:
+        before, after = value.split('%command%', 1)
+        return before.split(), after.split()
+    return [], value.split()
+
+
+def merge_launch_options(existing, env, args):
+    """The user's launch options plus ours: our variables replace same-named ones, other tokens are kept."""
+    before, after = split_launch_options(existing)
+    names = {e.split('=', 1)[0] for e in env}
+    # Environment assignments must come first: anything after a wrapper command (gamemoderun, mangohud) would be
+    # taken as the program to run.
+    before = env + [t for t in before if t.split('=', 1)[0] not in names]
+    after = after + [a for a in args if a not in after]
+    return ('%s %%command%% %s' % (' '.join(before), ' '.join(after))).strip()
+
+
+def unmerge_launch_options(current, env, args):
+    """Remove exactly our tokens again; '' when nothing else is left."""
+    before, after = split_launch_options(current)
+    before = [t for t in before if t not in env]
+    after = [t for t in after if t not in args]
+    if not before and not after:
+        return ''
+    if not before:
+        return ' '.join(after)
+    return ('%s %%command%% %s' % (' '.join(before), ' '.join(after))).strip()
+
+
+def ask(prompt):
+    if not sys.stdin.isatty():
+        return None
+    try:
+        return input(prompt)
+    except EOFError:
+        return None
+
+
+def copy_to_clipboard(text):
+    if not sys.stdin.isatty():
+        return False  # only for a person at a terminal
+    for cmd in (['wl-copy'], ['xclip', '-selection', 'clipboard'], ['xsel', '--clipboard', '--input']):
+        if shutil.which(cmd[0]):
+            try:
+                import subprocess
+                # The clipboard tools keep running to serve the selection: never let them hold our output.
+                subprocess.run(cmd, input=text.encode(), timeout=5, check=True,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                return True
+            except Exception:
+                continue
+    return False
+
+
+def wait_for_steam_closed(action):
+    """True once Steam is closed; False when the user skips (or there is no terminal to ask in)."""
+    while steam_running():
+        answer = ask('Steam is running. To %s automatically, close Steam completely (Steam menu > Exit),\n'
+                     'then press Enter. Or type s and press Enter to skip and do it by hand: ' % action)
+        if answer is None or answer.strip().lower().startswith('s'):
+            return False
+    return True
+
+
+def apply_launch_options(g, state):
+    env, detail, _runtime = launch_option_parts()
+    print('OpenXR runtime: %s' % detail)
+    vdf = localconfig_path(g)
+    wanted_for_print = merge_launch_options('', env, LAUNCH_ARGS)
+    if vdf and wait_for_steam_closed('set the Steam launch options'):
+        with open(vdf, encoding='utf-8', errors='surrogateescape') as f:
+            text = f.read()
+        span = vdf_block(text, APP_PATH)
+        current = vdf_child_value(text, span, 'LaunchOptions')[0] if span else None
+        wanted = merge_launch_options(current, env, LAUNCH_ARGS)
+        record = state.setdefault('launch_options', {})
+        if 'original' not in record:
+            record['original'] = current  # None = there were none
+            record['created_block'] = span is None
+        record.update({'file': vdf, 'env': env, 'args': LAUNCH_ARGS, 'written': wanted})
+        if current == wanted:
+            print('Steam launch options already set.')
+            return True
+        backup = vdf + '.w3vr.bak'
+        shutil.copy2(vdf, backup)
+        new_text = vdf_set_child_value(text, APP_PATH, 'LaunchOptions', wanted)
+        tmp = vdf + '.w3vr.tmp'
+        with open(tmp, 'w', encoding='utf-8', errors='surrogateescape') as f:
+            f.write(new_text)
+        os.replace(tmp, vdf)
+        print('Steam launch options set (backup: %s):\n  %s' % (backup, wanted))
+        return True
+    print()
+    print('Set the Steam launch options by hand: Steam > right-click The Witcher 3 > Properties > General >')
+    print('Launch Options, and paste this line:')
+    print()
+    print('  ' + wanted_for_print)
+    print()
+    if copy_to_clipboard(wanted_for_print):
+        print('(The line is already copied to your clipboard.)')
+    state.setdefault('launch_options', {})['manual'] = wanted_for_print
+    return False
+
+
+def revert_launch_options(state):
+    record = (state or {}).get('launch_options') or {}
+    vdf = record.get('file')
+    if not vdf or 'written' not in record:
+        if record.get('manual'):
+            print('Remember to clear the Steam launch options you added by hand (Steam > The Witcher 3 > Properties).')
+        return True
+    if not os.path.exists(vdf):
+        return True
+    if not wait_for_steam_closed('remove the Steam launch options'):
+        print('Remove these parts from the Steam launch options by hand: %s ... --launcher-skip' % ' '.join(record['env']))
+        return False
+    with open(vdf, encoding='utf-8', errors='surrogateescape') as f:
+        text = f.read()
+    span = vdf_block(text, APP_PATH)
+    current = vdf_child_value(text, span, 'LaunchOptions')[0] if span else None
+    if current is None:
+        return True
+    if current == record['written']:
+        restored = record.get('original')
+    else:
+        restored = unmerge_launch_options(current, record['env'], record['args'])  # the user edited them since
+    new_text = vdf_set_child_value(text, APP_PATH, 'LaunchOptions', restored if restored else None)
+    if record.get('created_block'):
+        new_text = vdf_remove_block_if_empty(new_text, APP_PATH)
+    shutil.copy2(vdf, vdf + '.w3vr.bak')
+    tmp = vdf + '.w3vr.tmp'
+    with open(tmp, 'w', encoding='utf-8', errors='surrogateescape') as f:
+        f.write(new_text)
+    os.replace(tmp, vdf)
+    print('Steam launch options restored%s.' % ((': ' + restored) if restored else ' (cleared)'))
+    return True
+
+
+# ------------------------------------------------------------------------------------ one-step setup / remove
+SETTINGS_SKIP = ('Galaxy', 'Localization')
+
+
+def record_settings_changes(state, before, after):
+    """Remember the original value of every dx12user.settings key the setup changed (first install wins)."""
+    state.setdefault('settings_sections_before', sorted({k[0] for k in before}))
+    changes = {tuple(c[:2]): c for c in state.get('settings_changes', [])}
+    for key in set(before) | set(after):
+        if before.get(key) != after.get(key) and key not in changes:
+            changes[key] = [key[0], key[1], before.get(key), after.get(key)]
+        elif key in changes:
+            changes[key][3] = after.get(key)
+    state['settings_changes'] = sorted(changes.values())
+
+
+def revert_settings_changes(g, state):
+    path = os.path.join(g['docs'], 'dx12user.settings')
+    changes = (state or {}).get('settings_changes') or []
+    if not changes or not os.path.exists(path):
+        return
+    doc = Ini.load(path)
+    reverted = kept = 0
+    for section, key, original, written in changes:
+        if doc.get(section, key) != written:
+            kept += 1  # changed again since (in the game menu): leave the player's choice
+            continue
+        if original is None:
+            doc.remove(section, key)
+        else:
+            doc.set(section, key, original)
+        reverted += 1
+    if 'settings_sections_before' in state:
+        doc.drop_empty_sections(keep=list(state['settings_sections_before']) + list(SETTINGS_SKIP))
+    write_with_backup(path, doc.text().encode('ascii', errors='replace'))
+    print('dx12user.settings: %d VR settings restored%s.' % (
+        reverted, ', %d you changed since were kept' % kept if kept else ''))
+
+
+def payload_files(payload):
+    out = []
+    for top in ('bin', 'mods', 'dlc', 'Witcher3VR'):
+        root = os.path.join(payload, top)
+        for base, _, files in os.walk(root):
+            for name in files:
+                rel = os.path.relpath(os.path.join(base, name), payload).replace(os.sep, '/')
+                if '__pycache__' not in rel:
+                    out.append(rel)
+    return sorted(out)
+
+
+def foreign_file(dest, ours):
+    """True when dest is someone else's file worth restoring on uninstall (e.g. a ReShade dxgi.dll)."""
+    name = os.path.basename(dest).lower()
+    if name not in ('dxgi.dll', 'openxr_loader.dll'):
+        return False  # our own names: an earlier version of this mod
+    if sha256_file(dest) == sha256_file(ours):
+        return False
+    if name == 'dxgi.dll':
+        with open(dest, 'rb') as f:
+            return b'witcher3vr' not in f.read()
+    return True
+
+
+def cmd_setup(args):
+    payload = os.path.abspath(args.payload)
+    if not os.path.isfile(os.path.join(payload, 'bin', 'x64_dx12', 'dxgi.dll')):
+        die('no bin/x64_dx12/dxgi.dll in %s: run the installer from the extracted release folder' % payload)
+    g = find_game()
+    if not g:
+        die('The Witcher 3 was not found in your Steam libraries (native, Flatpak or Snap Steam). Install it in '
+            'Steam first.')
+    print('Found the game: %s' % g['game'])
+    if game_running():
+        die('The Witcher 3 is running. Quit the game, then run the installer again.')
+    build, build_description = build_info(g)
+    if build != '501':
+        if build == '404':
+            print('This is the Next-Gen 4.04 version. This mod is made and tested for Remastered 5.01 (Steam\'s '
+                  'default version).')
+        else:
+            print('This game version is not supported yet (%s). The mod would stay inactive; a mod update for '
+                  'this version is needed.' % build_description)
+        if not args.force:
+            die('Nothing was changed.')
+    else:
+        print('Game version: %s (supported)' % build_description)
+    if os.path.isdir(g['docs']):
+        print('Backing up your saves ...')
+        print('  -> %s' % backup_saves(g))
+
+    state = load_state(g) or {'files': [], 'backups': {}}
+    installed = set(state['files'])
+    ini_path = os.path.join(g['x64'], 'witcher3vr.ini')
+    keep_res = None
+    if os.path.exists(ini_path):
+        old = Ini.load(ini_path)
+        w, h = old.get('openxr', 'render_width'), old.get('openxr', 'render_height')
+        if w and h and w.isdigit() and h.isdigit():
+            keep_res = '%sx%s' % (w, h)
+        saved = os.path.join(STATE_DIR, 'ini-backups', 'witcher3vr.ini.%s' % datetime.datetime.now().strftime('%Y%m%d-%H%M%S'))
+        os.makedirs(os.path.dirname(saved), exist_ok=True)
+        shutil.copy2(ini_path, saved)
+        print('Updating: witcher3vr.ini is replaced by this release\'s tested settings%s.' % (
+            ' (your render size %s is kept)' % keep_res if keep_res else ''))
+        print('  your previous one is saved as %s' % saved)
+    print('Copying the mod files ...')
+    for rel in payload_files(payload):
+        dest = os.path.join(g['game'], rel)
+        if os.path.exists(dest) and rel not in installed and foreign_file(dest, os.path.join(payload, rel)):
+            backup = os.path.join(STATE_DIR, 'overwritten', hashlib.sha1(g['game'].encode()).hexdigest()[:12], rel)
+            os.makedirs(os.path.dirname(backup), exist_ok=True)
+            shutil.copy2(dest, backup)
+            state['backups'][rel] = backup
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        shutil.copyfile(os.path.join(payload, rel), dest)
+        if os.access(os.path.join(payload, rel), os.X_OK):
+            os.chmod(dest, 0o755)
+        installed.add(rel)
+    fix_state_bridge(g, build)
+    state.update({'files': sorted(installed), 'source': payload, 'game': g['game'],
+                  'installed_at': datetime.datetime.now().isoformat(timespec='seconds')})
+    save_state(g, state)
+    print('  %d files in place.' % len(installed))
+
+    settings_path = os.path.join(g['docs'], 'dx12user.settings')
+    settings_done = False
+    if os.path.exists(settings_path):
+        current = Ini.load(settings_path)
+        before = current.snapshot(SETTINGS_SKIP)
+        conf = ['configure'] + (['--res', keep_res] if keep_res else []) + (['--force'] if args.force else [])
+        if keep_res and current.get('PostProcess', 'AAMode') == '6':
+            # Updating: keep the DLSS mode the player picked in the game (5 = DLAA, 0 = Auto).
+            q = {'5': '0', '1': '1', '2': '2', '3': '3', '4': '4'}.get(current.get('PostProcess', 'DLSSQuality'))
+            if q:
+                conf += ['--dlss-quality', q]
+        conf_args = build_parser().parse_args(conf)
+        conf_args.from_setup = True
+        cmd_configure(conf_args)
+        record_settings_changes(state, before, Ini.load(settings_path).snapshot(SETTINGS_SKIP))
+        save_state(g, state)
+        settings_done = True
+    else:
+        print('The game has not created its settings yet (first start). The mod files are in place; to apply the VR')
+        print('graphics settings, start the game once (main menu is enough), quit, and run the installer again.')
+    launch_done = apply_launch_options(g, state)
+    save_state(g, state)
+    print()
+    print('=' * 72)
+    print('Done.' if settings_done and launch_done else 'Done, with the step(s) above to finish by hand.')
+    print('Play: start your VR runtime (WiVRn or SteamVR), connect the headset, then start The Witcher 3 in Steam.')
+    print('Remove the mod again any time with "Uninstall (Linux)".')
+    print('=' * 72)
+
+
+def cmd_remove(args):
+    g = find_game()
+    if not g:
+        die('The Witcher 3 was not found in your Steam libraries.')
+    if game_running():
+        die('The Witcher 3 is running. Quit the game, then run the uninstaller again.')
+    state = load_state(g)
+    revert_launch_options(state)
+    revert_settings_changes(g, state)
+    cmd_uninstall(argparse.Namespace(restore_settings=False))
+    for leftover in ('witcher3vr.ini.w3vr.bak', 'witcher3vr.ini.w3vr.tmp'):
+        p = os.path.join(g['x64'], leftover)
+        if os.path.exists(p) and state:
+            os.remove(p)
+    if os.path.isdir(BACKUP_ROOT):
+        print('Save backups made by the installer stay in %s (delete them when you no longer need them).' % BACKUP_ROOT)
+
+
+def build_parser():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest='cmd', required=True)
+    sp = sub.add_parser('setup', help='one-step install from an extracted release folder (used by "Install (Linux)")')
+    sp.add_argument('--payload', default=os.path.join(TOOL_DIR, '..', '..'),
+                    help='the release payload folder (mirrors the game folder)')
+    sp.add_argument('--force', action='store_true', help='install even if the game version is not supported')
+    sub.add_parser('remove', help='undo setup: files, VR settings and Steam launch options (saves are kept)')
     sub.add_parser('status')
     sub.add_parser('backup-saves')
     sp = sub.add_parser('install')
@@ -956,8 +1511,12 @@ def main():
                     help='1 = also start the game whenever the headset connects (WiVRn config "application")')
     sp = sub.add_parser('uninstall')
     sp.add_argument('--restore-settings', action='store_true', help='restore dx12user.settings from before configure')
-    args = p.parse_args()
-    {'status': cmd_status, 'backup-saves': cmd_backup_saves, 'install': cmd_install, 'configure': cmd_configure,
+    return p
+
+
+def main():
+    args = build_parser().parse_args()
+    {'setup': cmd_setup, 'remove': cmd_remove, 'status': cmd_status, 'backup-saves': cmd_backup_saves, 'install': cmd_install, 'configure': cmd_configure,
      'launch-options': cmd_launch_options, 'wivrn-shortcut': cmd_wivrn_shortcut,
      'uninstall': cmd_uninstall}[args.cmd](args)
 

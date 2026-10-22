@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Uninstall Witcher 3 Remastered VR
+Comment=Remove the VR mod again. Your saves are not touched.
+Icon=edit-delete
+Terminal=true
+Exec=bash -c "exec bash \\"\\$(dirname \\"\\$1\\")/installer/uninstall.sh\\"" w3vr-uninstall %k
