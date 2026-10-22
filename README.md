@@ -283,6 +283,12 @@ file before it overwrites it:
 6. **Play:** with the headset connected, start the game from Steam or from WiVRn's app list in the
    headset. Proton sets up VR once, at launch.
 
+**SteamVR on Linux (experimental, not tested in the headset yet):** start SteamVR and connect the
+headset first (for a Quest: the Steam Link app). Then run `python3 linux/w3vr-linux.py configure --res runtime`
+and `python3 linux/w3vr-linux.py launch-options --runtime steamvr`; the printed line adds
+`XR_RUNTIME_JSON=".../SteamVR/steamxr_linux64.json"`, so the game uses SteamVR even when WiVRn is
+installed. SteamVR's per-application resolution setting then decides the render size.
+
 **Uninstall:** with the game closed, run `python3 linux/w3vr-linux.py uninstall --restore-settings`
 and clear the launch options in Steam. Your saves are not touched. Deleting
 `bin/x64_dx12/dxgi.dll` alone also switches the mod off.
@@ -452,6 +458,7 @@ The original mod's keys are documented in [witcher3vr.example.ini](witcher3vr.ex
 
 | Key | Default | What it does |
 |---|---|---|
+| `render_size_from_runtime` | `0` | `1` = at every start, render at the OpenXR runtime's recommended per-eye size (times `resolution_scale`) instead of `render_width`/`render_height`; those stay as the fallback. For SteamVR this follows its resolution setting. The Linux tool sets it with `configure --res runtime`. Clamped to 800-4096 px. Not tested in the headset yet. |
 | `hud_fade_mode` | `remove` | The game draws its fade to black into the HUD texture, which shows as a black rectangle in VR. `remove`: drop that fill, the world stays visible. `uniform`: darken each whole eye image instead. `native`: the game's own draw. Menus, loading screens and Cinema panels always keep the native fade. |
 | `hud_filtered_sampling` | `1` | Filter the HUD when it is shrunk (`hud_size` below 1), so text stays readable. All builds. |
 | `hud_anchor_level` | `1` | The controller-locked HUD keeps only your heading from the recenter, not head pitch or roll. All builds. |

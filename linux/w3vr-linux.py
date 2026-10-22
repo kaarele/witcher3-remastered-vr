@@ -366,6 +366,21 @@ def openxr_runtime():
     return None, 'no active OpenXR runtime found'
 
 
+def find_steamvr():
+    """Path of SteamVR's Linux OpenXR manifest (steamxr_linux64.json) in any Steam library, or None."""
+    for root in steam_roots():
+        libraries = [root]
+        vdf = os.path.join(root, 'steamapps', 'libraryfolders.vdf')
+        if os.path.exists(vdf):
+            with open(vdf, encoding='utf-8', errors='replace') as f:
+                libraries += parse_vdf_paths(f.read())
+        for lib in dict.fromkeys(os.path.realpath(l) for l in libraries):
+            manifest = os.path.join(lib, 'steamapps', 'common', 'SteamVR', 'steamxr_linux64.json')
+            if os.path.exists(manifest):
+                return manifest
+    return None
+
+
 def nvidia_gpu():
     return os.path.exists('/proc/driver/nvidia/version')
 
@@ -391,6 +406,8 @@ def cmd_status(args):
         print('Mod             not active (no bin/x64_dx12/dxgi.dll)')
     kind, detail = openxr_runtime()
     print('OpenXR runtime  %s' % (detail if kind else detail))
+    steamvr = find_steamvr()
+    print('SteamVR         %s' % (steamvr if steamvr else 'not installed'))
     print('GPU             %s' % ('NVIDIA (DLSS available)' if nvidia_gpu() else 'non-NVIDIA (no DLSS: FXAA on 5.01, TAAU on 4.04)'))
     print('Game running    %s' % ('yes' if game_running() else 'no'))
     ini_path = os.path.join(g['x64'], 'witcher3vr.ini')
@@ -608,8 +625,13 @@ def cmd_configure(args):
             'Remastered 5.01' if remaster else '4.04', args.mode, aa,
             'stereo/mono with dlss, fsr or none' if remaster else 'AER needs taau or dlss; fsr is 5.01 only'))
     openxr_mode, dual, aer, backend, aa_mode, allow_dlss = modes[mode_name]
-    w, h = (int(v) for v in args.res.lower().split('x'))
-    if args.res.lower() == '2476x2594':
+    from_runtime = args.res.lower() == 'runtime'
+    # With --res runtime the mod asks the OpenXR runtime for its recommended per-eye size at every start
+    # ([openxr] render_size_from_runtime=1); 2476x2594 is only the fallback if that query fails.
+    w, h = (2476, 2594) if from_runtime else (int(v) for v in args.res.lower().split('x'))
+    if from_runtime:
+        print("note: the render size follows the OpenXR runtime's recommendation (SteamVR: its resolution setting)")
+    elif args.res.lower() == '2476x2594':
         print("note: using the Quest 3 default render size 2476x2594; for other headsets pass --res WIDTHxHEIGHT "
               "with your runtime's recommended per-eye size")
     quality = args.dlss_quality
@@ -625,6 +647,7 @@ def cmd_configure(args):
     ini.set('openxr', 'resolution_auto', '0')
     ini.set('openxr', 'render_width', str(w))
     ini.set('openxr', 'render_height', str(h))
+    ini.set('openxr', 'render_size_from_runtime', '1' if from_runtime else '0')
     # 5.01 never uses the 4.04 native_stereo path (its centre block is the DLSS jitter there); it gets
     # per-eye frusta through the engine's NDC projection offset instead (remaster_asymmetric_ndc), so the
     # whole render target is the eye's field of view rather than a crop of a symmetric envelope.
@@ -764,8 +787,21 @@ def cmd_configure(args):
 
 def cmd_launch_options(args):
     kind, detail = openxr_runtime()
+    steamvr = find_steamvr()
+    runtime = getattr(args, 'runtime', 'auto')
+    if runtime == 'auto':
+        if kind == 'steamvr' or (kind is None and steamvr):
+            runtime = 'steamvr'
+        else:
+            runtime = 'wivrn' if kind and kind.startswith('wivrn') else 'active'
     parts = ['PRESSURE_VESSEL_IMPORT_OPENXR_1_RUNTIMES=1']
-    if kind and kind.startswith('wivrn-flatpak'):
+    if runtime == 'steamvr':
+        if not steamvr:
+            die('SteamVR is not installed in any Steam library (install it from Steam first)')
+        # Pin SteamVR even when another runtime (WiVRn) registers itself as the active one.
+        parts.append('XR_RUNTIME_JSON="%s"' % steamvr)
+        detail = 'SteamVR (%s)' % steamvr
+    elif kind and kind.startswith('wivrn-flatpak'):
         system = '/var/lib/flatpak/app/io.github.wivrn.wivrn'
         user = os.path.expanduser('~/.local/share/flatpak/app/io.github.wivrn.wivrn')
         parts.append('PRESSURE_VESSEL_FILESYSTEMS_RW=%s' % (user if os.path.isdir(user) and not os.path.isdir(system) else system))
@@ -778,7 +814,11 @@ def cmd_launch_options(args):
     print()
     print('  %s %%command%% --launcher-skip' % ' '.join(parts))
     print()
-    print('Prefer the exact string your runtime shows (e.g. the WiVRn dashboard), and keep %command% --launcher-skip.')
+    if runtime == 'steamvr':
+        print('SteamVR: start SteamVR (and connect the headset, e.g. Steam Link on a Quest) before the game. '
+              'For SteamVR\'s own resolution use `configure --res runtime`.')
+    else:
+        print('Prefer the exact string your runtime shows (e.g. the WiVRn dashboard), and keep %command% --launcher-skip.')
 
 
 WIVRN_DESKTOP = os.path.join(os.environ.get('XDG_DATA_HOME', os.path.expanduser('~/.local/share')),
@@ -887,8 +927,9 @@ def main():
     sp.add_argument('--dlss-quality', type=int, default=1, choices=range(0, 5),
                     help='0 DLAA, 1 Quality (default), 2 Balanced, 3 Performance, 4 Ultra Performance')
     sp.add_argument('--res', default='2476x2594',
-                    help="per-eye render size WIDTHxHEIGHT; use your OpenXR runtime's recommended per-eye size "
-                         "(default 2476x2594, WiVRn's recommendation for Quest 3)")
+                    help="per-eye render size WIDTHxHEIGHT, or 'runtime' to follow the OpenXR runtime's recommended "
+                         "per-eye size at every start (good for SteamVR) (default 2476x2594, WiVRn's recommendation "
+                         "for Quest 3)")
     sp.add_argument('--world-detail', type=float, default=0.7, help='0.4-1.0; lower = less CPU per eye (default 0.7)')
     sp.add_argument('--hud-size', type=float, default=0.5,
                     help='size of the VR HUD plane (stereo modes; default 0.5 = half size, chosen for Quest 3)')
@@ -906,7 +947,9 @@ def main():
     sp.add_argument('--reset-settings', action='store_true', help='re-apply the VR graphics template to dx12user.settings')
     sp.add_argument('--force', action='store_true', help='configure even if witcher3.exe is an unknown build')
     sp.add_argument('--dry-run', action='store_true')
-    sub.add_parser('launch-options')
+    sp = sub.add_parser('launch-options')
+    sp.add_argument('--runtime', choices=['auto', 'wivrn', 'steamvr'], default='auto',
+                    help='auto = the active OpenXR runtime (SteamVR if none is active and SteamVR is installed)')
     sp = sub.add_parser('wivrn-shortcut', help="add the game to WiVRn's in-headset app launcher")
     sp.add_argument('--remove', action='store_true')
     sp.add_argument('--autostart', type=int, choices=[0, 1],
