@@ -2,17 +2,35 @@
 
 > This is an unofficial fan work and is not approved/endorsed by CD PROJEKT RED.
 
-Play *The Witcher 3: Wild Hunt* Remastered (patch 5.01) in full stereo VR, on Linux with Steam +
-Proton today. Windows support is being worked on. This project continues the
-[Witcher 3 VR](https://github.com/tig3rmast3r/witcher3-vr) mod by tig3rmast3r and the
+Play *The Witcher 3: Wild Hunt* Remastered (patch 5.01) in full 3D VR: sharp DLSS in both eyes,
+menus that float in the room, and a HUD you can read. Free and open source. This project continues
+the [Witcher 3 VR](https://github.com/tig3rmast3r/witcher3-vr) mod by tig3rmast3r and the
 [Remastered port](https://github.com/joschi127/witcher3-vr/tree/remaster) by joschi127.
 
-## How to install?
+![Geralt in a village, left and right eye (DLSS Quality)](docs/images/stereo-village.jpg)
 
-1. Download the latest `Witcher3RemasteredVR-v….zip` from
-   **[Releases](https://github.com/kaarele/witcher3-remastered-vr/releases)** and extract it anywhere.
-2. Close the game. In the extracted folder, open **Install (Linux)** or **Install (Windows)**. Done: start your VR
-   runtime (WiVRn, SteamVR, ...), connect the headset, start the game.
+## Does it work for me?
+
+| | Setup |
+|---|---|
+| ✅ **Polished, played regularly** | Linux (Bazzite) · Steam + Proton · NVIDIA RTX 3080 · Meta Quest 3 through WiVRn · DLSS Quality or DLAA |
+| 🟡 **Should work, not tested yet** | Windows · SteamVR · other headsets · AMD/Intel GPUs (FSR) · SteamOS / Steam Deck · GOG edition |
+| ❌ **Not supported** | Game versions other than 5.01 (the mod then switches itself off) · VR motion controllers |
+
+On the tested setup it is a complete, polished experience. Nobody has tried the other setups yet, so
+expect rough edges there, and please [tell us](https://github.com/kaarele/witcher3-remastered-vr/issues)
+how it goes.
+
+## Simple install
+
+1. Download the latest zip from **[Releases](https://github.com/kaarele/witcher3-remastered-vr/releases)**.
+2. Extract it anywhere and open **Install (Linux)**, or **Install (Windows)** (experimental).
+3. Start WiVRn (or your VR runtime), connect the headset and start the game from Steam.
+
+To remove the mod, open **Uninstall**. Your saves are never touched.
+
+<details>
+<summary>What the installer does, and what to do if it doesn't start</summary>
 
 The installer finds the game in Steam (on Linux also Flatpak and Snap Steam), backs up your saves, copies the mod
 and writes the tested VR graphics settings (DLSS Quality on NVIDIA). On Linux it also sets the Steam launch options;
@@ -47,12 +65,29 @@ Uninstall by hand: delete `bin/x64_dx12/dxgi.dll` in the game folder. On Linux,
 `python3 Witcher3VR/linux/w3vr-linux.py uninstall --restore-settings` also puts your graphics settings back.
 </details>
 
+</details>
+
+## What you get
+
+![The pause menu and the graphics settings floating over the live 3D world](docs/images/see-through-menus.jpg)
+
+- **Full 3D with sharp DLSS in both eyes**, playable even on DLSS Balanced. Quality or DLAA look best.
+- **The pause menu floats over the live 3D world.** In the graphics settings you can look around
+  and see every change as you make it.
+- **The main menu and loading screens are a big screen in the room,** with a 360° 3D picture of the
+  game world around it instead of a black void.
+- **"Press A to talk" labels sit at the person's real depth.** HUD, menus and subtitles stay readable.
+- **Optional:** capture your own 3D 360° pictures in the game (pause menu + `F4`). They join the
+  loading-screen rotation.
+
+![A 360° view of Novigrad captured in the game, shown around the loading screen](docs/images/novigrad-360.jpg)
+
 **Controls:** no F keys are needed: the mod starts in the right mode. Play with mouse and keyboard,
 a gamepad or a Steam Controller (tested with the 2026 Steam Controller); VR motion controllers are
 not supported. Optional keys: F9 recentres the view (look straight ahead first), F8 toggles the
 near view, F10 the cinema screen, F11 first person.
 
-## What works and what's next
+## What works and what's next (details)
 
 **Works, tested in the headset:** Linux (Bazzite), Steam, Proton Hotfix, NVIDIA RTX 3080, Meta Quest
 3 through WiVRn at 90 Hz.
@@ -123,8 +158,10 @@ with your OS, GPU, headset, OpenXR runtime and what you saw. See [CONTRIBUTING.m
 
 ## Contents
 
-- [How to install?](#how-to-install)
-- [What works and what's next](#what-works-and-whats-next)
+- [Does it work for me?](#does-it-work-for-me)
+- [Simple install](#simple-install)
+- [What you get](#what-you-get)
+- [What works and what's next (details)](#what-works-and-whats-next-details)
 - [Why this mod exists](#why-this-mod-exists)
 - [Contributing](#contributing)
 - [What this project adds](#what-this-project-adds)
@@ -257,7 +294,7 @@ file before it overwrites it:
 ### Linux (Steam + Proton)
 
 1. **Get the files.** The easy way: the release zip's **Install (Linux)**, as in
-   [How to install?](#how-to-install); it does steps 1 to 5 for you. By hand: copy the zip's `payload` folder into
+   [How to install?](#simple-install); it does steps 1 to 5 for you. By hand: copy the zip's `payload` folder into
    the game folder. It contains
    everything below, including `openxr_loader.dll`, the 5.01 script mods and the setup tool
    (`Witcher3VR/linux/w3vr-linux.py`). To use your own build instead, build `dxgi.dll` (see
