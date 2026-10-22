@@ -29,10 +29,12 @@ struct V3 {
 
 // Procedural world colour (BGR) from a direction: smooth gradients plus a
 // lat/lon grid so misplacement shows up as error.
+bool g_world_grid = true;
+
 void world(const V3& d, float out[3]) {
     const float lon = std::atan2(d.x, -d.z);
     const float lat = std::asin(std::fmax(-1.0f, std::fmin(1.0f, d.y)));
-    const float grid = (std::fabs(std::sin(lon * 12.0f)) < 0.08f ||
+    const float grid = g_world_grid && (std::fabs(std::sin(lon * 12.0f)) < 0.08f ||
         std::fabs(std::sin(lat * 12.0f)) < 0.08f) ? 60.0f : 0.0f;
     out[0] = 100.0f + 80.0f * std::sin(lat) + grid;
     out[1] = 120.0f + 60.0f * std::cos(lon) * std::cos(lat) + grid;
@@ -148,7 +150,9 @@ int main() {
     for (const auto& v : mono) {
         mono_ptrs.push_back(&v);
     }
-    const auto mono_image = c360::assemble_mono(mono_ptrs, 1024, 8);
+    c360::AssembleOptions exact{};
+    exact.sharpen = 0.0f;  // compare against the world without the unsharp mask
+    const auto mono_image = c360::assemble_mono(mono_ptrs, 1024, 8, exact);
     const double mono_psnr = psnr(mono_image);
     std::printf("mono psnr %.2f dB\n", mono_psnr);
     check(mono_psnr > 27.0, "mono assembly matches the world (>27 dB)");
@@ -170,13 +174,118 @@ int main() {
         (v.band ? band_ptrs : pole_ptrs).push_back(&v);
     }
     const auto ods_image = c360::assemble_ods_eye(band_ptrs, pole_ptrs,
-        ods_options.ods_step_deg, 1024, 8);
+        ods_options.ods_step_deg, 1024, 8, exact);
     const double ods_psnr = psnr(ods_image);
     std::printf("ods psnr %.2f dB\n", ods_psnr);
     check(ods_psnr > 27.0, "ODS assembly matches the world (>27 dB)");
 
     const auto tb = c360::stack_top_bottom(ods_image, ods_image);
     check(tb.width == 1024 && tb.height == 1024, "top-bottom stack size");
+
+    // Single-band (old) path still matches.
+    c360::AssembleOptions single = exact;
+    single.two_band = false;
+    single.bicubic = false;
+    const double single_psnr = psnr(c360::assemble_mono(mono_ptrs, 1024, 8, single));
+    std::printf("mono single-band psnr %.2f dB\n", single_psnr);
+    check(single_psnr > 27.0, "single-band mono matches the world (>27 dB)");
+
+    // Seams: uncorrected exposure steps (no gain solve) on a smooth world.
+    // Two-band blending must spread them: the largest column-to-column jump of
+    // the equator's mean brightness gets smaller.
+    g_world_grid = false;
+    std::vector<c360::View> raw;
+    srand(11);
+    for (size_t i = 0; i < mono_plan.size(); ++i) {
+        const float gain = 0.75f + 0.5f * static_cast<float>(rand() % 1000) / 1000.0f;
+        raw.push_back(render_view(mono_plan[i], fov, w, h, -1, gain));
+    }
+    std::vector<const c360::View*> raw_ptrs;
+    for (const auto& v : raw) {
+        raw_ptrs.push_back(&v);
+    }
+    auto max_step = [](const c360::Image& image) {
+        std::vector<double> column(image.width, 0.0);
+        for (uint32_t y = image.height * 2 / 5; y < image.height * 3 / 5; ++y) {
+            for (uint32_t x = 0; x < image.width; ++x) {
+                const uint8_t* p = image.bgra.data() + (static_cast<size_t>(y) * image.width + x) * 4;
+                column[x] += 0.0722 * p[0] + 0.7152 * p[1] + 0.2126 * p[2];
+            }
+        }
+        double worst = 0.0;
+        for (uint32_t x = 0; x + 1 < image.width; ++x) {
+            worst = std::fmax(worst, std::fabs(column[x + 1] - column[x]) / (image.height / 5));
+        }
+        return worst;
+    };
+    c360::AssembleOptions narrow_only = exact;
+    narrow_only.two_band = true;
+    const double step_two = max_step(c360::assemble_mono(raw_ptrs, 1024, 8, narrow_only));
+    c360::AssembleOptions hard = exact;
+    hard.two_band = false;
+    const double step_single = max_step(c360::assemble_mono(raw_ptrs, 1024, 8, hard));
+    std::printf("exposure seam step: two-band %.2f, single %.2f\n", step_two, step_single);
+    check(step_two < 2.0, "two-band exposure seams are soft (<2 levels per column)");
+    g_world_grid = true;
+
+    // ODS band-to-pole seam: pole views 15% brighter than the band strips
+    // (no gain solve). The largest row-to-row jump of the mean brightness must
+    // shrink with two-band blending (the reported sky streak).
+    {
+        g_world_grid = false;
+        std::vector<c360::View> seam_views;
+        for (const auto& step : ods_plan) {
+            if (step.band) {
+                uint32_t x0 = 0, x1 = 0;
+                c360::strip_columns(fov, w, ods_options.ods_step_deg * 0.5f + 1.5f, 4, x0, x1);
+                seam_views.push_back(render_view(step, fov, w, h, 0, 1.0f, x0, x1));
+            } else {
+                seam_views.push_back(render_view(step, fov, w, h, -1, 1.15f));
+            }
+        }
+        std::vector<const c360::View*> b, p;
+        for (const auto& v : seam_views) {
+            (v.band ? b : p).push_back(&v);
+        }
+        auto row_jump = [](const c360::Image& image) {
+            double worst = 0.0;
+            double previous = -1.0;
+            for (uint32_t y = 0; y < image.height / 2; ++y) {
+                double sum = 0.0;
+                for (uint32_t x = 0; x < image.width; ++x) {
+                    const uint8_t* q = image.bgra.data() + (static_cast<size_t>(y) * image.width + x) * 4;
+                    sum += 0.0722 * q[0] + 0.7152 * q[1] + 0.2126 * q[2];
+                }
+                const double mean = sum / image.width;
+                if (previous >= 0.0) {
+                    worst = std::fmax(worst, std::fabs(mean - previous));
+                }
+                previous = mean;
+            }
+            return worst;
+        };
+        c360::AssembleOptions one = exact;
+        one.two_band = false;
+        const double jump_single = row_jump(c360::assemble_ods_eye(b, p,
+            ods_options.ods_step_deg, 1024, 8, one));
+        const double jump_two = row_jump(c360::assemble_ods_eye(b, p,
+            ods_options.ods_step_deg, 1024, 8, exact));
+        std::printf("ODS band/pole seam row jump: two-band %.2f, single %.2f\n",
+            jump_two, jump_single);
+        check(jump_two < 2.0, "band/pole seam stays soft (<2 levels per row)");
+        g_world_grid = true;
+    }
+
+    // rotate_left: the forward direction (centre column) moves 45 deg left.
+    c360::Image ramp{};
+    ramp.width = 360;
+    ramp.height = 2;
+    ramp.bgra.assign(360 * 2 * 4, 0);
+    for (uint32_t x = 0; x < 360; ++x) {
+        ramp.bgra[x * 4] = static_cast<uint8_t>(x % 256);
+    }
+    c360::rotate_left(ramp, 45.0f);
+    check(ramp.bgra[(180 - 45) * 4] == 180, "rotate_left moves the centre 45 deg left");
 
     if (g_failures == 0) {
         std::printf("capture360 tests passed\n");

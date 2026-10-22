@@ -1,4 +1,4 @@
-// Witcher3VR pause menu see-through signal (Remastered 5.01 only).
+// Witcher3VR pause menu see-through and main menu signals (Remastered 5.01 only).
 //
 // While the in-game pause menu (its main list and its settings pages) is open,
 // dxgi.dll keeps rendering the world in stereo behind the menu, so the world
@@ -11,6 +11,17 @@
 // On PC that native evaluates its argument and ignores it; dxgi.dll intercepts
 // the two sentinel values. Without the DLL, or with the key off, these calls
 // do nothing. The game's own calls (0 and 1 around the HDR page) still run.
+
+// The start screen's main menu (isMainMenu) is shown or closed. dxgi.dll uses
+// it to treat the main menu reached by quitting a game like the startup
+// frontend (world screen, loading background).
+function W3VR_MainMenuSignal(shown: bool) {
+  if (shown) {
+    theGame.SetHDRMenuFadePercentage(7703.0f);
+  } else {
+    theGame.SetHDRMenuFadePercentage(7702.0f);
+  }
+}
 
 function W3VR_OptionsSeeThroughSignal(enable: bool) {
   if (enable) {
@@ -35,6 +46,7 @@ function OnConfigUI() {
 
   result = wrappedMethod();
   W3VR_OptionsSeeThroughSignal(!isMainMenu);
+  W3VR_MainMenuSignal(isMainMenu);
   return result;
 }
 
@@ -75,6 +87,9 @@ function OnClosingMenu() {
   var result: bool;
 
   W3VR_OptionsSeeThroughSignal(false);
+  if (isMainMenu) {
+    W3VR_MainMenuSignal(false);
+  }
   result = wrappedMethod();
   return result;
 }

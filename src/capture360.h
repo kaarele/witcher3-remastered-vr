@@ -75,15 +75,34 @@ void strip_columns(const Fov& fov, uint32_t full_width, float half_angle_deg,
 // between viewing directions). Leaves gain = 1 when there is no overlap.
 void solve_gains(std::vector<View>& views, uint32_t sample_width);
 
-// Mono equirect from full views (feather-blended, no parallax).
+// Assembly quality options.
+//  - Two-band blend: fine detail comes from the most central view of each
+//    direction (narrow seams, no averaging of slightly different views), while
+//    brightness and haze differences between views are spread over a wide
+//    area, so no exposure step or streak shows at the seams.
+//  - Bicubic (Catmull-Rom) sampling keeps more detail than bilinear.
+//  - A mild unsharp mask undoes the softening of the equirect resampling.
+struct AssembleOptions {
+    bool two_band{true};
+    bool bicubic{true};
+    float wide_feather{0.25f};  // fraction of the view's smaller side
+    float sharpen{0.35f};       // unsharp-mask amount, 0 = off
+};
+
+// Mono equirect from full views (no parallax).
 Image assemble_mono(const std::vector<const View*>& views,
-    uint32_t out_width, unsigned threads);
+    uint32_t out_width, unsigned threads, const AssembleOptions& options = {});
 
 // One eye of an ODS panorama: band strips of this eye (nearest steps, linear
 // blend between neighbours) and the shared pole views above/below the band.
 Image assemble_ods_eye(const std::vector<const View*>& band,
     const std::vector<const View*>& poles, float ods_step_deg,
-    uint32_t out_width, unsigned threads);
+    uint32_t out_width, unsigned threads, const AssembleOptions& options = {});
+
+// Rotates an equirect picture about the vertical axis: content moves
+// `degrees` to the LEFT (longitude decreases), e.g. 45 puts the capture's
+// forward direction 45 degrees left of the picture centre.
+void rotate_left(Image& image, float degrees);
 
 // Top-bottom stack (left eye on top), as the loading-background viewer expects.
 Image stack_top_bottom(const Image& top, const Image& bottom);

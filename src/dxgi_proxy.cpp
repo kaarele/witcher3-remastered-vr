@@ -673,14 +673,17 @@ struct Config {
     // menu_world_follow_angle degrees (yaw) away from the screen centre for
     // menu_world_follow_delay seconds, the screen eases back in front of the
     // view over menu_world_follow_time seconds. Looking into the corners of
-    // the screen never moves it.
-    bool menu_world_follow{true};
+    // the screen never moves it. Off by default (owner: the screen stays put).
+    bool menu_world_follow{false};
     float menu_world_follow_angle{25.0f};
     float menu_world_follow_delay{0.8f};
     float menu_world_follow_time{0.6f};
     // Width/height of the picture shown on the world screen (the game draws
     // its frontend letterboxed into the eye render size); 0 = the whole image.
     float menu_world_aspect{16.0f / 9.0f};
+    // Degrees the world screen is raised above the menus' downward-tilted
+    // centre (it keeps facing the viewer).
+    float menu_world_pitch_offset{5.0f};
     // [FEATURE:OPTIONS-SEE-THROUGH 2/6] [openxr] options_menu_see_through=1:
     // while the in-game graphics, post-processing or display options page is
     // open (signalled by the 5.01 state-bridge script mod), keep stereo
@@ -749,8 +752,8 @@ struct Config {
     float loading_background_yaw_offset{0.0f};
     float loading_background_pitch{0.0f};
     float loading_background_roll{0.0f};
-    int loading_background_max_width{8192};
-    int loading_background_eye_width{2400};
+    int loading_background_max_width{10240};
+    int loading_background_eye_width{2880};
     std::string loading_background_folder{"w3vr_backgrounds"};
     // [FEATURE:CAPTURE-360 1/9] In-game 360-degree capture ([openxr]
     // capture360*), off by default. The hotkey turns the camera through a
@@ -759,12 +762,17 @@ struct Config {
     // loading-background folder.
     bool capture360_enabled{false};
     int capture360_virtual_key{VK_F4};
-    bool capture360_stereo{false};          // capture360_mode=stereo_ods
+    bool capture360_stereo{true};           // capture360_mode=stereo_ods (default)
     float capture360_ods_step{3.0f};
     int capture360_settle_frames{24};
     int capture360_ods_settle_frames{6};
-    int capture360_width{8192};
+    int capture360_width{10240};
     float capture360_jpeg_quality{0.92f};
+    // Degrees the saved picture is turned so the capture's forward direction
+    // (the subject, e.g. Geralt) lands LEFT of the picture centre, where the
+    // loading screen covers it otherwise.
+    float capture360_subject_yaw{45.0f};
+    float capture360_sharpen{0.35f};        // unsharp-mask amount, 0 = off
     bool reverse_enabled{false};
     bool reverse_scan_periodic{false};
     bool reverse_scan_unmap{false};
@@ -3206,6 +3214,13 @@ std::atomic<uint64_t> g_options_see_through_since_present{UINT64_MAX};
 std::atomic<bool> g_options_see_through_fallback{};
 constexpr float kOptionsSeeThroughOnValue = 7701.0f;
 constexpr float kOptionsSeeThroughOffValue = 7700.0f;
+// [FEATURE:MAIN-MENU-SIGNAL 1/4] The same script channel reports the start
+// screen's main menu (CR4IngameMenu with isMainMenu): shown / closed. The
+// mod cannot otherwise tell the main menu reached by quitting a game from an
+// in-game menu (both are full-screen menus without an HMD world camera).
+constexpr float kMainMenuOnValue = 7703.0f;
+constexpr float kMainMenuOffValue = 7702.0f;
+std::atomic<bool> g_main_menu_signal{};
 // About 1.5 s at the usual 80-90 Presents/s.
 constexpr uint64_t kOptionsSeeThroughArmPresents = 135;
 
@@ -17325,7 +17340,7 @@ void load_config() {
         g_config.menu_world_width = std::clamp(
             read_ini_float("openxr", "menu_world_width", 3.6f), 0.5f, 10.0f);
         g_config.menu_world_follow =
-            read_ini_bool("openxr", "menu_world_follow", true);
+            read_ini_bool("openxr", "menu_world_follow", false);
         g_config.menu_world_follow_angle = std::clamp(
             read_ini_float("openxr", "menu_world_follow_angle", 25.0f),
             5.0f, 90.0f);
@@ -17338,6 +17353,8 @@ void load_config() {
         g_config.menu_world_reanchor_distance = std::clamp(
             read_ini_float("openxr", "menu_world_reanchor_distance", 0.5f),
             0.1f, 5.0f);
+        g_config.menu_world_pitch_offset = std::clamp(read_ini_float(
+            "openxr", "menu_world_pitch_offset", 5.0f), -45.0f, 45.0f);
         g_config.menu_world_aspect = read_ini_float(
             "openxr", "menu_world_aspect", 16.0f / 9.0f);
         if (!(g_config.menu_world_aspect >= 0.5f &&
@@ -17346,9 +17363,11 @@ void load_config() {
         }
         log_line(
             "Config menu world screen locked=%d distance=%.3f width=%.3f "
-            "reanchor_distance=%.3f follow=%d angle=%.1f delay=%.2f time=%.2f",
+            "pitch_offset=%.1f reanchor_distance=%.3f follow=%d angle=%.1f "
+            "delay=%.2f time=%.2f",
             g_config.menu_world_locked ? 1 : 0,
             g_config.menu_world_distance, g_config.menu_world_width,
+            g_config.menu_world_pitch_offset,
             g_config.menu_world_reanchor_distance,
             g_config.menu_world_follow ? 1 : 0,
             g_config.menu_world_follow_angle,
@@ -17467,9 +17486,9 @@ void load_config() {
         g_config.loading_background_roll = std::clamp(read_ini_float(
             "openxr", "loading_background_roll", 0.0f), -90.0f, 90.0f);
         g_config.loading_background_max_width = std::clamp(read_ini_int(
-            "openxr", "loading_background_max_width", 8192), 1024, 16384);
+            "openxr", "loading_background_max_width", 10240), 1024, 16384);
         g_config.loading_background_eye_width = std::clamp(read_ini_int(
-            "openxr", "loading_background_eye_width", 2400), 512, 4096);
+            "openxr", "loading_background_eye_width", 2880), 512, 4096);
         g_config.loading_background_folder = read_ini_string(
             "openxr", "loading_background_folder", "w3vr_backgrounds");
         // [FEATURE:CAPTURE-360 2/9]
@@ -17481,7 +17500,7 @@ void load_config() {
             g_config.capture360_virtual_key = virtual_key != 0 ? virtual_key : VK_F4;
         }
         g_config.capture360_stereo = read_ini_string(
-            "openxr", "capture360_mode", "mono") == "stereo_ods";
+            "openxr", "capture360_mode", "stereo_ods") != "mono";
         g_config.capture360_ods_step = std::clamp(read_ini_float(
             "openxr", "capture360_ods_step", 3.0f), 1.0f, 15.0f);
         g_config.capture360_settle_frames = std::clamp(read_ini_int(
@@ -17489,7 +17508,11 @@ void load_config() {
         g_config.capture360_ods_settle_frames = std::clamp(read_ini_int(
             "openxr", "capture360_ods_settle_frames", 6), 2, 600);
         g_config.capture360_width = std::clamp(read_ini_int(
-            "openxr", "capture360_width", 8192), 1024, 16384) & ~1;
+            "openxr", "capture360_width", 10240), 1024, 16384) & ~1;
+        g_config.capture360_subject_yaw = std::clamp(read_ini_float(
+            "openxr", "capture360_subject_yaw", 45.0f), -180.0f, 180.0f);
+        g_config.capture360_sharpen = std::clamp(read_ini_float(
+            "openxr", "capture360_sharpen", 0.35f), 0.0f, 2.0f);
         g_config.capture360_jpeg_quality = std::clamp(read_ini_float(
             "openxr", "capture360_jpeg_quality", 0.92f), 0.5f, 1.0f);
         apply_hud_frame_scale();
@@ -17815,13 +17838,14 @@ void load_config() {
         // [debug] switches above have been read.
         if (g_config.capture360_enabled) {
             log_line("Capture360 enabled key=vk0x%02X mode=%s ods_step=%.1f "
-                "settle=%d/%d width=%d quality=%.2f",
+                "settle=%d/%d width=%d quality=%.2f subject_yaw=%.1f sharpen=%.2f",
                 g_config.capture360_virtual_key,
                 g_config.capture360_stereo ? "stereo_ods" : "mono",
                 g_config.capture360_ods_step,
                 g_config.capture360_settle_frames,
                 g_config.capture360_ods_settle_frames,
-                g_config.capture360_width, g_config.capture360_jpeg_quality);
+                g_config.capture360_width, g_config.capture360_jpeg_quality,
+                g_config.capture360_subject_yaw, g_config.capture360_sharpen);
         }
 
         // [FEATURE:VRS-MEASUREMENT 4/8] A measurement runs with
@@ -53295,11 +53319,35 @@ void __fastcall hook_engine_set_hdr_menu_fade_percentage(
         set_options_see_through_request(true);
     } else if (value == kOptionsSeeThroughOffValue) {
         set_options_see_through_request(false);
+    } else if (value == kMainMenuOnValue || value == kMainMenuOffValue) {
+        // [FEATURE:MAIN-MENU-SIGNAL 2/4]
+        const bool on = value == kMainMenuOnValue;
+        if (g_main_menu_signal.exchange(on, std::memory_order_acq_rel) != on) {
+            log_line("Main menu signal=%d present=%llu", on ? 1 : 0,
+                static_cast<unsigned long long>(g_present_count.load()));
+        }
     }
 }
 
+// [FEATURE:MAIN-MENU-SIGNAL 3/4] The start screen's main menu is open and the
+// world is not being rendered for the headset (guards against a signal left on
+// if the script missed a close: a fresh HMD world camera always wins).
+bool main_menu_frontend_active() {
+    if (!g_main_menu_signal.load(std::memory_order_acquire)) {
+        return false;
+    }
+    const uint64_t now = g_present_count.load(std::memory_order_relaxed);
+    const uint64_t last_world_camera =
+        g_engine_hmd_camera_last_present.load(std::memory_order_relaxed);
+    return last_world_camera == UINT64_MAX || last_world_camera > now ||
+        now - last_world_camera > 45;
+}
+
 void install_options_see_through_signal_hook() {
-    if (!g_config.options_menu_see_through ||
+    // Also needed for the main menu signal (loading background and the world
+    // screen on the main menu reached by quitting a game).
+    if (!(g_config.options_menu_see_through || g_config.loading_background ||
+            g_config.menu_world_locked) ||
         g_engine_set_hdr_menu_fade_original != nullptr) {
         return;
     }
@@ -53320,9 +53368,10 @@ void install_options_see_through_signal_hook() {
             &g_engine_set_hdr_menu_fade_original) == MH_OK &&
         MH_EnableHook(target) == MH_OK) {
         log_line("Options see-through signal hooked target=%p opcode_table=%p "
-            "on=%.0f off=%.0f",
+            "on=%.0f off=%.0f main_menu_on=%.0f main_menu_off=%.0f",
             target, static_cast<const void*>(g_script_opcode_handlers),
-            kOptionsSeeThroughOnValue, kOptionsSeeThroughOffValue);
+            kOptionsSeeThroughOnValue, kOptionsSeeThroughOffValue,
+            kMainMenuOnValue, kMainMenuOffValue);
     } else {
         g_script_opcode_handlers = nullptr;
         g_engine_set_hdr_menu_fade_original = nullptr;
@@ -63308,12 +63357,16 @@ bool consume_openxr_early_frame(XrFrameState& frame_state) {
 // [openxr] loading_background_seconds, starting from a random file.
 namespace loading_background {
 
+// full = decoded at loading_background_max_width; the prefetched next picture
+// is decoded at half that width (it only covers the crossfade) and replaced by
+// a full decode once it is shown, so at most one full-size picture is in VRAM.
 struct DecodedImage {
     std::vector<uint8_t> bgra;
     uint32_t width{};
     uint32_t height{};
     bool stereo_tb{};
     size_t index{};
+    bool full{};
 };
 
 struct GpuImage {
@@ -63322,6 +63375,7 @@ struct GpuImage {
     uint32_t height{};
     bool stereo_tb{};
     size_t index{};
+    bool full{};
 };
 
 struct PendingRelease {
@@ -63543,17 +63597,19 @@ bool decode_file(const std::wstring& path, uint32_t max_width,
     return true;
 }
 
-void request_decode(size_t index) {
+void request_decode(size_t index, bool full = true) {
     if (g_files.empty() || g_decode_busy.exchange(true)) {
         return;
     }
     const std::wstring path = g_files[index % g_files.size()];
-    const uint32_t max_width = static_cast<uint32_t>(
+    const uint32_t configured = static_cast<uint32_t>(
         std::clamp(g_config.loading_background_max_width, 1024, 16384));
+    const uint32_t max_width = full ? configured : std::max(1024u, configured / 2);
     const uint64_t generation = g_decode_generation.load();
-    std::thread([path, max_width, index, generation]() {
+    std::thread([path, max_width, index, generation, full]() {
         auto image = std::make_unique<DecodedImage>();
         image->index = index;
+        image->full = full;
         const bool ok = decode_file(path, max_width, *image);
         if (ok && generation == g_decode_generation.load()) {
             std::scoped_lock lock{g_decode_mutex};
@@ -63881,6 +63937,7 @@ bool upload(const DecodedImage& image, GpuImage& target) {
     target.height = image.height;
     target.stereo_tb = image.stereo_tb;
     target.index = image.index;
+    target.full = image.full;
     return true;
 }
 
@@ -63931,6 +63988,10 @@ bool context_active(bool fullscreen_menu, bool loading_video,
     }
     if (last_hmd_camera == UINT64_MAX) {
         return g_config.loading_background_frontend;
+    }
+    // [FEATURE:MAIN-MENU-SIGNAL 4/4] The main menu reached by quitting a game.
+    if (g_config.loading_background_frontend && main_menu_frontend_active()) {
+        return true;
     }
     if (g_loading_object_trusted && object_state == 1) {
         return true;
@@ -64339,13 +64400,17 @@ void assemble_and_write(std::vector<c360::View> views, bool stereo,
         std::thread::hardware_concurrency() > 2
             ? std::thread::hardware_concurrency() - 2 : 1u);
     c360::solve_gains(views, 512);
+    c360::AssembleOptions options{};
+    options.sharpen = g_config.capture360_sharpen;
+    const float subject_yaw = g_config.capture360_subject_yaw;
     c360::Image output;
     if (!stereo) {
         std::vector<const c360::View*> pointers;
         for (const auto& view : views) {
             pointers.push_back(&view);
         }
-        output = c360::assemble_mono(pointers, width, threads);
+        output = c360::assemble_mono(pointers, width, threads, options);
+        c360::rotate_left(output, subject_yaw);
     } else {
         std::vector<const c360::View*> poles;
         std::vector<const c360::View*> band[2];
@@ -64356,10 +64421,12 @@ void assemble_and_write(std::vector<c360::View> views, bool stereo,
                 band[view.eye].push_back(&view);
             }
         }
-        const c360::Image left = c360::assemble_ods_eye(band[0], poles,
-            g_config.capture360_ods_step, width, threads);
-        const c360::Image right = c360::assemble_ods_eye(band[1], poles,
-            g_config.capture360_ods_step, width, threads);
+        c360::Image left = c360::assemble_ods_eye(band[0], poles,
+            g_config.capture360_ods_step, width, threads, options);
+        c360::Image right = c360::assemble_ods_eye(band[1], poles,
+            g_config.capture360_ods_step, width, threads, options);
+        c360::rotate_left(left, subject_yaw);
+        c360::rotate_left(right, subject_yaw);
         output = c360::stack_top_bottom(left, right);
     }
     views.clear();
@@ -64529,10 +64596,27 @@ bool record_loading_background(const XrView* views, uint64_t now_ms) {
         decoded = std::move(lb::g_decoded);
     }
     if (decoded != nullptr) {
-        lb::GpuImage& slot = lb::g_front.texture == nullptr ? lb::g_front : lb::g_back;
-        if (slot.texture == nullptr && !lb::upload(*decoded, slot)) {
-            log_line("Loading background upload failed %ux%u",
-                decoded->width, decoded->height);
+        if (decoded->full && lb::g_front.texture != nullptr &&
+            decoded->index == lb::g_front.index) {
+            // Full-size upgrade of the picture now shown (it came in as the
+            // half-size prefetch); a stale one is dropped.
+            lb::GpuImage upgraded{};
+            if (!lb::g_front.full && !lb::g_fading) {
+                if (lb::upload(*decoded, upgraded)) {
+                    lb::release_image(lb::g_front);
+                    lb::g_front = upgraded;
+                } else {
+                    log_line("Loading background upload failed %ux%u",
+                        decoded->width, decoded->height);
+                }
+            }
+        } else {
+            lb::GpuImage& slot =
+                lb::g_front.texture == nullptr ? lb::g_front : lb::g_back;
+            if (slot.texture == nullptr && !lb::upload(*decoded, slot)) {
+                log_line("Loading background upload failed %ux%u",
+                    decoded->width, decoded->height);
+            }
         }
     }
     if (lb::g_front.texture == nullptr) {
@@ -64542,11 +64626,17 @@ bool record_loading_background(const XrView* views, uint64_t now_ms) {
         }
         return false;
     }
-    // Prefetch the next picture once the current one is shown.
-    if (lb::g_files.size() > 1 && lb::g_back.texture == nullptr &&
+    // The picture shown came in as the half-size prefetch: load it full size.
+    if (!lb::g_front.full && !lb::g_fading && !lb::g_decode_busy.load()) {
+        lb::request_decode(lb::g_front.index, true);
+    }
+    // Prefetch the next picture (half size, for the crossfade) once the
+    // current one is shown at full size.
+    if (lb::g_files.size() > 1 && lb::g_front.full &&
+        lb::g_back.texture == nullptr &&
         !lb::g_back_requested && !lb::g_decode_busy.load()) {
         lb::g_back_requested = true;
-        lb::request_decode((lb::g_front.index + 1) % lb::g_files.size());
+        lb::request_decode((lb::g_front.index + 1) % lb::g_files.size(), false);
     }
     if (!lb::g_fading && lb::g_back.texture != nullptr &&
         now_ms >= lb::g_switch_at_ms) {
@@ -68389,8 +68479,11 @@ void render_openxr_test_frame(
     // [FEATURE:MENU-WORLD-SCREEN 4/5] Kind 3: the startup frontend (main menu,
     // loading screens) and the loading video as one world-locked screen.
     // In-game menus (kind 1) and cinema (kind 2) keep their own anchoring.
+    // The main menu reached by quitting a game is part of the frontend too
+    // (script signal; a fresh HMD world camera overrides it).
     const bool world_menu_screen = g_config.menu_world_locked &&
-        fullscreen_menu && (startup_frontend_panel || loading_video);
+        fullscreen_menu && (startup_frontend_panel || loading_video ||
+            main_menu_frontend_active());
     // The frontend picture is letterboxed inside the eye render size; on the
     // world screen show only its centred menu_world_aspect part, so the black
     // bars do not become part of the screen.
@@ -68504,6 +68597,14 @@ void render_openxr_test_frame(
         world_follow_animating = false;
         if (fullscreen_menu) {
             world_screen_tilt = menu_visible_center_tilt(anchor_views[0].fov);
+            if (spatial_panel_kind == 3 && g_config.menu_world_pitch_offset != 0.0f) {
+                // Raise the world screen; +x rotation turns -z forward upwards.
+                const float half =
+                    g_config.menu_world_pitch_offset * 0.00872664626f;
+                world_screen_tilt = w3vr::openxr_eye_geometry::multiply(
+                    world_screen_tilt,
+                    XrQuaternionf{sinf(half), 0.0f, 0.0f, cosf(half)});
+            }
             anchored_panel_pose.orientation =
                 w3vr::openxr_eye_geometry::multiply(
                     anchored_panel_pose.orientation, world_screen_tilt);

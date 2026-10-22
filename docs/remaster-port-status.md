@@ -1385,3 +1385,37 @@ thread, just before xrWaitFrame/xrEndFrame.
   stereo_ods = 360/step strips (120 at 3 degrees) + the same pole rings (about 40 s).
 - Status: built, unit-tested, not run in the game yet.
 
+
+### Polish after the first headset test of the 360 features (2026-10-22)
+- World screen (`menu_world_locked`): lazy follow is off by default again (`menu_world_follow=0`);
+  the screen stays where it was anchored, `F9` re-centres it. New `menu_world_pitch_offset=5`
+  raises the screen 5 degrees above the menus' downward-tilted visible centre (owner: it looked
+  slightly tilted down); it keeps facing the viewer.
+- Main menu after quitting a game: the 5.01 state-bridge script sends a second signal through the
+  same no-op native (`SetHDRMenuFadePercentage` 7703 = main menu shown, 7702 = closed), from
+  `CR4IngameMenu.OnConfigUI` / `OnClosingMenu` when `isMainMenu`. While it is on and no fresh HMD
+  world camera arrives (more than 45 Presents), the loading background shows
+  (`loading_background_frontend`) and the world screen applies, as on the startup main menu.
+  The signal hook is installed when `options_menu_see_through`, `loading_background` or
+  `menu_world_locked` is on. Log: `Main menu signal=1/0`.
+- 360 capture:
+  - `capture360_mode` defaults to `stereo_ods`; `capture360_width` to 10240.
+  - Two-band assembly (`src/capture360.cpp`): every full view gets a low-pass copy (16-px cells,
+    blurred). Fine detail (sample - low) comes from the most central view (weight
+    `(edge / half size)^6`), the low band is feathered over 25% of each view. Brightness, bloom or
+    haze differences between pole views no longer show as a step or streak, and detail is not
+    averaged between views. ODS band strips keep their linear blend; the band-to-pole crossfade
+    is unchanged.
+  - Catmull-Rom sampling and a mild unsharp mask (`capture360_sharpen=0.35`).
+  - `capture360_subject_yaw=45`: the saved picture is rotated so the capture's forward direction
+    lands 45 degrees left of the picture centre (beside the 3.6 m loading screen, half-width about
+    36 degrees at 2.5 m).
+  - The headset view comes back by itself after a capture and on every abort
+    (`stop_override` clears the blank flag; `check_interrupt` aborts when the world view ends or
+    frames stop).
+  - Not done: a narrower per-view FOV for more real pixels per degree (the projection is set by
+    the runtime FOV); the source detail stays about 20 px/deg at the view centres.
+- Loading viewer: `loading_background_max_width=10240`, `loading_background_eye_width=2880`. The
+  next picture is decoded at half width for the crossfade and replaced by a full-size decode once
+  shown, so only one full-size picture is in GPU memory (10240 TB: about 420 MB + 105 MB for the
+  next one; before: two full 8192 pictures = 512 MB).
