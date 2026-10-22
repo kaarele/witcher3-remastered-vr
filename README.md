@@ -14,7 +14,8 @@ the [Witcher 3 VR](https://github.com/tig3rmast3r/witcher3-vr) mod by tig3rmast3
 | | Setup |
 |---|---|
 | ✅ **Polished, played regularly** | Linux (Bazzite) · Steam + Proton · NVIDIA RTX 3080 · Meta Quest 3 through WiVRn · DLSS Quality or DLAA |
-| 🟡 **Should work, not tested yet** | Windows · SteamVR · other headsets · AMD/Intel GPUs (FSR) · SteamOS / Steam Deck · GOG edition |
+| ✅ **Tested, works well** | Linux · **SteamVR** 2.18 · Meta Quest 3 through Steam Link · RTX 3080 (texture quality High or Medium, see [SteamVR on Linux](#linux-steam--proton)) |
+| 🟡 **Should work, not tested yet** | Windows (also SteamVR on Windows) · other headsets · AMD/Intel GPUs (FSR) · SteamOS / Steam Deck · GOG edition |
 | ❌ **Not supported** | Game versions other than 5.01 (the mod then switches itself off) · VR motion controllers |
 
 On the tested setup it is a complete, polished experience. Nobody has tried the other setups yet, so
@@ -122,7 +123,7 @@ near view, F10 the cinema screen, F11 first person.
   AMD owners: please try FSR and report how it runs.
 
 **Coming soon:**
-- SteamVR, on Linux and Windows (prepared, not tested yet; see [SteamVR on Linux](#linux-steam--proton)).
+- SteamVR on Windows (SteamVR on Linux is tested and works).
 - Windows in general (the code and the installer should work, but nobody has run them yet).
 - More detail close up: some objects and characters switch to their simpler versions too early in VR.
 - A photo-mode button for 360° pictures.
@@ -248,7 +249,7 @@ without a headset; the [feature status table](#platform-support) shows which.
 
 - *The Witcher 3: Wild Hunt*, Remastered, **patch 5.01**, DirectX 12, legally obtained. The Steam
   edition is tested. The mod checks the game build at startup and does nothing on other builds.
-- A VR headset with an **OpenXR runtime**. Tested: WiVRn on Linux. Others (SteamVR, Meta Quest
+- A VR headset with an **OpenXR runtime**. Tested: WiVRn and SteamVR (Steam Link) on Linux. Others (SteamVR on Windows, Meta Quest
   Link, Virtual Desktop, Monado, ...) are untested.
 - Mouse and keyboard, a gamepad, or a Steam Controller (tested with the 2026 Steam Controller). VR
   motion controllers are not supported.
@@ -342,11 +343,20 @@ file before it overwrites it:
 6. **Play:** with the headset connected, start the game from Steam or from WiVRn's app list in the
    headset. Proton sets up VR once, at launch.
 
-**SteamVR on Linux (experimental, not tested in the headset yet):** start SteamVR and connect the
-headset first (for a Quest: the Steam Link app). Then run `python3 linux/w3vr-linux.py configure --res runtime`
-and `python3 linux/w3vr-linux.py launch-options --runtime steamvr`; the printed line adds
-`XR_RUNTIME_JSON=".../SteamVR/steamxr_linux64.json"`, so the game uses SteamVR even when WiVRn is
-installed. SteamVR's per-application resolution setting then decides the render size.
+**SteamVR on Linux (tested with a Quest 3 through Steam Link, SteamVR 2.18):**
+1. Run once, so SteamVR's compositor gets the priority it needs (SteamVR usually asks for this
+   itself): `sudo setcap CAP_SYS_NICE+ep ~/.local/share/Steam/steamapps/common/SteamVR/bin/linux64/vrcompositor-launcher`
+2. Use the SteamVR launch options: `python3 Witcher3VR/linux/w3vr-linux.py launch-options --runtime steamvr`
+   (the line adds `XR_RUNTIME_JSON=".../SteamVR/steamxr_linux64.json"`, so the game uses SteamVR even when
+   WiVRn is installed) and paste it into Steam's launch options.
+3. Start SteamVR, connect the headset (Quest: the Steam Link app), then start the game.
+4. In the game set **Texture quality** (and Detail level) to **High** or **Medium** on a 10 GB graphics card. SteamVR
+   and Steam Link need more graphics memory than WiVRn; with Ultra textures the card ran full (9.9 of 10 GB) and
+   the game got slower and slower after a few seconds. High was fine except in crowded cities; Medium ran smoothly
+   everywhere.
+
+Steam Link sends the Quest 3 a picture that is only sharp in the centre (fixed foveated encoding); its
+*Video size* and *Bandwidth* settings help a little. WiVRn gives a sharper picture.
 
 **Uninstall:** with the game closed, run `python3 linux/w3vr-linux.py uninstall --restore-settings`
 and clear the launch options in Steam. Your saves are not touched. Deleting
@@ -618,7 +628,8 @@ The original mod's keys are documented in [witcher3vr.example.ini](witcher3vr.ex
 | Linux + Proton, AMD or Intel (including Steam Deck) | Untested | Stereo with FXAA should work. DLSS needs an NVIDIA RTX GPU. |
 | Windows 10/11 (native Direct3D 12) | Untested | The new code does not depend on Wine or vkd3d-proton, and the Remastered port this project builds on was developed on Windows. This project's build has not been run on Windows yet. |
 | WiVRn | Tested | |
-| SteamVR (Windows or Linux) | Untested | |
+| SteamVR on Linux | Tested | Quest 3 through Steam Link, SteamVR 2.18, RTX 3080; texture quality High or Medium (see SteamVR on Linux). |
+| SteamVR on Windows | Untested | |
 | Virtual Desktop (VDXR), Meta Quest Link / Air Link, Pimax, Monado, other OpenXR runtimes | Untested | Headsets with canted displays (for example Pimax) use a camera path that has not been tried on 5.01; we suggest `remaster_asymmetric_ndc=0` there. |
 | GOG edition, patch 5.01 | Untested by this project | Expected to use the same game executable as the Steam edition. The mod checks the executable and the game code before it hooks anything. |
 | Epic edition | Unknown | Works only if its game executable is the same 5.01 build the mod knows; otherwise the mod leaves the game alone. |
@@ -654,7 +665,8 @@ Feature status on the tested setup:
 | 360° loading backgrounds (`loading_background`) | Off (release ini: on) | Tested in the headset |
 | See-through pause menu (`options_menu_see_through`) | Off (release ini: on) | Tested in the headset |
 | In-game 360° capture (`capture360_enabled`, `F4`) | Off | Tested in the headset (3D, 10240x10240) |
-| Runtime render size (`render_size_from_runtime`), SteamVR launch options | Off | Not tested yet |
+| SteamVR launch options (`launch-options --runtime steamvr`) | Linux tool | Tested in the headset (Quest 3, Steam Link) |
+| Runtime render size (`render_size_from_runtime`) | Off | Not tested yet |
 | One-click installer (`Install (Linux)` / `Install (Windows)`) | — | Linux tested on test setups; Windows not run yet |
 | `frame_wait_early`, `pair_rate_divisor` | Off | Experimental, no gain measured |
 
@@ -678,6 +690,19 @@ Feature status on the tested setup:
 may be running on the CPU fallback renderer after a Flatpak NVIDIA driver update (its server log
 then shows `GPU: llvmpipe`). Quit the game and restart WiVRn, or reboot:
 `flatpak kill io.github.wivrn.wivrn`, then start WiVRn again.
+
+**SteamVR: the Steam Link app on the Quest says the connection failed (Linux, WiVRn also installed).**
+WiVRn points the OpenVR runtime at its own translation layer (xrizer), so SteamVR's server never starts.
+With SteamVR closed, set `"runtime"` in `~/.config/openvr/openvrpaths.vrpath` to
+`["~/.local/share/Steam/steamapps/common/SteamVR"]` (full path), then start SteamVR again. WiVRn changes it back
+when you use WiVRn.
+
+**SteamVR: smooth at first, then slower and slower.** The graphics card has run out of memory. Set Texture
+quality to High or Medium in the game (see SteamVR on Linux).
+
+**SteamVR: an empty starry void and no menu.** Steam Link's video stream stopped (SteamVR's log shows "stream
+reset" errors). Quit SteamVR, close and reopen the Steam Link app on the headset and connect again. The
+left controller's menu button opens the SteamVR dashboard.
 
 **The mod does nothing.** The game build is probably not 5.01, for example after a game update.
 `python3 linux/w3vr-linux.py status` shows the detected build.

@@ -6,6 +6,9 @@ original mod and of the Remastered port this project builds on are in [docs/rele
 
 ## 0.1.4 (2026-10-23)
 
+- **SteamVR on Linux tested and working** (Quest 3 through Steam Link, SteamVR 2.18): use
+  `launch-options --runtime steamvr`, run the one-time `setcap` for SteamVR, and set texture quality to High
+  or Medium on a 10 GB card.
 - **See-through pause menu:** the whole in-game pause menu (main list and all settings pages except
   HDR calibration) floats over the live stereo world on a soft dark panel with feathered edges, so
   graphics changes are visible as you make them (`[openxr] options_menu_see_through=1`, veil 0.75,
