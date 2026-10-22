@@ -17492,16 +17492,6 @@ void load_config() {
             "openxr", "capture360_width", 8192), 1024, 16384) & ~1;
         g_config.capture360_jpeg_quality = std::clamp(read_ini_float(
             "openxr", "capture360_jpeg_quality", 0.92f), 0.5f, 1.0f);
-        if (g_config.capture360_enabled) {
-            log_line("Capture360 enabled key=vk0x%02X mode=%s ods_step=%.1f "
-                "settle=%d/%d width=%d quality=%.2f",
-                g_config.capture360_virtual_key,
-                g_config.capture360_stereo ? "stereo_ods" : "mono",
-                g_config.capture360_ods_step,
-                g_config.capture360_settle_frames,
-                g_config.capture360_ods_settle_frames,
-                g_config.capture360_width, g_config.capture360_jpeg_quality);
-        }
         apply_hud_frame_scale();
 
         g_config.reverse_enabled = read_ini_bool("reverse", "enabled", false);
@@ -17820,6 +17810,18 @@ void load_config() {
             g_config.first_person_aim_diagnostics = false;
             g_config.cinema_camera_diagnostics = false;
             g_config.taau_drop_diagnostics = false;
+        }
+        // [FEATURE:CAPTURE-360 2b/9] Logged here: log_line is silent until the
+        // [debug] switches above have been read.
+        if (g_config.capture360_enabled) {
+            log_line("Capture360 enabled key=vk0x%02X mode=%s ods_step=%.1f "
+                "settle=%d/%d width=%d quality=%.2f",
+                g_config.capture360_virtual_key,
+                g_config.capture360_stereo ? "stereo_ods" : "mono",
+                g_config.capture360_ods_step,
+                g_config.capture360_settle_frames,
+                g_config.capture360_ods_settle_frames,
+                g_config.capture360_width, g_config.capture360_jpeg_quality);
         }
 
         // [FEATURE:VRS-MEASUREMENT 4/8] A measurement runs with
