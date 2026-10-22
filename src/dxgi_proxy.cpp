@@ -660,8 +660,17 @@ struct Config {
     // where it was anchored (for example a headset put on after startup).
     bool menu_world_locked{false};
     float menu_world_distance{2.5f};
-    float menu_world_width{2.4f};
+    float menu_world_width{3.6f};
     float menu_world_reanchor_distance{0.5f};
+    // Lazy follow of the world screen: after the head has turned more than
+    // menu_world_follow_angle degrees (yaw) away from the screen centre for
+    // menu_world_follow_delay seconds, the screen eases back in front of the
+    // view over menu_world_follow_time seconds. Looking into the corners of
+    // the screen never moves it.
+    bool menu_world_follow{true};
+    float menu_world_follow_angle{25.0f};
+    float menu_world_follow_delay{0.8f};
+    float menu_world_follow_time{0.6f};
     // Width/height of the picture shown on the world screen (the game draws
     // its frontend letterboxed into the eye render size); 0 = the whole image.
     float menu_world_aspect{16.0f / 9.0f};
@@ -671,9 +680,12 @@ struct Config {
     // rendering and draw the menu on the HUD plane over the live world instead
     // of the flat menu panel, so changes are visible as they are made.
     bool options_menu_see_through{false};
-    // Opacity of the veil that replaces the options page's black backdrop
-    // while see-through is active (0 = invisible, 1 = the game's black).
-    float options_menu_see_through_veil{0.5f};
+    // Opacity of the veil that replaces the pause menu's black backdrop
+    // while see-through is active (0 = invisible, 1 = the game's black), and
+    // the width of the soft fade to fully transparent at the edges of the
+    // HUD plane, as a fraction of its shorter side.
+    float options_menu_see_through_veil{0.75f};
+    float options_menu_see_through_feather{0.08f};
     float cinema_render_stereo_strength{1.0f};
     int cinema_hud_stereo_shift_px{-72};
     float manual_cinema_hud_scale{1.25f};
@@ -17266,7 +17278,18 @@ void load_config() {
             read_ini_float("openxr", "menu_world_distance", 2.5f),
             0.75f, 10.0f);
         g_config.menu_world_width = std::clamp(
-            read_ini_float("openxr", "menu_world_width", 2.4f), 0.5f, 10.0f);
+            read_ini_float("openxr", "menu_world_width", 3.6f), 0.5f, 10.0f);
+        g_config.menu_world_follow =
+            read_ini_bool("openxr", "menu_world_follow", true);
+        g_config.menu_world_follow_angle = std::clamp(
+            read_ini_float("openxr", "menu_world_follow_angle", 25.0f),
+            5.0f, 90.0f);
+        g_config.menu_world_follow_delay = std::clamp(
+            read_ini_float("openxr", "menu_world_follow_delay", 0.8f),
+            0.0f, 10.0f);
+        g_config.menu_world_follow_time = std::clamp(
+            read_ini_float("openxr", "menu_world_follow_time", 0.6f),
+            0.05f, 5.0f);
         g_config.menu_world_reanchor_distance = std::clamp(
             read_ini_float("openxr", "menu_world_reanchor_distance", 0.5f),
             0.1f, 5.0f);
@@ -17278,19 +17301,27 @@ void load_config() {
         }
         log_line(
             "Config menu world screen locked=%d distance=%.3f width=%.3f "
-            "reanchor_distance=%.3f",
+            "reanchor_distance=%.3f follow=%d angle=%.1f delay=%.2f time=%.2f",
             g_config.menu_world_locked ? 1 : 0,
             g_config.menu_world_distance, g_config.menu_world_width,
-            g_config.menu_world_reanchor_distance);
+            g_config.menu_world_reanchor_distance,
+            g_config.menu_world_follow ? 1 : 0,
+            g_config.menu_world_follow_angle,
+            g_config.menu_world_follow_delay,
+            g_config.menu_world_follow_time);
         // [FEATURE:OPTIONS-SEE-THROUGH 3/6]
         g_config.options_menu_see_through =
             read_ini_bool("openxr", "options_menu_see_through", false);
         g_config.options_menu_see_through_veil = std::clamp(
-            read_ini_float("openxr", "options_menu_see_through_veil", 0.5f),
+            read_ini_float("openxr", "options_menu_see_through_veil", 0.75f),
             0.0f, 1.0f);
-        log_line("Config options menu see-through=%d veil=%.2f",
+        g_config.options_menu_see_through_feather = std::clamp(
+            read_ini_float("openxr", "options_menu_see_through_feather", 0.08f),
+            0.0f, 0.5f);
+        log_line("Config options menu see-through=%d veil=%.2f feather=%.3f",
             g_config.options_menu_see_through ? 1 : 0,
-            g_config.options_menu_see_through_veil);
+            g_config.options_menu_see_through_veil,
+            g_config.options_menu_see_through_feather);
         // Missing keys preserve the pre-V865 cinema exactly: full REDengine
         // baseline and the original zero-shift HUD composite.
         g_config.cinema_render_stereo_strength = std::clamp(
@@ -58000,14 +58031,21 @@ float4 bilinear_premultiplied(float2 position) {
         load_premultiplied(base + int2(1, 1)), f.x);
     return lerp(top, bottom, f.y);
 }
-// [FEATURE:OPTIONS-SEE-THROUGH 7/7] Bit 1 of filtered_sampling: the options
-// page draws an opaque black backdrop; key it into a veil (bits 8-15 = veil
+// [FEATURE:OPTIONS-SEE-THROUGH 7/7] Bit 1 of filtered_sampling: the pause
+// menu draws an opaque black backdrop; key it into a veil (bits 8-15 = veil
 // opacity), so the live world shows through while text and widgets stay solid.
-float4 options_backdrop_key(float4 c) {
+// Bits 16-23: the veil fades to fully transparent over this fraction of the
+// HUD's shorter side at its edges, so the panel has no hard border.
+float4 options_backdrop_key(float4 c, float2 position, float2 size) {
     if ((filtered_sampling & 2u) == 0u) {
         return c;
     }
     float veil = float((filtered_sampling >> 8) & 255u) / 255.0;
+    float feather = float((filtered_sampling >> 16) & 255u) / 255.0 *
+        min(size.x, size.y);
+    float2 edge = min(position, size - position);
+    float edge_distance = min(edge.x, edge.y);
+    veil *= feather > 0.5 ? smoothstep(0.0, feather, edge_distance) : 1.0;
     float level = max(max(c.r, c.g), c.b);
     float keep = saturate((level - 0.002) / 0.02);
     c.a *= lerp(veil, 1.0, keep);
@@ -58104,7 +58142,8 @@ float4 ps_main(PixelInput input) : SV_Target0 {
         }
         sum /= float(taps * taps);
         return sum.a > (1.0 / 1024.0)
-            ? options_backdrop_key(float4(sum.rgb / sum.a, sum.a))
+            ? options_backdrop_key(float4(sum.rgb / sum.a, sum.a),
+                  source_position, source_size)
             : float4(0.0, 0.0, 0.0, 0.0);
     }
     // [FIX:MODE3-HUD-SRGB 1/1] REDengine stores display-encoded HUD RGB in an
@@ -58112,7 +58151,7 @@ float4 ps_main(PixelInput input) : SV_Target0 {
     // target, whose RTV performs the matching output encoding.
     float4 hud = hud_texture.Load(int3(coordinate, 0));
     hud.rgb = srgb_to_linear(hud.rgb);
-    return options_backdrop_key(hud);
+    return options_backdrop_key(hud, float2(coordinate) + 0.5, source_size);
 }
 )";
 
@@ -58975,7 +59014,10 @@ bool composite_mode3_hud_into_projection_image(
                 (options_see_through_active()
                     ? 2u | (static_cast<uint32_t>(std::lround(std::clamp(
                           g_config.options_menu_see_through_veil, 0.0f, 1.0f) *
-                          255.0f)) << 8)
+                          255.0f)) << 8) |
+                      (static_cast<uint32_t>(std::lround(std::clamp(
+                          g_config.options_menu_see_through_feather, 0.0f,
+                          1.0f) * 255.0f)) << 16)
                     : 0u)};
         memcpy(&sampling_constants[2], &hud_scale_x, sizeof(hud_scale_x));
         memcpy(&sampling_constants[3], &hud_scale_y, sizeof(hud_scale_y));
@@ -67630,6 +67672,15 @@ void render_openxr_test_frame(
     static XrPosef anchored_panel_pose{};
     static XrVector3f anchored_panel_head_position{};
     static uint32_t anchored_panel_recenter_generation{};
+    // World-screen lazy follow state: the screen's yaw about its anchor head
+    // position, its fixed menu tilt, and the ease animation towards the head.
+    static float world_screen_yaw{};
+    static XrQuaternionf world_screen_tilt{0.0f, 0.0f, 0.0f, 1.0f};
+    static XrTime world_follow_outside_since{};
+    static bool world_follow_animating{};
+    static XrTime world_follow_start{};
+    static float world_follow_from{};
+    static float world_follow_to{};
     const uint32_t panel_recenter_generation =
         g_hmd_manual_recenter_generation.load(std::memory_order_acquire);
     const float panel_distance = world_menu_screen
@@ -67699,11 +67750,17 @@ void render_openxr_test_frame(
                   0.0f,
                   tracked_orientation.w / yaw_twist_length}
             : XrQuaternionf{0.0f, 0.0f, 0.0f, 1.0f};
+        world_screen_yaw = 2.0f * atan2f(
+            anchored_panel_pose.orientation.y,
+            anchored_panel_pose.orientation.w);
+        world_screen_tilt = XrQuaternionf{0.0f, 0.0f, 0.0f, 1.0f};
+        world_follow_outside_since = 0;
+        world_follow_animating = false;
         if (fullscreen_menu) {
+            world_screen_tilt = menu_visible_center_tilt(anchor_views[0].fov);
             anchored_panel_pose.orientation =
                 w3vr::openxr_eye_geometry::multiply(
-                    anchored_panel_pose.orientation,
-                    menu_visible_center_tilt(anchor_views[0].fov));
+                    anchored_panel_pose.orientation, world_screen_tilt);
         }
         const XrVector3f head_position{
             (anchor_views[0].pose.position.x +
@@ -67751,6 +67808,75 @@ void render_openxr_test_frame(
             anchored_panel_pose.orientation.y,
             anchored_panel_pose.orientation.z,
             anchored_panel_pose.orientation.w);
+    }
+    // [FEATURE:MENU-WORLD-FOLLOW 1/1] Lazy follow: small looks keep the world
+    // screen fixed; after the head has stayed more than menu_world_follow_angle
+    // (yaw) away from the screen centre for menu_world_follow_delay seconds,
+    // the screen eases in front of the view around its anchor head position.
+    // It stays level; the 360 loading background does not move.
+    if (spatial_panel_kind == 3 && anchored_panel_kind == 3 &&
+        anchored_panel_pose_valid && panel_tracking_pose_valid &&
+        g_config.menu_world_follow && frame_state.predictedDisplayTime > 0) {
+        constexpr float kTwoPi = 6.28318530718f;
+        const XrView* follow_views =
+            isolate_publication_pose && !frame_was_prepared
+            ? publication_views.data()
+            : g_xr_views.data();
+        const auto& head_orientation = follow_views[0].pose.orientation;
+        const float head_yaw =
+            2.0f * atan2f(head_orientation.y, head_orientation.w);
+        const XrTime now = frame_state.predictedDisplayTime;
+        float new_yaw = world_screen_yaw;
+        if (world_follow_animating) {
+            const float t = std::clamp(
+                static_cast<float>(now - world_follow_start) * 1e-9f /
+                    g_config.menu_world_follow_time,
+                0.0f, 1.0f);
+            const float eased = t * t * (3.0f - 2.0f * t);
+            new_yaw = world_follow_from +
+                std::remainder(world_follow_to - world_follow_from, kTwoPi) *
+                    eased;
+            if (t >= 1.0f) {
+                world_follow_animating = false;
+                world_follow_outside_since = 0;
+            }
+        } else {
+            const float off = std::remainder(head_yaw - world_screen_yaw, kTwoPi);
+            if (fabsf(off) * 57.2957795f > g_config.menu_world_follow_angle) {
+                if (world_follow_outside_since == 0) {
+                    world_follow_outside_since = now;
+                } else if (static_cast<float>(now - world_follow_outside_since) *
+                               1e-9f >= g_config.menu_world_follow_delay) {
+                    world_follow_animating = true;
+                    world_follow_start = now;
+                    world_follow_from = world_screen_yaw;
+                    world_follow_to = head_yaw;
+                    log_line(
+                        "OpenXR world menu screen follow present=%llu "
+                        "from_yaw=%.1f to_yaw=%.1f",
+                        static_cast<unsigned long long>(current_present),
+                        world_screen_yaw * 57.2957795f, head_yaw * 57.2957795f);
+                }
+            } else {
+                world_follow_outside_since = 0;
+            }
+        }
+        if (new_yaw != world_screen_yaw) {
+            world_screen_yaw = new_yaw;
+            const XrQuaternionf yaw_rotation{
+                0.0f, sinf(world_screen_yaw * 0.5f),
+                0.0f, cosf(world_screen_yaw * 0.5f)};
+            anchored_panel_pose.orientation =
+                w3vr::openxr_eye_geometry::multiply(
+                    yaw_rotation, world_screen_tilt);
+            const auto follow_offset = rotate_vector(
+                anchored_panel_pose.orientation,
+                XrVector3f{0.0f, 0.0f, -panel_distance});
+            anchored_panel_pose.position = {
+                anchored_panel_head_position.x + follow_offset.x,
+                anchored_panel_head_position.y + follow_offset.y,
+                anchored_panel_head_position.z + follow_offset.z};
+        }
     }
     // Before OpenXR reports a valid tracked pose, keep the startup panel in
     // VIEW space instead of placing it at LOCAL origin (which can be floor

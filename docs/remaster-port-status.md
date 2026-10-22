@@ -1258,7 +1258,13 @@ thread, just before xrWaitFrame/xrEndFrame.
     after startup.
   - Main menu, loading screen and video share one anchor. In-game menus and cinema are unchanged.
 - Log: `OpenXR world menu screen anchored ... reason=entered|recenter|head_moved`.
-- Status: built, not run yet.
+- Status: headless pass 2026-10-22 (night job N); headset-tested by the owner in try3 (liked it).
+- 2026-10-22 owner follow-up (job P):
+  - The screen is 1.5x larger by default (`menu_world_width=3.6`).
+  - Lazy follow (`menu_world_follow=1`, `menu_world_follow_angle=25`, `menu_world_follow_delay=0.8`, `menu_world_follow_time=0.6`):
+    - once the head yaw stays more than the angle away from the screen centre for the delay, the screen eases (smoothstep) to the head yaw around its anchor head position;
+    - pitch and level are unchanged, and the 360 loading background stays world-fixed;
+    - log line `OpenXR world menu screen follow ... from_yaw= to_yaw=`.
 
 ### 360-degree picture around the loading screen (`[openxr] loading_background`, experimental)
 - Owner request: replace the black void around the loading screen with a 2D or stereo 3D picture,
@@ -1333,3 +1339,14 @@ thread, just before xrWaitFrame/xrEndFrame.
   - whether the world keeps rendering while the menu has the game fully paused;
   - how dark the menu's own Flash background makes the world;
   - whether the menu is readable at HUD size.
+
+- 2026-10-22 owner follow-up (job P, after the try3 headset test: "I love the graphics menu"):
+  - The whole in-game pause menu is see-through now, not only the Graphics/Display pages.
+  - The script wraps `CR4IngameMenu.OnConfigUI`:
+    - it signals on when the pause menu opens in-game (`!isMainMenu`);
+    - `OnShowOptionSubmenu` signals on for every page except `settings_hdr`;
+    - `OnOptionPanelNavigateBack` and `OnNavigatedBack` keep it on after returning to the main list (off while a `refreshViewport` reopen is pending);
+    - `OnClosingMenu` signals off.
+  - Inventory, map and the other `CR4CommonMenu` panels are separate menus and unchanged.
+  - The veil is darker by default (`options_menu_see_through_veil=0.75`). It fades to fully transparent at the HUD edges over `options_menu_see_through_feather=0.08` of the shorter side (smoothstep, bits 16-23 of the sampling flags). Text and widgets stay solid.
+  - Open: whether the main pause list's backdrop is pure black, which the veil key needs. A dark textured backdrop would stay opaque.
