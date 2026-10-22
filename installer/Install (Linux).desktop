@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Install Witcher 3 Remastered VR
+Comment=Install the VR mod into The Witcher 3 (Steam). Everything comes from this folder.
+Icon=applications-games
+Terminal=true
+Exec=bash -c "exec bash \\"\\$(dirname \\"\\$1\\")/installer/install.sh\\"" w3vr-install %k
