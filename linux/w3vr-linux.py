@@ -85,6 +85,7 @@ REMASTER_DEFAULTS = (
     ('openxr', 'menu_world_locked', '1'),
     ('openxr', 'loading_background', '1'),
     ('openxr', 'options_menu_see_through', '1'),
+    ('openxr', 'capture360_subject_yaw', '60'),
     ('engine', 'remaster_pair_jitter', '1'),
     ('engine', 'remaster_pair_noise', '1'),
     ('engine', 'remaster_pair_previous_transforms', '1'),

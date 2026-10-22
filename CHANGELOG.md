@@ -17,7 +17,8 @@ original mod and of the Remastered port this project builds on are in [docs/rele
   `bin/x64_dx12/w3vr_backgrounds/`, rotating every 30 s. Ships with one 3D picture captured in the game.
 - **In-game 360° capture** (opt-in, `capture360_enabled=1`): pause menu + `F4` captures a 3D
   (omnidirectional stereo) 10240x10240 picture of the frozen world, assembled in the mod and added to
-  the rotation; saved with the forward direction 45° left of the screen.
+  the rotation; saved with the forward direction 60° left of the screen (`capture360_subject_yaw=60` in the
+  release ini).
 - **One-click installer:** extract the zip anywhere and open `Install (Linux)` or
   `Install (Windows)`; `Uninstall` reverts it. Nothing is downloaded. Linux sets the Steam launch
   options when Steam is closed. The Windows installer has not been run yet.

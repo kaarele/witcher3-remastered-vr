@@ -81,7 +81,7 @@ near view, F10 the cinema screen, F11 first person.
 - **Your own 360° pictures** (opt-in): set `capture360_enabled=1`, open the pause menu where you like
   the view and press `F4`. Keep still for about 30-40 seconds (the headset stays dark meanwhile).
   The 3D picture lands in the loading-screen rotation. Tip: turn the camera to face Geralt first; the
-  picture is saved with him to the left of the loading screen.
+  picture is saved with him 60° to the left, beside the loading screen.
 - **FSR works in Stereo**, with its own history for each eye. On NVIDIA the game uses its built-in
   FSR 2, which works but costs a lot of performance there, so DLSS is the better choice on NVIDIA.
   AMD owners: please try FSR and report how it runs.
@@ -513,7 +513,7 @@ The original mod's keys are documented in [witcher3vr.example.ini](witcher3vr.ex
 | `capture360_ods_step` | `3` | `stereo_ods`: degrees between strips (1-15). Smaller = cleaner stereo, longer capture. |
 | `capture360_settle_frames`, `capture360_ods_settle_frames` | `24`, `6` | Frames to wait after a camera turn before reading the picture, so DLSS/DLAA can settle (big turns / small ODS steps). Raise them if a picture looks soft or ghosted. |
 | `capture360_width` | `10240` | Width of the equirect picture per eye (height = width / 2; `stereo_ods` stacks both eyes, so 10240x10240). |
-| `capture360_subject_yaw` | `45` | Degrees the saved picture is turned so the capture's forward direction (what you faced, e.g. Geralt) lands this far LEFT of the picture centre. The loading screen sits at the centre, so the subject stays visible beside it. `0` = centred. |
+| `capture360_subject_yaw` | `45` (release ini and installer: `60`) | Degrees the saved picture is turned so the capture's forward direction (what you faced, e.g. Geralt) lands this far LEFT of the picture centre. The loading screen sits at the centre, so the subject stays visible beside it. `0` = centred. |
 | `capture360_sharpen` | `0.35` | Mild unsharp mask after the picture is assembled (0 = off). |
 | `capture360_jpeg_quality` | `0.92` | JPEG quality (0.5-1.0). |
 | `cinema_restore_gameplay_recenter` | `1` | After a cutscene, gameplay keeps the forward direction it had before the cutscene. |
