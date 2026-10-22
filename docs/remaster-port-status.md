@@ -1352,3 +1352,36 @@ thread, just before xrWaitFrame/xrEndFrame.
     - `options_menu_see_through_veil=0.75` is a perceived darkness. The panel is blended in linear light, so the linear opacity is 1 - (1 - v)^2.2.
     - A first try with a linear 0.75 measured only ~45% darker on screen, and the main pause list had no veil at all: its band is the game's own semi-transparent strip.
   - It fades to fully transparent at the HUD edges over `options_menu_see_through_feather=0.15` of the shorter side (smoothstep, bits 16-23 of the sampling flags).
+
+### In-game 360-degree capture (`[openxr] capture360_*`, 5.01, experimental)
+- Request: the null-runtime ring capture (10 views, game time running, feather blending across eye
+  offsets, 4096 wide) gave ghosting and too little resolution. The capture now runs inside the mod,
+  ideally from the see-through pause menu, where the world is frozen.
+- Trigger: `capture360_key` (default F4: free in the mod and in the game's input.settings; F7
+  belongs to the HUD editor) or a `capture360.now` file next to the exe (polled every 30 frames).
+  It only starts in the 3D world view.
+- Pose: `update_hmd_freelook_pose` replaces the head-derived yaw/pitch/position with the step's
+  direction (relative to where the player looked), divided by hmd_yaw/pitch_scale. Roll stays 0;
+  the native-canted route is off. The game camera's pitch is locked level (`hmd_lock_game_pitch`),
+  so step pitch is the true elevation.
+- Eye offset: the factory stereo offset is multiplied by `g_capture360_eye_scale`: 0 for mono and
+  pole steps (both eyes at the centre, no parallax between views), 1 for ODS band steps.
+- Settle: after each turn the capture waits `capture360_settle_frames` (24) frames, or
+  `capture360_ods_settle_frames` (6) between ODS strips, so DLSS/DLAA re-converges.
+- Readback: before the HUD composite (scene only, no menu or HUD), the eye slice of the XR swapchain
+  image goes RENDER_TARGET -> COPY_SOURCE, is copied to a READBACK buffer (full image, or just
+  the ODS strip), then goes back to RENDER_TARGET. The XR fence of that submission retires it;
+  rows are converted with `test_mode_convert_row`.
+- Headset: zero layers are submitted while the camera turns, so the player never sees the world spin.
+- Assembly (`src/capture360.cpp`, unit-tested on synthetic views: 33.7 dB mono with random
+  exposure, 34.2 dB ODS):
+  - Per-view gains solved from overlaps (auto exposure differs per direction).
+  - Mono: feather blend of full views.
+  - ODS: per eye, the two nearest strips are blended linearly in yaw and cross-faded into the mono
+    pole views near the strips' vertical edges.
+  - Output 8192 wide (TB 8192x8192 for stereo) as JPG via WIC into the loading-background folder.
+  - The loading background rescans the folder on its next appearance.
+- Plans: mono = 8 views at 45 degrees + 6 at +-55 + 3 at +-85 (26 steps, about 15 s);
+  stereo_ods = 360/step strips (120 at 3 degrees) + the same pole rings (about 40 s).
+- Status: built, unit-tested, not run in the game yet.
+

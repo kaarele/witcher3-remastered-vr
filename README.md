@@ -480,8 +480,15 @@ The original mod's keys are documented in [witcher3vr.example.ini](witcher3vr.ex
 | `loading_background_in_game_menus` | `0` | With `loading_background=1`: also around in-game menus while the game world is not being drawn. |
 | `loading_background_seconds` | `30` | Seconds per picture (5-3600). |
 | `loading_background_yaw_offset`, `loading_background_pitch`, `loading_background_roll` | `0` | Degrees. Turn the picture's centre to the left (yaw), or level a tilted camera (pitch, roll). The picture is fixed in the room, facing where you looked when it appeared. |
-| `loading_background_max_width`, `loading_background_eye_width` | `4096`, `1600` | Larger pictures are scaled down to this width when loaded (GPU memory). Per-eye width of the background layer. |
+| `loading_background_max_width`, `loading_background_eye_width` | `8192`, `2400` | Larger pictures are scaled down to this width when loaded (GPU memory). Per-eye width of the background layer. An 8192-wide top-bottom picture takes 256 MB of GPU memory, two during a crossfade; lower the width on cards with little memory. |
 | `loading_background_folder` | `w3vr_backgrounds` | Picture folder, relative to `bin/x64_dx12/`. |
+| `capture360_enabled` | `0` | Experimental. `1` = press `capture360_key` to capture a 360-degree picture of the game world into the loading-background folder (named `w3vr360_<date>_<time>_mono.jpg` or `_TB.jpg`). Best from the see-through pause menu: the world is frozen, so nothing moves between the views. The camera turns by itself for about 15-40 seconds while the headset stays dark; the menu and HUD are never in the picture. Not in the 3D world view (full-screen menus, loading) it does nothing. |
+| `capture360_key` | `F4` | Key that starts a capture (a key name such as `F4`). A file `capture360.now` next to `witcher3.exe` also starts one (for scripted runs). |
+| `capture360_mode` | `mono` | `mono` = one camera centre, seamless (no parallax between views): 8 views around plus 2 rings of 6 and 2 of 3 towards the poles. `stereo_ods` = 3D picture (top-bottom): slit-scan omnidirectional stereo, a strip every `capture360_ods_step` degrees for each eye, mono near the poles. |
+| `capture360_ods_step` | `3` | `stereo_ods`: degrees between strips (1-15). Smaller = cleaner stereo, longer capture. |
+| `capture360_settle_frames`, `capture360_ods_settle_frames` | `24`, `6` | Frames to wait after a camera turn before reading the picture, so DLSS/DLAA can settle (big turns / small ODS steps). Raise them if a picture looks soft or ghosted. |
+| `capture360_width` | `8192` | Width of the equirect picture per eye (height = width / 2; `stereo_ods` stacks both eyes, so 8192x8192). |
+| `capture360_jpeg_quality` | `0.92` | JPEG quality (0.5-1.0). |
 | `cinema_restore_gameplay_recenter` | `1` | After a cutscene, gameplay keeps the forward direction it had before the cutscene. |
 | `follow_runtime_recenter` | `0` | `1` = recenter the view when the runtime recenters (Meta button, WiVRn, SteamVR's *Reset seated position*). Not tested in the headset yet. |
 | `frame_wait_early` | `0` | Experimental. Strict Stereo: wait for the next OpenXR frame right after submitting, in standard OpenXR loop order. No gain measured in headless tests with a WiVRn-like pacer; not tried in the headset. |

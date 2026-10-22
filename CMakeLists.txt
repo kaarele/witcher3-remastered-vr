@@ -43,6 +43,7 @@ target_include_directories(minhook PUBLIC
 add_library(witcher3vr_dxgi SHARED
     src/aer_scheduler.cpp
     src/command_list_identity.cpp
+    src/capture360.cpp
     src/dxgi_proxy.cpp
     src/dxgi_proxy.def
     src/openxr_eye_geometry.cpp
@@ -192,6 +193,12 @@ if(BUILD_TESTING)
         "${W3VR_OPENXR_DIR}/include"
     )
     add_test(NAME renderer_eye_geometry COMMAND w3vr_openxr_eye_geometry_tests)
+
+    add_executable(w3vr_capture360_tests
+        tests/capture360_tests.cpp
+        src/capture360.cpp
+    )
+    add_test(NAME capture360 COMMAND w3vr_capture360_tests)
 
     add_executable(w3vr_rt_ingress_join_tests
         tests/rt_ingress_join_tests.cpp

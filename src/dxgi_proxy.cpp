@@ -47,6 +47,7 @@
 #include "pipeline_flight_recorder.h"
 #include "prefix_hook.h"
 #include "call_site_hook.h"
+#include "capture360.h"
 #include "hotkey_name.h"
 #include "camera_light_yaw.h"
 #include "route_flight_recorder.h"
@@ -748,9 +749,22 @@ struct Config {
     float loading_background_yaw_offset{0.0f};
     float loading_background_pitch{0.0f};
     float loading_background_roll{0.0f};
-    int loading_background_max_width{4096};
-    int loading_background_eye_width{1600};
+    int loading_background_max_width{8192};
+    int loading_background_eye_width{2400};
     std::string loading_background_folder{"w3vr_backgrounds"};
+    // [FEATURE:CAPTURE-360 1/9] In-game 360-degree capture ([openxr]
+    // capture360*), off by default. The hotkey turns the camera through a
+    // list of directions (best while paused), reads each eye image back
+    // before the HUD composite and writes an equirect JPG into the
+    // loading-background folder.
+    bool capture360_enabled{false};
+    int capture360_virtual_key{VK_F4};
+    bool capture360_stereo{false};          // capture360_mode=stereo_ods
+    float capture360_ods_step{3.0f};
+    int capture360_settle_frames{24};
+    int capture360_ods_settle_frames{6};
+    int capture360_width{8192};
+    float capture360_jpeg_quality{0.92f};
     bool reverse_enabled{false};
     bool reverse_scan_periodic{false};
     bool reverse_scan_unmap{false};
@@ -1736,6 +1750,18 @@ float g_hmd_position_y{};
 float g_hmd_position_z{};
 XrVector3f g_mono_neck_pose_correction{};
 std::mutex g_hmd_pose_snapshot_mutex{};
+// [FEATURE:CAPTURE-360 3/9] While a 360 capture runs, these replace the
+// head-derived camera pose (absolute yaw/pitch in the freelook frame, frozen
+// position) and scale the per-eye offset (0 = both eyes at the centre).
+std::atomic<bool> g_capture360_override{};
+std::atomic<float> g_capture360_override_yaw{};
+std::atomic<float> g_capture360_override_pitch{};
+std::atomic<float> g_capture360_override_position[3]{};
+std::atomic<float> g_capture360_eye_scale{1.0f};
+// The headset shows no layer while the camera turns (no spinning image).
+std::atomic<bool> g_capture360_blank_headset{};
+// Set when a capture wrote a new picture: the loading background rescans.
+std::atomic<bool> g_capture360_rescan_backgrounds{};
 
 XrQuaternionf multiply_quaternions(const XrQuaternionf& a, const XrQuaternionf& b);
 XrVector3f rotate_vector(const XrQuaternionf& rotation, const XrVector3f& vector);
@@ -17441,11 +17467,41 @@ void load_config() {
         g_config.loading_background_roll = std::clamp(read_ini_float(
             "openxr", "loading_background_roll", 0.0f), -90.0f, 90.0f);
         g_config.loading_background_max_width = std::clamp(read_ini_int(
-            "openxr", "loading_background_max_width", 4096), 1024, 16384);
+            "openxr", "loading_background_max_width", 8192), 1024, 16384);
         g_config.loading_background_eye_width = std::clamp(read_ini_int(
-            "openxr", "loading_background_eye_width", 1600), 512, 4096);
+            "openxr", "loading_background_eye_width", 2400), 512, 4096);
         g_config.loading_background_folder = read_ini_string(
             "openxr", "loading_background_folder", "w3vr_backgrounds");
+        // [FEATURE:CAPTURE-360 2/9]
+        g_config.capture360_enabled = read_ini_bool(
+            "openxr", "capture360_enabled", false);
+        {
+            const auto key = read_ini_string("openxr", "capture360_key", "F4");
+            const int virtual_key = w3vr::hotkey_name::parse_virtual_key(key);
+            g_config.capture360_virtual_key = virtual_key != 0 ? virtual_key : VK_F4;
+        }
+        g_config.capture360_stereo = read_ini_string(
+            "openxr", "capture360_mode", "mono") == "stereo_ods";
+        g_config.capture360_ods_step = std::clamp(read_ini_float(
+            "openxr", "capture360_ods_step", 3.0f), 1.0f, 15.0f);
+        g_config.capture360_settle_frames = std::clamp(read_ini_int(
+            "openxr", "capture360_settle_frames", 24), 2, 600);
+        g_config.capture360_ods_settle_frames = std::clamp(read_ini_int(
+            "openxr", "capture360_ods_settle_frames", 6), 2, 600);
+        g_config.capture360_width = std::clamp(read_ini_int(
+            "openxr", "capture360_width", 8192), 1024, 16384) & ~1;
+        g_config.capture360_jpeg_quality = std::clamp(read_ini_float(
+            "openxr", "capture360_jpeg_quality", 0.92f), 0.5f, 1.0f);
+        if (g_config.capture360_enabled) {
+            log_line("Capture360 enabled key=vk0x%02X mode=%s ods_step=%.1f "
+                "settle=%d/%d width=%d quality=%.2f",
+                g_config.capture360_virtual_key,
+                g_config.capture360_stereo ? "stereo_ods" : "mono",
+                g_config.capture360_ods_step,
+                g_config.capture360_settle_frames,
+                g_config.capture360_ods_settle_frames,
+                g_config.capture360_width, g_config.capture360_jpeg_quality);
+        }
         apply_hud_frame_scale();
 
         g_config.reverse_enabled = read_ini_bool("reverse", "enabled", false);
@@ -45084,7 +45140,10 @@ void __fastcall hook_engine_view_rebuild(float* view) {
             const float stereo_strength = normal_stereo_cinema_camera
                 ? g_config.cinema_render_stereo_strength
                 : 1.0f;
+            // [FEATURE:CAPTURE-360 5/9] Mono capture steps render both eyes
+            // from the centre; ODS band steps keep the full eye offset.
             const float offset = active_stereo_offset * stereo_strength *
+                g_capture360_eye_scale.load(std::memory_order_relaxed) *
                 (render_right_eye ? 0.5f : -0.5f);
             view[0] += stereo_right[0] * offset;
             view[1] += stereo_right[1] * offset;
@@ -60878,6 +60937,22 @@ void update_hmd_freelook_pose() {
         g_native_canted_cant_degrees = 0.0f;
     }
     g_native_canted_eye_geometry_valid = native_canted_valid;
+    // [FEATURE:CAPTURE-360 4/9] The capture's camera direction replaces the
+    // head's; roll stays level and the eyes use the parallel route.
+    if (g_capture360_override.load(std::memory_order_acquire)) {
+        g_hmd_yaw_degrees =
+            g_capture360_override_yaw.load(std::memory_order_relaxed);
+        g_hmd_pitch_degrees =
+            g_capture360_override_pitch.load(std::memory_order_relaxed);
+        g_hmd_roll_degrees = 0.0f;
+        g_hmd_position_x =
+            g_capture360_override_position[0].load(std::memory_order_relaxed);
+        g_hmd_position_y =
+            g_capture360_override_position[1].load(std::memory_order_relaxed);
+        g_hmd_position_z =
+            g_capture360_override_position[2].load(std::memory_order_relaxed);
+        g_native_canted_eye_geometry_valid = false;
+    }
     g_hmd_pose_valid.store(true, std::memory_order_release);
 }
 
@@ -63886,6 +63961,11 @@ void begin_frame(bool active, uint64_t now_ms) {
     g_active = active;
     log_line("Loading background %s", active ? "shown" : "hidden");
     if (active) {
+        // [FEATURE:CAPTURE-360 9/9] A new capture joins the rotation.
+        if (g_capture360_rescan_backgrounds.exchange(
+                false, std::memory_order_acq_rel)) {
+            g_files_scanned = false;
+        }
         if (!g_files_scanned) {
             scan_files();
         }
@@ -63923,6 +64003,506 @@ void begin_frame(bool active, uint64_t now_ms) {
 }
 
 }  // namespace loading_background
+
+// [FEATURE:CAPTURE-360 6/9] In-game 360-degree capture. On the hotkey (or a
+// capture360.now file next to the DLL) the camera is turned through
+// w3vr::capture360::plan_steps while the headset shows nothing. After each
+// step settles (DLSS needs a few frames to re-converge after a turn), the
+// eye images are copied from the XR swapchain before the HUD composite, so
+// neither menus nor the HUD reach the picture. The views are assembled on a
+// worker thread and written as JPG into the loading-background folder.
+namespace capture360_runtime {
+namespace c360 = w3vr::capture360;
+
+enum class Phase : int { Idle = 0, Running = 1, Draining = 2, Assembling = 3 };
+std::atomic<int> g_phase{0};
+std::vector<c360::Step> g_steps;
+size_t g_step_index{};
+int g_settle_left{};
+int g_wait_frames{};
+float g_base_yaw{};
+bool g_key_latched{};
+uint64_t g_frame_counter{};
+uint64_t g_started_ms{};
+bool g_stereo{};
+uint64_t g_frames_without_capture_call{};
+
+struct Pending {
+    ID3D12Resource* buffer{};
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+    DXGI_FORMAT format{DXGI_FORMAT_UNKNOWN};
+    c360::View meta{};
+    uint64_t fence{};  // 0 until the XR submission carrying the copy is signalled
+};
+std::vector<Pending> g_pending;
+std::vector<c360::View> g_views;
+
+std::wstring module_directory() {
+    wchar_t path[MAX_PATH]{};
+    const DWORD length = GetModuleFileNameW(
+        nullptr, path, static_cast<DWORD>(std::size(path)));
+    if (length == 0 || length >= std::size(path)) {
+        return {};
+    }
+    wchar_t* slash = wcsrchr(path, L'\\');
+    if (slash == nullptr) {
+        return {};
+    }
+    slash[1] = L'\0';
+    return path;
+}
+
+bool write_jpeg(const std::wstring& path, const c360::Image& image,
+    float quality) {
+    std::vector<uint8_t> bgr(static_cast<size_t>(image.width) * image.height * 3);
+    for (size_t i = 0, n = static_cast<size_t>(image.width) * image.height; i < n; ++i) {
+        bgr[i * 3 + 0] = image.bgra[i * 4 + 0];
+        bgr[i * 3 + 1] = image.bgra[i * 4 + 1];
+        bgr[i * 3 + 2] = image.bgra[i * 4 + 2];
+    }
+    const HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    IWICImagingFactory* factory{};
+    IWICStream* stream{};
+    IWICBitmapEncoder* encoder{};
+    IWICBitmapFrameEncode* frame{};
+    IPropertyBag2* properties{};
+    bool ok = SUCCEEDED(CoCreateInstance(CLSID_WICImagingFactory, nullptr,
+                  CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory))) &&
+        SUCCEEDED(factory->CreateStream(&stream)) &&
+        SUCCEEDED(stream->InitializeFromFilename(path.c_str(), GENERIC_WRITE)) &&
+        SUCCEEDED(factory->CreateEncoder(GUID_ContainerFormatJpeg, nullptr, &encoder)) &&
+        SUCCEEDED(encoder->Initialize(stream, WICBitmapEncoderNoCache)) &&
+        SUCCEEDED(encoder->CreateNewFrame(&frame, &properties));
+    if (ok && properties != nullptr) {
+        PROPBAG2 option{};
+        wchar_t name[] = L"ImageQuality";
+        option.pstrName = name;
+        VARIANT value{};
+        VariantInit(&value);
+        value.vt = VT_R4;
+        value.fltVal = quality;
+        properties->Write(1, &option, &value);
+    }
+    ok = ok && SUCCEEDED(frame->Initialize(properties)) &&
+        SUCCEEDED(frame->SetSize(image.width, image.height));
+    WICPixelFormatGUID format = GUID_WICPixelFormat24bppBGR;
+    ok = ok && SUCCEEDED(frame->SetPixelFormat(&format)) &&
+        IsEqualGUID(format, GUID_WICPixelFormat24bppBGR) &&
+        SUCCEEDED(frame->WritePixels(image.height, image.width * 3,
+            static_cast<UINT>(bgr.size()), bgr.data())) &&
+        SUCCEEDED(frame->Commit()) && SUCCEEDED(encoder->Commit());
+    if (properties != nullptr) properties->Release();
+    if (frame != nullptr) frame->Release();
+    if (encoder != nullptr) encoder->Release();
+    if (stream != nullptr) stream->Release();
+    if (factory != nullptr) factory->Release();
+    if (SUCCEEDED(co)) {
+        CoUninitialize();
+    }
+    return ok;
+}
+
+void set_override(const c360::Step& step) {
+    // The camera turns by head angle x hmd_*_scale; undo the scale so the
+    // camera lands exactly on the step. Head yaw is left-positive, the
+    // step's longitude grows to the right.
+    const float yaw_scale = std::fabs(g_config.hmd_yaw_scale) > 0.01f
+        ? g_config.hmd_yaw_scale : 1.0f;
+    const float pitch_scale = std::fabs(g_config.hmd_pitch_scale) > 0.01f
+        ? g_config.hmd_pitch_scale : 1.0f;
+    g_capture360_override_yaw.store(g_base_yaw - step.yaw_deg / yaw_scale,
+        std::memory_order_relaxed);
+    g_capture360_override_pitch.store(step.pitch_deg / pitch_scale,
+        std::memory_order_relaxed);
+    g_capture360_eye_scale.store(step.stereo ? 1.0f : 0.0f,
+        std::memory_order_relaxed);
+    g_capture360_override.store(true, std::memory_order_release);
+}
+
+void stop_override() {
+    g_capture360_override.store(false, std::memory_order_release);
+    g_capture360_eye_scale.store(1.0f, std::memory_order_relaxed);
+    g_capture360_blank_headset.store(false, std::memory_order_release);
+}
+
+void release_pending() {
+    if (!g_pending.empty()) {
+        // A copy may still be in flight on the XR queue.
+        wait_for_xr_gpu();
+    }
+    for (auto& pending : g_pending) {
+        if (pending.buffer != nullptr) {
+            pending.buffer->Release();
+        }
+    }
+    g_pending.clear();
+}
+
+void abort(const char* reason) {
+    stop_override();
+    release_pending();
+    g_views.clear();
+    g_views.shrink_to_fit();
+    g_phase.store(static_cast<int>(Phase::Idle), std::memory_order_release);
+    log_line("Capture360 aborted at step %zu/%zu: %s", g_step_index,
+        g_steps.size(), reason);
+}
+
+void start() {
+    c360::PlanOptions options{};
+    options.ods_step_deg = g_config.capture360_ods_step;
+    g_stereo = g_config.capture360_stereo;
+    g_steps = c360::plan_steps(
+        g_stereo ? c360::Mode::StereoOds : c360::Mode::Mono, options);
+    {
+        std::scoped_lock lock{g_hmd_pose_snapshot_mutex};
+        g_base_yaw = g_hmd_yaw_degrees;
+        g_capture360_override_position[0].store(g_hmd_position_x);
+        g_capture360_override_position[1].store(g_hmd_position_y);
+        g_capture360_override_position[2].store(g_hmd_position_z);
+    }
+    g_step_index = 0;
+    g_settle_left = g_config.capture360_settle_frames;
+    g_wait_frames = 0;
+    g_views.clear();
+    g_started_ms = GetTickCount64();
+    g_capture360_blank_headset.store(true, std::memory_order_release);
+    set_override(g_steps[0]);
+    g_phase.store(static_cast<int>(Phase::Running), std::memory_order_release);
+    log_line("Capture360 started mode=%s steps=%zu base_yaw=%.2f settle=%d/%d",
+        g_stereo ? "stereo_ods" : "mono", g_steps.size(), g_base_yaw,
+        g_config.capture360_settle_frames, g_config.capture360_ods_settle_frames);
+}
+
+bool triggered() {
+    const bool down =
+        (GetAsyncKeyState(g_config.capture360_virtual_key) & 0x8000) != 0;
+    const bool pressed = down && !g_key_latched;
+    g_key_latched = down;
+    if (pressed) {
+        log_line("Capture360 hotkey pressed");
+        return true;
+    }
+    if (g_frame_counter % 30 != 0) {
+        return false;
+    }
+    const std::wstring file = module_directory() + L"capture360.now";
+    if (GetFileAttributesW(file.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        return false;
+    }
+    DeleteFileW(file.c_str());
+    log_line("Capture360 trigger file found");
+    return true;
+}
+
+bool record_copy(const XrEyeSwapchain& swapchain, uint32_t image_index,
+    const XrCompositionLayerProjectionView& view, int eye,
+    const c360::Step& step) {
+    if (image_index >= swapchain.images.size()) {
+        return false;
+    }
+    ID3D12Resource* texture = swapchain.images[image_index].texture;
+    const XrRect2Di rect = view.subImage.imageRect;
+    if (texture == nullptr || rect.extent.width <= 0 || rect.extent.height <= 0) {
+        return false;
+    }
+    const uint32_t full_width = static_cast<uint32_t>(rect.extent.width);
+    const uint32_t full_height = static_cast<uint32_t>(rect.extent.height);
+    uint32_t x0 = 0;
+    uint32_t x1 = full_width;
+    if (step.band) {
+        const c360::Fov fov{view.fov.angleLeft, view.fov.angleRight,
+            view.fov.angleUp, view.fov.angleDown};
+        c360::strip_columns(fov, full_width,
+            g_config.capture360_ods_step * 0.5f + 1.5f, 4, x0, x1);
+        if (x1 <= x0) {
+            return false;
+        }
+    }
+    const DXGI_FORMAT format = swapchain.format;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+    footprint.Offset = 0;
+    footprint.Footprint.Format = format;
+    footprint.Footprint.Width = x1 - x0;
+    footprint.Footprint.Height = full_height;
+    footprint.Footprint.Depth = 1;
+    footprint.Footprint.RowPitch = ((x1 - x0) * 4 + 255) & ~255u;
+    const UINT64 size =
+        static_cast<UINT64>(footprint.Footprint.RowPitch) * full_height;
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type = D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Width = size;
+    desc.Height = 1;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    ID3D12Resource* buffer{};
+    if (FAILED(g_d3d12_device->CreateCommittedResource(&heap,
+            D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST,
+            nullptr, IID_PPV_ARGS(&buffer)))) {
+        return false;
+    }
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = texture;
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    g_xr_command_list->ResourceBarrier(1, &barrier);
+    D3D12_TEXTURE_COPY_LOCATION destination{};
+    destination.pResource = buffer;
+    destination.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    destination.PlacedFootprint = footprint;
+    D3D12_TEXTURE_COPY_LOCATION source{};
+    source.pResource = texture;
+    source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    source.SubresourceIndex = swapchain.stereo_array
+        ? view.subImage.imageArrayIndex : 0;
+    const D3D12_BOX box{
+        static_cast<UINT>(rect.offset.x) + x0,
+        static_cast<UINT>(rect.offset.y),
+        0,
+        static_cast<UINT>(rect.offset.x) + x1,
+        static_cast<UINT>(rect.offset.y) + full_height,
+        1};
+    g_xr_command_list->CopyTextureRegion(&destination, 0, 0, 0, &source, &box);
+    std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
+    g_xr_command_list->ResourceBarrier(1, &barrier);
+
+    Pending pending{};
+    pending.buffer = buffer;
+    pending.footprint = footprint;
+    pending.format = format;
+    pending.meta.yaw_deg = step.yaw_deg;
+    pending.meta.pitch_deg = step.pitch_deg;
+    pending.meta.fov = {view.fov.angleLeft, view.fov.angleRight,
+        view.fov.angleUp, view.fov.angleDown};
+    pending.meta.full_width = full_width;
+    pending.meta.full_height = full_height;
+    pending.meta.x0 = x0;
+    pending.meta.width = x1 - x0;
+    pending.meta.height = full_height;
+    pending.meta.eye = step.band ? eye : -1;
+    pending.meta.band = step.band;
+    g_pending.push_back(std::move(pending));
+    return true;
+}
+
+void process_completed() {
+    if (g_pending.empty() || g_xr_fence == nullptr) {
+        return;
+    }
+    const uint64_t completed = g_xr_fence->GetCompletedValue();
+    for (auto it = g_pending.begin(); it != g_pending.end();) {
+        if (it->fence == 0 || completed < it->fence) {
+            ++it;
+            continue;
+        }
+        c360::View view = std::move(it->meta);
+        view.bgra.resize(static_cast<size_t>(view.width) * view.height * 4);
+        void* mapped{};
+        const D3D12_RANGE read_range{0, static_cast<SIZE_T>(
+            it->footprint.Footprint.RowPitch) * view.height};
+        bool converted = SUCCEEDED(it->buffer->Map(0, &read_range, &mapped));
+        if (converted) {
+            for (uint32_t y = 0; y < view.height && converted; ++y) {
+                converted = test_mode_convert_row(it->format,
+                    static_cast<const uint8_t*>(mapped) +
+                        static_cast<size_t>(y) * it->footprint.Footprint.RowPitch,
+                    view.bgra.data() + static_cast<size_t>(y) * view.width * 4,
+                    view.width);
+            }
+            const D3D12_RANGE written_range{0, 0};
+            it->buffer->Unmap(0, &written_range);
+        }
+        const DXGI_FORMAT format = it->format;
+        it->buffer->Release();
+        it = g_pending.erase(it);
+        if (converted) {
+            g_views.push_back(std::move(view));
+        } else {
+            log_line("Capture360 readback conversion failed format=%u",
+                static_cast<unsigned>(format));
+        }
+    }
+}
+
+void assemble_and_write(std::vector<c360::View> views, bool stereo,
+    uint32_t width, float quality, uint64_t started_ms) {
+    const uint64_t assemble_ms = GetTickCount64();
+    const unsigned threads = std::max(1u,
+        std::thread::hardware_concurrency() > 2
+            ? std::thread::hardware_concurrency() - 2 : 1u);
+    c360::solve_gains(views, 512);
+    c360::Image output;
+    if (!stereo) {
+        std::vector<const c360::View*> pointers;
+        for (const auto& view : views) {
+            pointers.push_back(&view);
+        }
+        output = c360::assemble_mono(pointers, width, threads);
+    } else {
+        std::vector<const c360::View*> poles;
+        std::vector<const c360::View*> band[2];
+        for (const auto& view : views) {
+            if (!view.band) {
+                poles.push_back(&view);
+            } else if (view.eye == 0 || view.eye == 1) {
+                band[view.eye].push_back(&view);
+            }
+        }
+        const c360::Image left = c360::assemble_ods_eye(band[0], poles,
+            g_config.capture360_ods_step, width, threads);
+        const c360::Image right = c360::assemble_ods_eye(band[1], poles,
+            g_config.capture360_ods_step, width, threads);
+        output = c360::stack_top_bottom(left, right);
+    }
+    views.clear();
+    views.shrink_to_fit();
+    std::wstring directory = loading_background::folder();
+    if (!directory.empty()) {
+        CreateDirectoryW(directory.c_str(), nullptr);
+    }
+    SYSTEMTIME now{};
+    GetLocalTime(&now);
+    wchar_t name[96]{};
+    swprintf_s(name, L"w3vr360_%04u%02u%02u_%02u%02u%02u_%s.jpg",
+        now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute, now.wSecond,
+        stereo ? L"TB" : L"mono");
+    const std::wstring path = directory + name;
+    const bool ok = write_jpeg(path, output, quality);
+    if (ok) {
+        g_capture360_rescan_backgrounds.store(true, std::memory_order_release);
+    }
+    log_line("Capture360 %s %ls (%ux%u) capture=%llu ms assemble=%llu ms",
+        ok ? "wrote" : "FAILED to write", path.c_str(), output.width,
+        output.height,
+        static_cast<unsigned long long>(assemble_ms - started_ms),
+        static_cast<unsigned long long>(GetTickCount64() - assemble_ms));
+    g_phase.store(static_cast<int>(Phase::Idle), std::memory_order_release);
+}
+
+// Render thread, once per submitted frame, right before the HUD composite.
+void frame(const XrEyeSwapchain& swapchain, uint32_t image_index,
+    const std::vector<XrCompositionLayerProjectionView>& projection_views,
+    bool recording, bool world_route) {
+    if (!g_config.capture360_enabled) {
+        return;
+    }
+    ++g_frame_counter;
+    process_completed();
+    const Phase phase = static_cast<Phase>(g_phase.load(std::memory_order_acquire));
+    if (phase == Phase::Idle) {
+        const bool fire = triggered();
+        if (!fire) {
+            return;
+        }
+        if (!world_route || !recording || projection_views.size() < 2 ||
+            !g_hmd_pose_valid.load(std::memory_order_acquire)) {
+            log_line("Capture360 ignored: not in the 3D world view (menu, "
+                "cutscene panel or loading)");
+            return;
+        }
+        start();
+        return;
+    }
+    if (phase == Phase::Draining) {
+        if (g_pending.empty()) {
+            g_phase.store(static_cast<int>(Phase::Assembling),
+                std::memory_order_release);
+            log_line("Capture360 captured %zu views in %llu ms; assembling",
+                g_views.size(), static_cast<unsigned long long>(
+                    GetTickCount64() - g_started_ms));
+            std::thread(assemble_and_write, std::move(g_views), g_stereo,
+                static_cast<uint32_t>(g_config.capture360_width),
+                g_config.capture360_jpeg_quality, g_started_ms).detach();
+            g_views = {};
+        }
+        return;
+    }
+    if (phase != Phase::Running) {
+        return;
+    }
+    g_frames_without_capture_call = 0;
+    if (!world_route) {
+        abort("a full-screen menu, cinema panel or loading screen appeared");
+        return;
+    }
+    if (!recording) {
+        if (++g_wait_frames > 900) {
+            abort("no frames submitted for 900 frames");
+        }
+        return;
+    }
+    if (g_settle_left > 0) {
+        --g_settle_left;
+        return;
+    }
+    const c360::Step& step = g_steps[g_step_index];
+    bool copied = true;
+    if (step.band) {
+        for (int eye = 0; eye < 2; ++eye) {
+            copied = copied && record_copy(swapchain, image_index,
+                projection_views[eye], eye, step);
+        }
+    } else {
+        copied = record_copy(swapchain, image_index, projection_views[0], 0, step);
+    }
+    if (!copied) {
+        abort("readback copy could not be recorded");
+        return;
+    }
+    ++g_step_index;
+    if (g_step_index % 8 == 0 || g_step_index == g_steps.size()) {
+        log_line("Capture360 step %zu/%zu", g_step_index, g_steps.size());
+    }
+    if (g_step_index < g_steps.size()) {
+        const c360::Step& next = g_steps[g_step_index];
+        set_override(next);
+        g_settle_left = step.band && next.band
+            ? g_config.capture360_ods_settle_frames
+            : g_config.capture360_settle_frames;
+    } else {
+        stop_override();
+        g_phase.store(static_cast<int>(Phase::Draining), std::memory_order_release);
+    }
+}
+
+// Every OpenXR frame (also menus and frames that skip the composite path):
+// a capture must never leave the camera turned or the headset dark.
+void check_interrupt(bool world_route) {
+    const Phase phase = static_cast<Phase>(g_phase.load(std::memory_order_acquire));
+    if (phase != Phase::Running) {
+        g_frames_without_capture_call = 0;
+        return;
+    }
+    if (!world_route) {
+        abort("the 3D world view ended (menu, cinema panel or loading)");
+        return;
+    }
+    if (++g_frames_without_capture_call > 900) {
+        abort("the capture stopped receiving frames");
+    }
+}
+
+// After the XR command list was executed: ok = signalled with `fence`.
+void after_submit(uint64_t fence, bool ok) {
+    bool any = false;
+    for (auto& pending : g_pending) {
+        if (pending.fence == 0) {
+            any = true;
+            pending.fence = ok ? fence : 0;
+        }
+    }
+    if (any && !ok) {
+        abort("XR submission failed");
+    }
+}
+
+}  // namespace capture360_runtime
 
 // [FEATURE:LOADING-BACKGROUND 3/6] Acquire, upload and draw. Runs inside the
 // open XR command list of a menu frame; the image is released after the
@@ -67558,6 +68138,11 @@ void render_openxr_test_frame(
         // matching slice before closing this same command list, then submit
         // only the projection layer so scene, markers and HUD share one pose.
         uint32_t mode3_hud_consumer_slots[2]{UINT32_MAX, UINT32_MAX};
+        // [FEATURE:CAPTURE-360 7/9] The scene is in the XR image now and the
+        // HUD/menu are not: the capture reads it back here.
+        capture360_runtime::frame(swapchain, image_index, projection_views,
+            command_list_recording && submitted,
+            !fullscreen_menu && !cinema_panel);
         w3vr::minimal_xr_log::hud("ATTEMPT_GATE",
             "present=%llu scene=%llu recording=%u submitted=%u ready=%u cinema=%u panel_ready=%u",
             current_present, hud_scene_pair_id, unsigned(command_list_recording),
@@ -67699,6 +68284,9 @@ void render_openxr_test_frame(
                 if (SUCCEEDED(g_command_queue->Signal(g_xr_fence, submission))) {
                     g_xr_command_allocator_fences[g_xr_command_allocator_index] =
                         submission;
+                    // [FEATURE:CAPTURE-360 8/9] This fence retires the
+                    // capture copies recorded into the list.
+                    capture360_runtime::after_submit(submission, true);
                     // [FIX:CROSS-QUEUE-SCENE-CAPTURE-OWNERSHIP V1368 6/7]
                     // When a packed cache resource is swapped back into the
                     // capture ring, this exact primary-consumer fence becomes
@@ -67718,9 +68306,11 @@ void render_openxr_test_frame(
                     // allocator must not assume the GPU is done with it.
                     wait_for_xr_gpu();
                     g_xr_command_allocator_fences[g_xr_command_allocator_index] = 0;
+                    capture360_runtime::after_submit(0, false);
                 }
             } else {
                 submitted = false;
+                capture360_runtime::after_submit(0, false);
                 log_taau_trace_line(
                     "OpenXR command list close failed image=%u hr=0x%08X",
                     image_index, static_cast<unsigned>(close_result));
@@ -68238,6 +68828,13 @@ void render_openxr_test_frame(
                 pfn_xrSetPresentationTransformOFXR = nullptr;
             }
         }
+    }
+    // [FEATURE:CAPTURE-360 7/9] No layer while the capture turns the camera,
+    // so the player never sees the world spin.
+    capture360_runtime::check_interrupt(!fullscreen_menu && !cinema_panel);
+    if (g_capture360_blank_headset.load(std::memory_order_acquire)) {
+        end_info.layerCount = 0;
+        end_info.layers = nullptr;
     }
     w3vr::minimal_xr_log::write("END_BEGIN", current_present, trace_pair_id, g_xr_fence_value, end_info.layerCount);
     result = pfn_xrEndFrame(g_xr_session, &end_info);
